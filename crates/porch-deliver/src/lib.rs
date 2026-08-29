@@ -116,6 +116,9 @@ pub struct CheckRow {
     pub state: String,
     #[serde(default)]
     pub bucket: String,
+    /// Optional details URL from `gh pr checks` (`link` field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 /// Filter forge checks to allowlisted names only.
@@ -128,18 +131,39 @@ pub fn filter_allowlisted<'a>(checks: &'a [CheckRow], allowlist: &[String]) -> V
 }
 
 /// Outcome of evaluating allowlisted checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AllowlistReady {
     /// Every allowlisted name is present and successful.
     Ready,
-    /// At least one allowlisted check failed (or equivalent terminal red).
-    Failed,
+    /// Genuine red on allowlisted names (`failure` / `failed` / `error`) — mechanical-repair eligible.
+    Failed {
+        /// Allowlisted rows that are genuinely red (name / state / optional link).
+        checks: Vec<CheckRow>,
+    },
+    /// Terminal allowlisted states that are **not** mechanical (`cancelled` / `timed_out` / `action_required`).
+    NonRepairable { names: Vec<String> },
     /// Still waiting (pending / missing name).
     Waiting,
 }
 
+/// Terminal result of [`watch_allowlisted_checks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchOutcome {
+    Ready,
+    Failed { checks: Vec<CheckRow> },
+    NonRepairable { names: Vec<String> },
+    Timeout,
+    Cancelled,
+}
+
 /// Evaluate allowlisted readiness. Empty forge list with non-empty allowlist is
 /// never Ready.
+///
+/// Genuine red (`failure`/`failed`/`error`) → [`AllowlistReady::Failed`].
+/// `cancelled` / `timed_out` / `action_required` → [`AllowlistReady::NonRepairable`]
+/// (fail closed; not mechanical auto-fix). Non-repairable **states** and bucket
+/// `cancel` are classified before any `bucket=fail` mechanical rule (real `gh`
+/// maps `timed_out` / `action_required` to bucket `fail`).
 #[must_use]
 pub fn evaluate_allowlist(checks: &[CheckRow], allowlist: &[String]) -> AllowlistReady {
     if allowlist.is_empty() {
@@ -147,6 +171,8 @@ pub fn evaluate_allowlist(checks: &[CheckRow], allowlist: &[String]) -> Allowlis
     }
     let filtered = filter_allowlisted(checks, allowlist);
     let mut any_waiting = false;
+    let mut failed_checks = Vec::new();
+    let mut non_repairable_names = Vec::new();
     for name in allowlist {
         let Some(row) = filtered.iter().find(|c| c.name == *name) else {
             any_waiting = true;
@@ -157,27 +183,47 @@ pub fn evaluate_allowlist(checks: &[CheckRow], allowlist: &[String]) -> Allowlis
         if is_check_success(&state, &bucket) {
             continue;
         }
-        if is_check_failed(&state, &bucket) {
-            return AllowlistReady::Failed;
+        // Non-repairable states/buckets before bucket=fail mechanical matching.
+        if is_check_non_repairable(&state, &bucket) {
+            non_repairable_names.push(name.clone());
+            continue;
+        }
+        if is_check_mechanical_failed(&state, &bucket) {
+            failed_checks.push((*row).clone());
+            continue;
         }
         any_waiting = true;
     }
+    // Prefer waiting while anything is still pending; only terminal when all settled.
     if any_waiting {
-        AllowlistReady::Waiting
-    } else {
-        AllowlistReady::Ready
+        return AllowlistReady::Waiting;
     }
+    if !failed_checks.is_empty() {
+        return AllowlistReady::Failed {
+            checks: failed_checks,
+        };
+    }
+    if !non_repairable_names.is_empty() {
+        return AllowlistReady::NonRepairable {
+            names: non_repairable_names,
+        };
+    }
+    AllowlistReady::Ready
 }
 
 fn is_check_success(state: &str, bucket: &str) -> bool {
     matches!(state, "success" | "pass" | "passed") || matches!(bucket, "pass" | "success")
 }
 
-fn is_check_failed(state: &str, bucket: &str) -> bool {
-    matches!(
-        state,
-        "failure" | "failed" | "fail" | "cancelled" | "timed_out" | "action_required" | "error"
-    ) || matches!(bucket, "fail" | "failure" | "cancel")
+/// Genuine job failure — eligible for mechanical deliver repair.
+/// Call only after [`is_check_non_repairable`] so `timed_out`+`bucket=fail` is excluded.
+fn is_check_mechanical_failed(state: &str, bucket: &str) -> bool {
+    matches!(state, "failure" | "failed" | "fail" | "error") || matches!(bucket, "fail" | "failure")
+}
+
+/// Provider terminal that must fail closed without spawning a fixer.
+fn is_check_non_repairable(state: &str, bucket: &str) -> bool {
+    matches!(state, "cancelled" | "timed_out" | "action_required") || matches!(bucket, "cancel")
 }
 
 /// Decode `gh pr list --json` output. Undecodable → error (do not create).
@@ -433,7 +479,7 @@ pub fn edit_pr_body(
     Ok(())
 }
 
-/// List PR checks JSON via `gh pr checks --json name,state,bucket`.
+/// List PR checks JSON via `gh pr checks --json name,state,bucket,link`.
 ///
 /// # Errors
 ///
@@ -450,9 +496,59 @@ pub fn list_pr_checks(
         bin,
         timeout,
         work_tree,
-        &["pr", "checks", &num, "--json", "name,state,bucket"],
+        &["pr", "checks", &num, "--json", "name,state,bucket,link"],
     )?;
     parse_pr_checks(&out.stdout)
+}
+
+/// PR mergeability from `gh pr view --json mergeable`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeableState {
+    ConflictFree,
+    Conflicting,
+    Unknown(String),
+}
+
+/// Decode `gh pr view --json mergeable` stdout.
+///
+/// # Errors
+///
+/// Returns JSON / UTF-8 errors when the payload cannot be trusted.
+pub fn parse_mergeable(stdout: &[u8]) -> Result<MergeableState, Error> {
+    #[derive(Deserialize)]
+    struct Row {
+        #[serde(default)]
+        mergeable: String,
+    }
+    let text =
+        std::str::from_utf8(stdout).map_err(|e| Error::Msg(format!("pr view utf-8: {e}")))?;
+    let row: Row = serde_json::from_str(text.trim())?;
+    Ok(match row.mergeable.to_ascii_uppercase().as_str() {
+        "MERGEABLE" => MergeableState::ConflictFree,
+        "CONFLICTING" => MergeableState::Conflicting,
+        other => MergeableState::Unknown(other.to_string()),
+    })
+}
+
+/// Fetch mergeability for an open PR.
+///
+/// # Errors
+///
+/// Returns spawn / exit / JSON errors.
+pub fn pr_mergeable(
+    bin: &str,
+    timeout: Duration,
+    work_tree: &Path,
+    number: u64,
+) -> Result<MergeableState, Error> {
+    let num = number.to_string();
+    let out = run_gh(
+        bin,
+        timeout,
+        work_tree,
+        &["pr", "view", &num, "--json", "mergeable"],
+    )?;
+    parse_mergeable(&out.stdout)
 }
 
 /// Options for [`watch_allowlisted_checks`].
@@ -468,7 +564,7 @@ pub struct WatchChecksOpts<'a> {
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
-/// Poll allowlisted checks until ready, failed, timeout, or cancel.
+/// Poll allowlisted checks until a terminal [`WatchOutcome`].
 ///
 /// Never runs `gh run rerun` (M6 keeps `rerun_transient = 0`).
 /// `cancel` is checked before each poll and during interruptible sleep so a
@@ -476,37 +572,35 @@ pub struct WatchChecksOpts<'a> {
 ///
 /// # Errors
 ///
-/// Returns timeout / failed allowlisted check / cancelled / `gh` errors.
-pub fn watch_allowlisted_checks(opts: &WatchChecksOpts<'_>) -> Result<(), Error> {
+/// Returns `gh` / I/O errors. Terminal allowlist states are `Ok(WatchOutcome)`.
+pub fn watch_allowlisted_checks(opts: &WatchChecksOpts<'_>) -> Result<WatchOutcome, Error> {
     use std::sync::atomic::Ordering;
     if opts.allowlist.is_empty() {
-        return Ok(());
+        return Ok(WatchOutcome::Ready);
     }
     let start = Instant::now();
     loop {
         if opts.cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-            return Err(Error::Msg("cancelled".into()));
+            return Ok(WatchOutcome::Cancelled);
         }
         let checks = list_pr_checks(opts.bin, opts.gh_timeout, opts.work_tree, opts.pr_number)?;
         match evaluate_allowlist(&checks, opts.allowlist) {
-            AllowlistReady::Ready => return Ok(()),
-            AllowlistReady::Failed => {
-                return Err(Error::Msg(
-                    "allowlisted check failed (fail closed; repair restart-at-review deferred)"
-                        .into(),
-                ));
+            AllowlistReady::Ready => return Ok(WatchOutcome::Ready),
+            AllowlistReady::Failed { checks } => {
+                return Ok(WatchOutcome::Failed { checks });
+            }
+            AllowlistReady::NonRepairable { names } => {
+                return Ok(WatchOutcome::NonRepairable { names });
             }
             AllowlistReady::Waiting => {
                 if start.elapsed() >= opts.poll_deadline {
-                    return Err(Error::Msg(
-                        "allowlisted checks not green before poll timeout".into(),
-                    ));
+                    return Ok(WatchOutcome::Timeout);
                 }
                 // Interruptible sleep so supersede cancel is prompt.
                 let sleep_deadline = Instant::now() + opts.poll_interval;
                 while Instant::now() < sleep_deadline {
                     if opts.cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-                        return Err(Error::Msg("cancelled".into()));
+                        return Ok(WatchOutcome::Cancelled);
                     }
                     let remaining = sleep_deadline.saturating_duration_since(Instant::now());
                     std::thread::sleep(remaining.min(Duration::from_millis(50)));
@@ -721,6 +815,15 @@ mod tests {
         assert_eq!(list[0].number, 7);
     }
 
+    fn check(name: &str, state: &str, bucket: &str) -> CheckRow {
+        CheckRow {
+            name: name.into(),
+            state: state.into(),
+            bucket: bucket.into(),
+            link: None,
+        }
+    }
+
     #[test]
     fn allowlist_empty_is_ready() {
         assert_eq!(evaluate_allowlist(&[], &[]), AllowlistReady::Ready);
@@ -728,11 +831,7 @@ mod tests {
 
     #[test]
     fn allowlist_missing_names_wait() {
-        let checks = vec![CheckRow {
-            name: "e2e".into(),
-            state: "failure".into(),
-            bucket: "fail".into(),
-        }];
+        let checks = vec![check("e2e", "failure", "fail")];
         assert_eq!(
             evaluate_allowlist(&checks, &["lint".into()]),
             AllowlistReady::Waiting
@@ -740,31 +839,65 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_failed_is_failed() {
-        let checks = vec![CheckRow {
-            name: "lint".into(),
-            state: "failure".into(),
-            bucket: "fail".into(),
-        }];
-        assert_eq!(
-            evaluate_allowlist(&checks, &["lint".into()]),
-            AllowlistReady::Failed
-        );
+    fn allowlist_failed_carries_red_names() {
+        let checks = vec![
+            check("lint", "failure", "fail"),
+            check("types", "error", ""),
+            check("e2e", "failure", "fail"),
+        ];
+        match evaluate_allowlist(&checks, &["lint".into(), "types".into()]) {
+            AllowlistReady::Failed { checks: failed } => {
+                assert_eq!(
+                    failed.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                    vec!["lint", "types"]
+                );
+                assert_eq!(failed[0].state, "failure");
+                assert_eq!(failed[1].state, "error");
+            }
+            other => panic!("expected Failed with checks, got {other:?}"),
+        }
     }
 
     #[test]
-    fn allowlist_success_ready() {
+    fn allowlist_cancelled_is_non_repairable_not_mechanical() {
+        let checks = vec![check("lint", "cancelled", "cancel")];
+        match evaluate_allowlist(&checks, &["lint".into()]) {
+            AllowlistReady::NonRepairable { names } => {
+                assert_eq!(names, vec!["lint".to_string()]);
+            }
+            other => panic!("expected NonRepairable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_timed_out_with_fail_bucket_is_non_repairable() {
+        // Real `gh pr checks` maps timed_out → bucket=fail.
+        let checks = vec![check("lint", "timed_out", "fail")];
+        match evaluate_allowlist(&checks, &["lint".into()]) {
+            AllowlistReady::NonRepairable { names } => {
+                assert_eq!(names, vec!["lint".to_string()]);
+            }
+            other => panic!("expected NonRepairable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_action_required_with_fail_bucket_is_non_repairable() {
+        // Real `gh pr checks` maps action_required → bucket=fail.
+        let checks = vec![check("lint", "action_required", "fail")];
+        match evaluate_allowlist(&checks, &["lint".into()]) {
+            AllowlistReady::NonRepairable { names } => {
+                assert_eq!(names, vec!["lint".to_string()]);
+            }
+            other => panic!("expected NonRepairable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_success_ready_ignores_unlisted_red() {
         let checks = vec![
-            CheckRow {
-                name: "lint".into(),
-                state: "success".into(),
-                bucket: "pass".into(),
-            },
-            CheckRow {
-                name: "e2e".into(),
-                state: "failure".into(),
-                bucket: "fail".into(),
-            },
+            check("lint", "success", "pass"),
+            check("e2e", "failure", "fail"),
         ];
         assert_eq!(
             evaluate_allowlist(&checks, &["lint".into()]),
@@ -774,21 +907,22 @@ mod tests {
 
     #[test]
     fn filter_ignores_unlisted() {
-        let checks = vec![
-            CheckRow {
-                name: "lint".into(),
-                state: "success".into(),
-                bucket: String::new(),
-            },
-            CheckRow {
-                name: "deploy".into(),
-                state: "failure".into(),
-                bucket: String::new(),
-            },
-        ];
+        let checks = vec![check("lint", "success", ""), check("deploy", "failure", "")];
         let filtered = filter_allowlisted(&checks, &["lint".into()]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "lint");
+    }
+
+    #[test]
+    fn parse_mergeable_conflicting() {
+        assert_eq!(
+            parse_mergeable(br#"{"mergeable":"CONFLICTING"}"#).unwrap(),
+            MergeableState::Conflicting
+        );
+        assert_eq!(
+            parse_mergeable(br#"{"mergeable":"MERGEABLE"}"#).unwrap(),
+            MergeableState::ConflictFree
+        );
     }
 
     #[test]
@@ -798,7 +932,7 @@ mod tests {
         let wt = tmp.path().canonicalize().unwrap();
         let cancel = AtomicBool::new(true);
         let start = Instant::now();
-        let err = watch_allowlisted_checks(&WatchChecksOpts {
+        let outcome = watch_allowlisted_checks(&WatchChecksOpts {
             bin: "false", // unused when cancel trips first
             gh_timeout: Duration::from_secs(5),
             work_tree: &wt,
@@ -808,11 +942,8 @@ mod tests {
             poll_interval: Duration::from_secs(5),
             cancel: Some(&cancel),
         })
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("cancel"),
-            "expected cancelled, got {err}"
-        );
+        .unwrap();
+        assert_eq!(outcome, WatchOutcome::Cancelled);
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "cancel must not wait for poll timeout"

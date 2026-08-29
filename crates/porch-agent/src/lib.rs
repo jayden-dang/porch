@@ -26,6 +26,13 @@ Do not add comments that only explain the fix.
 Do not auto-apply suggestion patches from the review JSON; treat them as evidence only.
 ";
 
+/// Deliver-repair prompt for mechanical allowlisted check failures.
+pub const DELIVER_REPAIR_PROMPT: &str = "\
+Named allowlisted PR checks failed. Fix the smallest root cause in this worktree.
+Do not refactor unrelated code. Do not run the full suite (no just gate, Playwright, or Postgres).
+Verify only the touched area. Findings JSON lists the failing check names and states.
+";
+
 /// Successful fixer CLI stdout payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixerOutcome {
@@ -137,11 +144,30 @@ pub fn write_fixer_inputs(
     fixer_dir: &Path,
     findings_json: &str,
 ) -> Result<(PathBuf, PathBuf), Error> {
-    fs::create_dir_all(fixer_dir)?;
-    let prompt_file = fixer_dir.join("prompt.txt");
-    let findings_file = fixer_dir.join("findings.json");
-    fs::write(&prompt_file, FIXER_PROMPT)?;
-    // Validate findings JSON before writing.
+    write_prompt_and_findings(fixer_dir, FIXER_PROMPT, findings_json)
+}
+
+/// Write deliver-repair `prompt.txt` + `findings.json` under `repair_dir`.
+///
+/// # Errors
+///
+/// Returns I/O or JSON errors.
+pub fn write_deliver_repair_inputs(
+    repair_dir: &Path,
+    findings_json: &str,
+) -> Result<(PathBuf, PathBuf), Error> {
+    write_prompt_and_findings(repair_dir, DELIVER_REPAIR_PROMPT, findings_json)
+}
+
+fn write_prompt_and_findings(
+    dir: &Path,
+    prompt: &str,
+    findings_json: &str,
+) -> Result<(PathBuf, PathBuf), Error> {
+    fs::create_dir_all(dir)?;
+    let prompt_file = dir.join("prompt.txt");
+    let findings_file = dir.join("findings.json");
+    fs::write(&prompt_file, prompt)?;
     let _: serde_json::Value = serde_json::from_str(findings_json)?;
     fs::write(&findings_file, findings_json)?;
     Ok((prompt_file, findings_file))

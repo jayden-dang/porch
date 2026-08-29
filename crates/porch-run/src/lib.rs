@@ -11,14 +11,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Serialize fetch + tip resolve across concurrent rebases in this process.
 static FETCH_RESOLVE_LOCK: Mutex<()> = Mutex::new(());
 
-use porch_agent::{RunFixerOpts, fixer_bin, fixer_timeout, run_fixer, write_fixer_inputs};
-use porch_gate::{Db, RunExecutor, RunRow, db_path, run_fixer_dir, run_worktree_dir};
+use porch_agent::{
+    RunFixerOpts, fixer_bin, fixer_timeout, run_fixer, write_deliver_repair_inputs,
+    write_fixer_inputs,
+};
+use porch_gate::{
+    Db, RunExecutor, RunRow, db_path, run_deliver_repair_dir, run_fixer_dir, run_worktree_dir,
+};
 use porch_git::GitDir;
 use porch_review::{Finding, RunReviewOpts, review_bin, review_timeout, run_review};
 use serde::Serialize;
 
 /// Phases in locked order (D5).
 const PHASES: &[&str] = &["intent", "rebase", "review", "certify", "deliver"];
+
+/// Mechanical deliver auto-fix budget (architecture; not overloading `rerun_transient`).
+const DELIVER_REPAIR_BUDGET: u32 = 3;
+
+const DELIVER_REPAIR_SUBJECT: &str = "porch: repair allowlisted checks";
 
 /// Production executor injected into the daemon from the `porch` binary.
 #[derive(Debug, Default, Clone, Copy)]
@@ -138,14 +148,18 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                     execute_certify_step(&db, run_id, &bare, &wt_path, cancel)?;
                 }
                 "deliver" => {
-                    execute_deliver_step(
+                    match execute_deliver_step(
                         &db,
+                        home,
                         run_id,
                         &bare,
                         &wt_path,
                         &repo.default_branch,
                         cancel,
-                    )?;
+                    )? {
+                        PhaseLoop::Parked => return Ok(PhaseLoop::Parked),
+                        PhaseLoop::Continue => {}
+                    }
                 }
                 _ => {}
             }
@@ -303,27 +317,218 @@ fn execute_certify_step(
 
 fn execute_deliver_step(
     db: &Db,
+    home: &Path,
     run_id: &str,
     bare: &GitDir,
     wt: &Path,
     default_branch: &str,
     cancel: &AtomicBool,
-) -> Result<()> {
+) -> Result<PhaseLoop> {
     assert_head_continuity(db, run_id, wt)?;
-    match deliver::run_deliver_phase(db, run_id, bare, wt, default_branch, Some(cancel)) {
-        Ok(()) => {
-            db.insert_step_result(run_id, "deliver", "completed", None)?;
-            Ok(())
+    deliver_with_repair(db, home, run_id, bare, wt, default_branch, Some(cancel))
+}
+
+/// Push/PR/watch; on mechanical allowlisted red or CONFLICTING PR, repair and
+/// restart at review → certify → deliver (same `run_id`, no intent/rebase).
+fn deliver_with_repair(
+    db: &Db,
+    home: &Path,
+    run_id: &str,
+    bare: &GitDir,
+    wt: &Path,
+    default_branch: &str,
+    cancel: Option<&AtomicBool>,
+) -> Result<PhaseLoop> {
+    loop {
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            return Err(RunError::Msg("cancelled".into()));
         }
-        Err(e) => {
-            let msg = e.to_string();
-            db.insert_step_result(run_id, "deliver", "failed", Some(&msg))?;
-            if msg == "cancelled" {
-                return Err(RunError::Msg("cancelled".into()));
+        match deliver::run_deliver_phase(db, run_id, bare, wt, default_branch, cancel) {
+            Ok(()) => {
+                db.insert_step_result(run_id, "deliver", "completed", None)?;
+                return Ok(PhaseLoop::Continue);
             }
-            Err(RunError::Deliver(e))
+            Err(e) => {
+                let msg = e.to_string();
+                db.insert_step_result(run_id, "deliver", "failed", Some(&msg))?;
+                if msg == "cancelled" {
+                    return Err(RunError::Msg("cancelled".into()));
+                }
+                let repairable = matches!(
+                    &e,
+                    deliver::DeliverError::AllowlistFailed { .. }
+                        | deliver::DeliverError::MergeConflicting
+                );
+                if !repairable {
+                    return Err(RunError::Deliver(e));
+                }
+                let run = db
+                    .run_by_id(run_id)?
+                    .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
+                if run.deliver_repair_attempts >= DELIVER_REPAIR_BUDGET {
+                    return Err(RunError::Msg(format!(
+                        "deliver repair budget exhausted ({DELIVER_REPAIR_BUDGET})"
+                    )));
+                }
+                let attempt = db.increment_deliver_repair_attempts(run_id)?;
+                let pre_repair_head = porch_git::rev_parse_c(wt, "HEAD")?;
+                match &e {
+                    deliver::DeliverError::AllowlistFailed { checks } => {
+                        attempt_allowlist_repair(db, home, run_id, wt, checks)?;
+                    }
+                    deliver::DeliverError::MergeConflicting => {
+                        attempt_merge_conflict_rebase(db, bare, wt, run_id, default_branch)?;
+                    }
+                    _ => unreachable!("filtered by repairable"),
+                }
+                let new_head = porch_git::rev_parse_c(wt, "HEAD")?;
+                if new_head == pre_repair_head {
+                    // Attempt counted; loop will re-deliver / re-watch or exhaust.
+                    tracing::warn!(run_id, attempt, "deliver repair attempt did not move HEAD");
+                    continue;
+                }
+                // Revoke review binding; do not upsert uncertified_pipeline_ranges.
+                db.set_review_approved_head_sha(run_id, None)?;
+                db.set_run_shas(run_id, Some(&new_head), None)?;
+                db.insert_step_result(
+                    run_id,
+                    "deliver_repair",
+                    "completed",
+                    Some(&format!("attempt {attempt}")),
+                )?;
+
+                // Session-free rereview (after_fix never passes fixer session).
+                match run_review_phase(db, run_id, wt, true)? {
+                    ReviewPhase::Approved => {
+                        db.insert_step_result(
+                            run_id,
+                            "review",
+                            "completed",
+                            Some("deliver_repair"),
+                        )?;
+                        let local_cancel = AtomicBool::new(false);
+                        let cancel_flag = cancel.unwrap_or(&local_cancel);
+                        execute_certify_step(db, run_id, bare, wt, cancel_flag)?;
+                        assert_head_continuity(db, run_id, wt)?;
+                        // Loop: lease-push + PR update + re-watch.
+                    }
+                    ReviewPhase::Parked => {
+                        db.insert_step_result(run_id, "review", "parked", Some("deliver_repair"))?;
+                        return Ok(PhaseLoop::Parked);
+                    }
+                }
+            }
         }
     }
+}
+
+fn attempt_allowlist_repair(
+    db: &Db,
+    home: &Path,
+    run_id: &str,
+    wt: &Path,
+    checks: &[porch_deliver::CheckRow],
+) -> Result<()> {
+    let findings = serde_json::json!(
+        checks
+            .iter()
+            .map(|c| {
+                let mut row = serde_json::json!({
+                    "name": c.name,
+                    "state": c.state,
+                });
+                if let Some(link) = c.link.as_deref() {
+                    row["link"] = serde_json::json!(link);
+                }
+                row
+            })
+            .collect::<Vec<_>>()
+    );
+    let findings_json = findings.to_string();
+    let repair_dir = run_deliver_repair_dir(home, run_id);
+    let (prompt_file, findings_file) = write_deliver_repair_inputs(&repair_dir, &findings_json)?;
+
+    let bin = fixer_bin().map_err(|e| RunError::Msg(e.to_string()))?;
+    let run = db
+        .run_by_id(run_id)?
+        .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
+
+    run_fixer(&RunFixerOpts {
+        work_tree: wt,
+        prompt_file: &prompt_file,
+        findings_file: &findings_file,
+        porch_home: home,
+        bin: &bin,
+        timeout: fixer_timeout(),
+        session_id: run.fixer_session_id.as_deref(),
+    })?;
+
+    // If the fixer left a dirty tree, commit with porch identity (same as certify).
+    maybe_deliver_repair_commit(wt)?;
+    Ok(())
+}
+
+fn attempt_merge_conflict_rebase(
+    db: &Db,
+    bare: &GitDir,
+    wt: &Path,
+    run_id: &str,
+    default_branch: &str,
+) -> Result<()> {
+    let onto = {
+        let _guard = FETCH_RESOLVE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let refspec = format!("refs/heads/{default_branch}:refs/remotes/origin/{default_branch}");
+        porch_git::fetch(bare, "origin", &refspec)
+            .map_err(|e| RunError::Msg(format!("fetch origin/{default_branch}: {e}")))?;
+        let origin_ref = format!("refs/remotes/origin/{default_branch}");
+        porch_git::rev_parse(bare, &origin_ref)
+            .map_err(|e| RunError::Msg(format!("resolve origin/{default_branch}: {e}")))?
+    };
+    if let Err(e) = porch_git::rebase(wt, &onto) {
+        let _ = porch_git::rebase_abort(wt);
+        return Err(RunError::Msg(format!("rebase conflict: {e}")));
+    }
+    let head = porch_git::rev_parse_c(wt, "HEAD")?;
+    db.set_run_shas(run_id, Some(&head), None)?;
+    Ok(())
+}
+
+fn maybe_deliver_repair_commit(wt: &Path) -> Result<bool> {
+    let out = porch_git::run_c(wt, &["status", "--porcelain"])?;
+    if porch_git::stdout_trim(&out).is_empty() {
+        return Ok(false);
+    }
+    porch_git::run_c(
+        wt,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.email=porch@example.com",
+            "-c",
+            "user.name=Porch",
+            "add",
+            "-A",
+        ],
+    )?;
+    porch_git::run_c(
+        wt,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.email=porch@example.com",
+            "-c",
+            "user.name=Porch",
+            "commit",
+            "--no-verify",
+            "-m",
+            DELIVER_REPAIR_SUBJECT,
+        ],
+    )?;
+    Ok(true)
 }
 
 fn assert_head_continuity(db: &Db, run_id: &str, wt: &Path) -> Result<()> {
@@ -599,8 +804,11 @@ fn agent_respond_inner(
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             db.insert_step_result(&run.id, "review", "completed", Some("approved"))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            finish_certify_and_deliver(&db, &bare, &wt, &run.id, &repo.default_branch)?;
-            remove_run_worktree(&bare, &wt);
+            let parked =
+                finish_certify_and_deliver(home, &db, &bare, &wt, &run.id, &repo.default_branch)?;
+            if !parked {
+                remove_run_worktree(&bare, &wt);
+            }
         }
         AgentResponse::Skip => {
             // Skip does not write review_approved_head_sha.
@@ -667,7 +875,7 @@ fn respond_fix(
     persist_uncertified_after_fix(db, wt, run, &pre_fix_head, &new_head)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
 
-    finish_rereview(db, run, bare, wt, yes)
+    finish_rereview(db, home, run, bare, wt, yes)
 }
 
 /// Returns `Ok(None)` when the fixer failed closed (run already marked failed).
@@ -740,6 +948,7 @@ fn fail_fix_run(
 
 fn finish_rereview(
     db: &Db,
+    home: &Path,
     run: &RunRow,
     bare: &GitDir,
     wt: &Path,
@@ -748,7 +957,7 @@ fn finish_rereview(
     // Session-free rereview (never pass fixer session).
     match run_review_phase(db, &run.id, wt, true) {
         Ok(ReviewPhase::Approved) => {
-            complete_after_review(db, bare, wt, run, None)?;
+            complete_after_review(db, home, bare, wt, run, None)?;
         }
         Ok(ReviewPhase::Parked) => {
             if yes {
@@ -758,7 +967,14 @@ fn finish_rereview(
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
                 clear_uncertified_if_certified(db, wt, &run.repo_id, &run.branch, &head)
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-                complete_after_review(db, bare, wt, run, Some("approved remaining after --yes"))?;
+                complete_after_review(
+                    db,
+                    home,
+                    bare,
+                    wt,
+                    run,
+                    Some("approved remaining after --yes"),
+                )?;
             } else {
                 db.insert_step_result(&run.id, "review", "parked", Some("fix_review"))
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
@@ -776,6 +992,7 @@ fn finish_rereview(
 
 fn complete_after_review(
     db: &Db,
+    home: &Path,
     bare: &GitDir,
     wt: &Path,
     run: &RunRow,
@@ -787,19 +1004,24 @@ fn complete_after_review(
         .repo_by_id(&run.repo_id)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?
         .ok_or_else(|| UsageOrFail::Fail(format!("unknown repo {}", run.repo_id)))?;
-    finish_certify_and_deliver(db, bare, wt, &run.id, &repo.default_branch)?;
-    remove_run_worktree(bare, wt);
+    let parked = finish_certify_and_deliver(home, db, bare, wt, &run.id, &repo.default_branch)?;
+    if !parked {
+        remove_run_worktree(bare, wt);
+    }
     Ok(())
 }
 
-/// Shared certify → deliver path for approve / post-fix complete.
+/// Shared certify → deliver(+repair) path for approve / post-fix complete.
+///
+/// Returns `true` when deliver repair rereview parked (worktree kept).
 fn finish_certify_and_deliver(
+    home: &Path,
     db: &Db,
     bare: &GitDir,
     wt: &Path,
     run_id: &str,
     default_branch: &str,
-) -> std::result::Result<(), UsageOrFail> {
+) -> std::result::Result<bool, UsageOrFail> {
     assert_head_continuity(db, run_id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     match certify::run_certify_phase(db, run_id, bare, wt, None) {
         Ok(()) => {
@@ -815,22 +1037,20 @@ fn finish_certify_and_deliver(
         }
     }
     assert_head_continuity(db, run_id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    match deliver::run_deliver_phase(db, run_id, bare, wt, default_branch, None) {
-        Ok(()) => {
-            db.insert_step_result(run_id, "deliver", "completed", None)
+    match deliver_with_repair(db, home, run_id, bare, wt, default_branch, None) {
+        Ok(PhaseLoop::Continue) => {
+            db.set_run_status(run_id, "completed", None)
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            Ok(false)
         }
+        Ok(PhaseLoop::Parked) => Ok(true),
         Err(e) => {
             let msg = e.to_string();
-            let _ = db.insert_step_result(run_id, "deliver", "failed", Some(&msg));
             let _ = db.set_run_status(run_id, "failed", Some(&msg));
             remove_run_worktree(bare, wt);
-            return Err(UsageOrFail::Fail(msg));
+            Err(UsageOrFail::Fail(msg))
         }
     }
-    db.set_run_status(run_id, "completed", None)
-        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    Ok(())
 }
 
 fn select_findings(

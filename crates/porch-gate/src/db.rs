@@ -10,12 +10,12 @@ use crate::Result;
 const RUN_SELECT_FROM: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
                     intent, intent_source, error, review_approved_head_sha, findings_json,
-                    fixer_session_id, pr_url
+                    fixer_session_id, pr_url, deliver_repair_attempts
              FROM runs";
 const RUN_SELECT: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
                     intent, intent_source, error, review_approved_head_sha, findings_json,
-                    fixer_session_id, pr_url
+                    fixer_session_id, pr_url, deliver_repair_attempts
              FROM runs WHERE id = ?1";
 
 pub struct Db {
@@ -47,6 +47,8 @@ pub struct RunRow {
     pub findings_json: Option<String>,
     pub fixer_session_id: Option<String>,
     pub pr_url: Option<String>,
+    /// Deliver mechanical repair attempts started (budget default 3).
+    pub deliver_repair_attempts: u32,
 }
 
 /// Persisted fixer commit span awaiting a completed review (E23).
@@ -127,6 +129,12 @@ impl Db {
         ensure_column(&conn, "runs", "findings_json", "TEXT")?;
         ensure_column(&conn, "runs", "fixer_session_id", "TEXT")?;
         ensure_column(&conn, "runs", "pr_url", "TEXT")?;
+        ensure_column(
+            &conn,
+            "runs",
+            "deliver_repair_attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
@@ -279,6 +287,7 @@ impl Db {
             findings_json: None,
             fixer_session_id: None,
             pr_url: None,
+            deliver_repair_attempts: 0,
         })
     }
 
@@ -578,6 +587,30 @@ impl Db {
         Ok(())
     }
 
+    /// Increment `deliver_repair_attempts` when a fix attempt starts; returns the new count.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the update fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn increment_deliver_repair_attempts(&self, id: &str) -> Result<u32> {
+        let conn = self.conn.lock().expect("db mutex");
+        conn.execute(
+            "UPDATE runs SET deliver_repair_attempts = deliver_repair_attempts + 1 WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        let n: i64 = conn.query_row(
+            "SELECT deliver_repair_attempts FROM runs WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )?;
+        u32::try_from(n)
+            .map_err(|_| crate::Error::Other(format!("deliver_repair_attempts out of range: {n}")))
+    }
+
     /// Insert or replace the uncertified fixer range for a repo branch.
     ///
     /// # Errors
@@ -771,6 +804,10 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         findings_json: row.get(12)?,
         fixer_session_id: row.get(13)?,
         pr_url: row.get(14)?,
+        deliver_repair_attempts: {
+            let n: i64 = row.get(15)?;
+            u32::try_from(n).unwrap_or(0)
+        },
     })
 }
 

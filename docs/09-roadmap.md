@@ -63,15 +63,15 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 - [ ] Mailgate sketch smoke: biome + types/api/docs drift (operator-gated; not `cargo test`)
 - [x] No Postgres, no Playwright as certify defaults
 
-## M6 — Deliver GitHub (done for push+PR+allowlist watch)
+## M6 — Deliver GitHub (push+PR+allowlist watch+repair)
 
 - [x] Lease-push exact SHA (`--force-with-lease=<ref>:<observed>`; never bare `--force`)
 - [x] `gh pr create/update`, body + `<!-- porch-attestation … -->` binding `head_sha`
 - [x] Watch allowlisted checks only (`deliver.github.watch_checks`); empty allowlist → push+PR, no babysit
 - [x] `rerun_transient` default **0**; no `gh run rerun` in this milestone
-- [x] Fail closed on incorporate refuse / missing `gh` (before push) / red allowlisted checks after poll
+- [x] Fail closed on incorporate refuse / missing `gh` (before push) / non-repairable or budget-exhausted allowlisted red
 - [x] `runs.pr_url`; daemon restart while watching → `ci_monitor_interrupted` (not failed)
-- [ ] Repair: agent CI-fix loop restart at **review** (deferred — fail closed on red allowlisted checks instead)
+- [x] Repair: mechanical allowlisted CI-fix / CONFLICTING rebase → restart at **review** → certify → lease-push (budget 3; cancelled/timed_out fail closed; no `gh run rerun`)
 
 ## M7 — Dogfood on mailgate
 

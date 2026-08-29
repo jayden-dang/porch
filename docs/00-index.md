@@ -1,6 +1,6 @@
 # Porch briefing index
 
-This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through M6 (GitHub deliver: lease-push exact SHA, `gh` PR create/update, allowlisted check watch). Repair restart-at-review after CI fix is deferred.
+This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through M6 (GitHub deliver: lease-push exact SHA, `gh` PR create/update, allowlisted check watch, mechanical repair restart-at-review).
 
 ## Read order
 

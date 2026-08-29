@@ -170,6 +170,10 @@ case "$CMD" in
     fi
     exit 0
     ;;
+  view)
+    printf '{"mergeable":"MERGEABLE"}\n'
+    exit 0
+    ;;
   checks)
     case "$MODE" in
       lint_fail)

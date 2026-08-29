@@ -4,9 +4,9 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use porch_deliver::{
-    Attestation, PrOpts, StepSnapshot, WatchChecksOpts, build_pr_body, check_poll_interval,
-    check_timeout, create_pr, edit_pr_body, ensure_gh_runnable, find_open_pr, gh_bin, gh_timeout,
-    pr_title, watch_allowlisted_checks,
+    Attestation, CheckRow, MergeableState, PrOpts, StepSnapshot, WatchChecksOpts, WatchOutcome,
+    build_pr_body, check_poll_interval, check_timeout, create_pr, edit_pr_body, ensure_gh_runnable,
+    find_open_pr, gh_bin, gh_timeout, pr_mergeable, pr_title, watch_allowlisted_checks,
 };
 use porch_gate::Db;
 use porch_git::{
@@ -26,6 +26,17 @@ pub(crate) enum DeliverError {
     Git(#[from] porch_git::Error),
     #[error(transparent)]
     Deliver(#[from] porch_deliver::Error),
+    /// Genuine allowlisted red — eligible for mechanical repair.
+    #[error("allowlisted check failed: {}", failed_names(.checks))]
+    AllowlistFailed { checks: Vec<CheckRow> },
+    /// Terminal non-mechanical allowlisted state (cancelled / `timed_out` / …).
+    #[error("allowlisted check non-repairable: {}", .names.join(", "))]
+    AllowlistNonRepairable { names: Vec<String> },
+    /// Forge reports the PR base is CONFLICTING.
+    #[error("pr merge conflicting")]
+    MergeConflicting,
+    #[error("allowlisted checks not green before poll timeout")]
+    WatchTimeout,
     #[error("{0}")]
     Msg(String),
 }
@@ -109,6 +120,20 @@ pub(crate) fn run_deliver_phase(
         (url, number)
     };
     db.set_pr_url(run_id, Some(&pr_url))?;
+
+    if pr_number != 0 {
+        match pr_mergeable(&bin, timeout, wt, pr_number) {
+            Ok(MergeableState::Conflicting) => {
+                return Err(DeliverError::MergeConflicting);
+            }
+            Ok(_) => {}
+            // Missing view support in older fakes / transient view errors: continue to watch.
+            Err(e) => {
+                tracing::warn!(error = %e, "pr mergeable probe failed; continuing to watch");
+            }
+        }
+    }
+
     maybe_watch(
         &bin,
         timeout,
@@ -134,7 +159,7 @@ fn maybe_watch(
     if cancelled(cancel) {
         return Err(DeliverError::Msg("cancelled".into()));
     }
-    watch_allowlisted_checks(&WatchChecksOpts {
+    let outcome = watch_allowlisted_checks(&WatchChecksOpts {
         bin,
         gh_timeout,
         work_tree: wt,
@@ -144,7 +169,23 @@ fn maybe_watch(
         poll_interval: check_poll_interval(),
         cancel,
     })?;
-    Ok(())
+    match outcome {
+        WatchOutcome::Ready => Ok(()),
+        WatchOutcome::Failed { checks } => Err(DeliverError::AllowlistFailed { checks }),
+        WatchOutcome::NonRepairable { names } => {
+            Err(DeliverError::AllowlistNonRepairable { names })
+        }
+        WatchOutcome::Timeout => Err(DeliverError::WatchTimeout),
+        WatchOutcome::Cancelled => Err(DeliverError::Msg("cancelled".into())),
+    }
+}
+
+fn failed_names(checks: &[CheckRow]) -> String {
+    checks
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn lease_push_exact(

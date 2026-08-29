@@ -29,7 +29,7 @@ working clone  --git push porch-->  bare gate  (~/.porch/repos/<id>.git)
 | 2 | **rebase** | Fetch integration branch + push target; rebase or fast-forward. Conflict → fixer. Empty diff vs base → skip remaining. Do not silently bundle unpushed local default-branch commits. | 3 |
 | 3 | **review** | External review CLI on `base..HEAD` in the worktree. Map to findings. Park on error/warning/ask-user. Fixer optional. Rereview cold. Write `review_approved_head_sha`. | 0 |
 | 4 | **certify** | Run configured cheap commands (format/lint/drift). Agent only for leftover targeted checks if commands empty — **do not** default to full workspace test. | 3 for command failures that are mechanical |
-| 5 | **deliver** | Format leftover? Commit leftover with a porch subject. `ls-remote`, lease-push exact SHA, `gh pr create/update`, watch **allowlisted** checks. Repair restart-at-review after CI fix / conflict rebase is **deferred** (M6 fail-closed on red allowlisted checks and incorporate refuse; see `docs/09-roadmap.md`). | 3 for mechanical check fails once repair lands; never for deploy |
+| 5 | **deliver** | Format leftover? Commit leftover with a porch subject. `ls-remote`, lease-push exact SHA, `gh pr create/update`, watch **allowlisted** checks. On genuine allowlisted red (or PR `CONFLICTING`), mechanical repair (budget 3) → clear `review_approved_head_sha` → session-free rereview → certify → lease-push again. Incorporate refuse stays fail-closed (E8). Never babysit deploy/E2E. | 3 for mechanical check fails; never for deploy |
 
 Skip is per-run (`--skip`, push option), never a standing config hole in the core five.
 
