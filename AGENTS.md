@@ -51,11 +51,12 @@ Do not run real LLM / review-CLI network / `gh` network in unit tests. Use PATH 
 
 ## Dogfood
 
-First consumer: **mailgate**. Porch must help that monorepo without replacing its CI. Clone index: [`docs/references.md`](docs/references.md).
+Consumers: **mailgate** (first) and **klynt** (second). Porch must help those monorepos without replacing their CI. Clone index: [`docs/references.md`](docs/references.md). Canonical yaml: [`docs/examples/`](docs/examples/).
 
 | Tree | Role | Clone |
 |---|---|---|
 | mailgate | Production CI porch must not replace; first dogfood | [../../work/CommandOss/mailgate](../../work/CommandOss/mailgate) |
+| klynt | Messy monolith CI; PR base `dev` vs `origin/HEAD` `main` | [../../klynt/klynt](../../klynt/klynt) |
 
 ## Language
 

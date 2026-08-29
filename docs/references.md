@@ -1,14 +1,16 @@
 # Clone references
 
-Links are to the local dogfood clone on this machine. Paths are relative to this file (`docs/`).
+Links are to the local dogfood clones on this machine. Paths are relative to this file (`docs/`).
 
 | Tree | Clone |
 |---|---|
 | mailgate | [../../../work/CommandOss/mailgate](../../../work/CommandOss/mailgate) |
+| klynt | [../../../klynt/klynt](../../../klynt/klynt) |
 
-Absolute root (if the relative link fails):
+Absolute roots (if a relative link fails):
 
 - `/Users/jayden/Developer/work/CommandOss/mailgate`
+- `/Users/jayden/Developer/klynt/klynt`
 
 ## mailgate
 
@@ -27,3 +29,15 @@ Absolute root (if the relative link fails):
 | Just recipes | [justfile](../../../work/CommandOss/mailgate/justfile) |
 | Lefthook | [lefthook.yml](../../../work/CommandOss/mailgate/lefthook.yml) |
 | PR template | [.github/pull_request_template.md](../../../work/CommandOss/mailgate/.github/pull_request_template.md) |
+
+## klynt
+
+| What | File |
+|---|---|
+| Root | [../../../klynt/klynt](../../../klynt/klynt) |
+| Agents | [AGENTS.md](../../../klynt/klynt/AGENTS.md) |
+| Project verify matrix | [docs/agents/project.md](../../../klynt/klynt/docs/agents/project.md) |
+| CI (moon ci monolith) | [.github/workflows/ci.yml](../../../klynt/klynt/.github/workflows/ci.yml) |
+| Just recipes | [justfile](../../../klynt/klynt/justfile) |
+| Lefthook | [lefthook.yml](../../../klynt/klynt/lefthook.yml) |
+| Canonical porch yaml | [examples/klynt.porch.yaml](examples/klynt.porch.yaml) |

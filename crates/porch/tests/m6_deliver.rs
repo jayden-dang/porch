@@ -783,3 +783,73 @@ fn lease_updates_ancestor_tip_on_origin() {
     assert_eq!(remote, certified);
     assert_ne!(remote, ancestor, "origin tip must move past ancestor");
 }
+
+#[test]
+fn pr_base_branch_from_trusted_yaml_in_pr_create() {
+    // Trusted yaml on origin/main; team PR base is `dev` (klynt-shaped).
+    let trusted = r"
+pr:
+  base_branch: dev
+review:
+  path_instructions:
+    - path: crates/enclave/**
+      instructions: Treat TEE as ask-user.
+";
+    let s = setup(Some(trusted), "clean", "ok");
+    // Ensure origin/dev exists for rebase onto (same tip as main is fine).
+    let main_sha = origin_branch_sha(&s.origin, "main").unwrap();
+    let st = StdCommand::new("git")
+        .args([
+            "--git-dir",
+            s.origin.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/dev",
+            &main_sha,
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    git(&s.work, &["checkout", "-b", "feat-base-dev"]);
+    std::fs::create_dir_all(s.work.join("crates/enclave")).unwrap();
+    commit_change(&s.work, "crates/enclave/x.rs", "fn x() {}\n");
+    push_with_env(&s, "feat-base-dev", "clean", "ok");
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["completed", "failed"],
+        Duration::from_secs(45),
+    );
+    assert_eq!(run.status, "completed", "err={:?}", run.error);
+
+    let log = gh_argv_log(&s.home);
+    assert!(
+        log.contains("pr create") && log.contains("--base") && log.contains("dev"),
+        "expected pr create --base dev in {log}"
+    );
+
+    let main_tip = origin_branch_sha(&s.origin, "main").unwrap();
+    assert_eq!(
+        run.trusted_config_sha.as_deref(),
+        Some(main_tip.as_str()),
+        "trusted_config_sha must pin origin/main (yaml-bearing default tip)"
+    );
+
+    let pi = s
+        .home
+        .join("runs")
+        .join(&run.id)
+        .join("path_instructions.json");
+    assert!(
+        pi.is_file(),
+        "path_instructions.json should be persisted under runs/<id>/"
+    );
+    let raw = std::fs::read_to_string(&pi).unwrap();
+    assert!(
+        raw.contains("crates/enclave/**"),
+        "persisted instructions: {raw}"
+    );
+}

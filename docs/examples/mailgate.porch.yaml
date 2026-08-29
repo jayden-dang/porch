@@ -1,0 +1,43 @@
+# Canonical mailgate dogfood sketch (trusted default-branch only).
+# Certify: cheap, no Postgres, no Nitro, no Playwright.
+# Skip-as-Ready is required for path-filtered PR Checks — without it,
+# babysit stalls on narrow PRs that never run types-check / mcp / etc.
+# NEVER: just gate / just test / e2e / Coolify / force-publish / rerun_transient>0.
+
+pr:
+  base_branch: dev
+
+commands:
+  format: bun run check:fix && just fmt
+  lint: bun run check && bun run types:check && bun run api:check && bun run docs:check
+  # test: omitted — never just gate / just test / e2e
+
+deliver:
+  github:
+    # Exact gh pr checks `name` values (workflow job ids).
+    # Most are path-filtered; skipped/skipping/neutral count as Ready for that name.
+    watch_checks:
+      - lint
+      - types-check
+      - docs-check
+      - mcp-conformance
+      - test-js
+      - test-infra
+      - test-contract
+      - canon-schema
+      - cargo-audit
+    rerun_transient: 0
+
+auto_fix:
+  review: 0
+
+review:
+  path_instructions:
+    - path: crates/enclave/**
+      instructions: Treat TEE/attestation/key handling as ask-user if the remedy extends trust boundaries.
+    - path: crates/auth_service/**
+      instructions: Auth and session changes are ask-user when they alter who is trusted.
+    - path: contract/sources/**
+      instructions: On-chain behavior changes are ask-user. Do not auto-apply.
+    - path: infra/**
+      instructions: infra/ is SoT for secrets. Do not emit gh secret/variable mutations.

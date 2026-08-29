@@ -14,9 +14,7 @@ use porch_git::{
     resolve_push_decision,
 };
 
-use crate::config::{DeliverGithub, parse_porch_config};
-
-const TRUSTED_CONFIG_PATH: &str = ".porch.yaml";
+use crate::config::{PorchConfig, effective_base_branch, load_trusted_at_sha};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DeliverError {
@@ -70,7 +68,8 @@ pub(crate) fn run_deliver_phase(
     // Prefer fail before push when gh cannot run (no branch without PR adapter).
     ensure_gh_runnable(&bin)?;
 
-    let deliver_cfg = load_trusted_deliver(db, run_id, bare)?;
+    let trusted = load_trusted_deliver(db, run_id, bare, default_branch)?;
+    let deliver_cfg = &trusted.deliver_github;
     // M6: never raise rerun budget; refuse if trusted yaml somehow requested it
     // while we do not implement rerun.
     if deliver_cfg.rerun_transient > 0 {
@@ -79,6 +78,7 @@ pub(crate) fn run_deliver_phase(
             "trusted rerun_transient > 0 ignored in M6 (no gh run rerun)"
         );
     }
+    let pr_base = effective_base_branch(&trusted.pr_base_branch, default_branch).to_string();
 
     let refname = format!("refs/heads/{}", run.branch);
     lease_push_exact(bare, &refname, &head_sha, run.base_sha.as_deref())?;
@@ -104,7 +104,7 @@ pub(crate) fn run_deliver_phase(
             timeout,
             work_tree: wt,
             head_branch: &run.branch,
-            base_branch: default_branch,
+            base_branch: &pr_base,
             title: &title,
             body: &body,
         })?;
@@ -235,21 +235,18 @@ fn load_trusted_deliver(
     db: &Db,
     run_id: &str,
     bare: &GitDir,
-) -> Result<DeliverGithub, DeliverError> {
+    _default_branch: &str,
+) -> Result<PorchConfig, DeliverError> {
     let run = db
         .run_by_id(run_id)?
         .ok_or_else(|| DeliverError::Msg(format!("unknown run {run_id}")))?;
-    let trusted_sha = run
-        .base_sha
-        .as_deref()
-        .ok_or_else(|| DeliverError::Msg("deliver requires base_sha".into()))?;
-
-    match porch_git::show_path_at(bare, trusted_sha, TRUSTED_CONFIG_PATH)? {
-        None => Ok(DeliverGithub::default()),
-        Some(bytes) => Ok(parse_porch_config(&bytes)
-            .map_err(DeliverError::Msg)?
-            .deliver_github),
+    if run.base_sha.is_none() {
+        return Err(DeliverError::Msg("deliver requires base_sha".into()));
     }
+    let trusted_sha = run.trusted_config_sha.as_deref().ok_or_else(|| {
+        DeliverError::Msg("deliver requires trusted_config_sha (pin at rebase)".into())
+    })?;
+    load_trusted_at_sha(bare, trusted_sha).map_err(DeliverError::Msg)
 }
 
 fn assemble_body(

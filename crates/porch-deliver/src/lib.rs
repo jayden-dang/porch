@@ -164,6 +164,9 @@ pub enum WatchOutcome {
 /// (fail closed; not mechanical auto-fix). Non-repairable **states** and bucket
 /// `cancel` are classified before any `bucket=fail` mechanical rule (real `gh`
 /// maps `timed_out` / `action_required` to bucket `fail`).
+///
+/// Path-filtered jobs that report skip / skipped / skipping / neutral (state or
+/// bucket) are **Ready for that name** — missing name is still Waiting.
 #[must_use]
 pub fn evaluate_allowlist(checks: &[CheckRow], allowlist: &[String]) -> AllowlistReady {
     if allowlist.is_empty() {
@@ -180,7 +183,7 @@ pub fn evaluate_allowlist(checks: &[CheckRow], allowlist: &[String]) -> Allowlis
         };
         let state = row.state.to_ascii_lowercase();
         let bucket = row.bucket.to_ascii_lowercase();
-        if is_check_success(&state, &bucket) {
+        if is_check_success(&state, &bucket) || is_check_skipped(&state, &bucket) {
             continue;
         }
         // Non-repairable states/buckets before bucket=fail mechanical matching.
@@ -213,6 +216,12 @@ pub fn evaluate_allowlist(checks: &[CheckRow], allowlist: &[String]) -> Allowlis
 
 fn is_check_success(state: &str, bucket: &str) -> bool {
     matches!(state, "success" | "pass" | "passed") || matches!(bucket, "pass" | "success")
+}
+
+/// Path-filter skip / neutral — Ready for that allowlisted name (not Waiting).
+fn is_check_skipped(state: &str, bucket: &str) -> bool {
+    matches!(state, "skip" | "skipped" | "skipping" | "neutral")
+        || matches!(bucket, "skip" | "skipped" | "skipping" | "neutral")
 }
 
 /// Genuine job failure — eligible for mechanical deliver repair.
@@ -901,6 +910,75 @@ mod tests {
         ];
         assert_eq!(
             evaluate_allowlist(&checks, &["lint".into()]),
+            AllowlistReady::Ready
+        );
+    }
+
+    #[test]
+    fn allowlist_skipped_types_check_with_lint_pass_is_ready() {
+        // Path-filtered PR jobs show as skipped/skipping; treat as Ready for that name.
+        let checks = vec![
+            check("types-check", "skipped", "skipping"),
+            check("lint", "success", "pass"),
+            check("e2e", "failure", "fail"),
+        ];
+        assert_eq!(
+            evaluate_allowlist(&checks, &["lint".into(), "types-check".into()]),
+            AllowlistReady::Ready
+        );
+    }
+
+    #[test]
+    fn allowlist_failed_lint_still_failed_when_peer_skipped() {
+        let checks = vec![
+            check("lint", "failure", "fail"),
+            check("types-check", "skipped", "skipping"),
+        ];
+        match evaluate_allowlist(&checks, &["lint".into(), "types-check".into()]) {
+            AllowlistReady::Failed { checks: failed } => {
+                assert_eq!(
+                    failed.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                    vec!["lint"]
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_unlisted_e2e_fail_ignored_with_skips() {
+        let checks = vec![
+            check("lint", "success", "pass"),
+            check("types-check", "skip", "skip"),
+            check("e2e", "failure", "fail"),
+        ];
+        assert_eq!(
+            evaluate_allowlist(&checks, &["lint".into(), "types-check".into()]),
+            AllowlistReady::Ready
+        );
+    }
+
+    #[test]
+    fn allowlist_missing_name_still_waiting_even_if_peers_skipped() {
+        let checks = vec![check("lint", "skipped", "neutral")];
+        assert_eq!(
+            evaluate_allowlist(&checks, &["lint".into(), "types-check".into()]),
+            AllowlistReady::Waiting
+        );
+    }
+
+    #[test]
+    fn allowlist_neutral_state_or_bucket_is_ready() {
+        assert_eq!(
+            evaluate_allowlist(&[check("lint", "neutral", "")], &["lint".into()]),
+            AllowlistReady::Ready
+        );
+        assert_eq!(
+            evaluate_allowlist(&[check("lint", "success", "neutral")], &["lint".into()]),
+            AllowlistReady::Ready
+        );
+        assert_eq!(
+            evaluate_allowlist(&[check("lint", "", "neutral")], &["lint".into()]),
             AllowlistReady::Ready
         );
     }

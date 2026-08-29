@@ -1,0 +1,51 @@
+# Klynt — cheap porch certify (format / lint / types / drift).
+# NEVER: moon ci, just test, just e2e, Deploy to *, Coolify, Playwright, rerun_transient>0.
+# origin/HEAD is main; team PR base is dev — do not conflate.
+
+pr:
+  base_branch: dev
+
+commands:
+  format: just fmt
+  # fmt-check + lint + typecheck across moon projects + OpenAPI drift.
+  # Uses SQLX_OFFLINE clippy (no Postgres). Drift may cold-compile emit_openapi.
+  lint: moon run :fmt-check :lint :typecheck api-contract:drift-check
+
+deliver:
+  github:
+    # No cheap CI job exists. Empty = push+PR, no babysit (honest for "cheap").
+    # Do NOT add "moon ci" or "CI status" — those include Playwright + Postgres.
+    watch_checks: []
+    rerun_transient: 0
+
+auto_fix:
+  review: 0
+
+review:
+  path_instructions:
+    - path: backend/crates/services/auth_service/**
+      instructions: Auth and session trust changes are ask-user when they alter who is trusted.
+    - path: backend/crates/gateways/src/middleware/auth.rs
+      instructions: Auth middleware changes are ask-user.
+    - path: backend/crates/gateways/src/routes/auth*
+      instructions: Auth/OAuth route changes are ask-user.
+    - path: backend/crates/infra/persistence/**
+      instructions: Persistence adapter changes are ask-user when they alter durable storage semantics.
+    - path: backend/migrations/**
+      instructions: Schema/migration changes are ask-user. Do not auto-apply.
+    - path: backend/.sqlx/**
+      instructions: sqlx offline cache changes paired with query/migration edits are ask-user if regenerating needs live DB.
+    - path: packages/api-contract/**
+      instructions: OpenAPI contract drift/regeneration that changes public API shape is ask-user when scope expands past the finding.
+    - path: .github/workflows/deploy*.yml
+      instructions: Deploy workflow changes are ask-user. Never emit Coolify or gh secret mutations.
+    - path: .github/workflows/reusable-deploy.yml
+      instructions: Deploy reusable workflow is ask-user.
+    - path: docker-compose.yml
+      instructions: Compose/infra plane changes are ask-user.
+    - path: docker/**
+      instructions: Container/infra config is ask-user.
+    - path: .env*
+      instructions: Env/secrets templates are ask-user. Do not publish secrets.
+    - path: frontend/.env*
+      instructions: Frontend env/secrets templates are ask-user. Do not publish secrets.

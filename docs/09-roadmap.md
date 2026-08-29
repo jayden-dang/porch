@@ -73,12 +73,15 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 - [x] `runs.pr_url`; daemon restart while watching → `ci_monitor_interrupted` (not failed)
 - [x] Repair: mechanical allowlisted CI-fix / CONFLICTING rebase → restart at **review** → certify → lease-push (budget 3; cancelled/timed_out fail closed; no `gh run rerun`)
 
-## M7 — Dogfood on mailgate
+## M7 — Dogfood yaml + porch gaps (done)
 
-- `.porch.yaml` on default branch (trusted)
-- Path instructions for enclave/auth/contract/infra
-- Measure: did PR Checks fail less often for mechanical drift? Did review park real `ask-user` issues?
-- Worktree cold-compile pain: document sccache; still do not run full `just gate`
+- [x] Canonical yaml authored: `docs/examples/mailgate.porch.yaml`, `docs/examples/klynt.porch.yaml`
+- [x] Allowlist **skip-as-Ready** (skip/skipped/skipping/neutral); missing name still Waiting
+- [x] Trusted `pr.base_branch` → rebase fetch/onto + `gh pr create --base` (empty → `repos.default_branch`)
+- [x] Parse `review.path_instructions`; persist matching-or-all JSON under `$PORCH_HOME/runs/<id>/`
+- [x] Docs: `04-klynt.md`, mailgate sketch → canonical example; index/roadmap/references/AGENTS dogfood table
+- [ ] Measurement of live PR-check rates / ask-user park rates is **observational** — not claimed as a shipped metric
+- Worktree cold-compile pain: document sccache; still do not run full `just gate` / `moon ci`
 
 ## M8 — Operator UX
 

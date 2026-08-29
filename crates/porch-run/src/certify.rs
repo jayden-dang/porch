@@ -8,10 +8,9 @@ use std::time::{Duration, Instant};
 use porch_gate::Db;
 use porch_git::GitDir;
 
-use crate::config::{Commands, parse_porch_yaml};
+use crate::config::{Commands, load_trusted_at_sha};
 
 pub(crate) const CERTIFY_TIMEOUT_ENV: &str = "PORCH_CERTIFY_TIMEOUT_SECS";
-const TRUSTED_CONFIG_PATH: &str = ".porch.yaml";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CertifyError {
@@ -37,16 +36,20 @@ pub(crate) fn certify_timeout() -> Duration {
 /// Load trusted commands and run one pass of format then lint.
 ///
 /// Caller must assert HEAD continuity first. Empty commands complete without spawn.
+/// Trusted executing fields are read from the run-pinned `trusted_config_sha`
+/// (default-branch tip observed at rebase), not from a fresh remote-tracking
+/// rev-parse and not from the rebase-onto / `base_sha` tip.
 ///
 /// # Errors
 ///
-/// Fails closed on missing `base_sha`, unreadable trusted commit, unparseable
-/// yaml, non-zero format/lint, timeout, or cancel.
+/// Fails closed on missing `base_sha` or `trusted_config_sha`, unreadable pinned
+/// commit, unparseable yaml, non-zero format/lint, timeout, or cancel.
 pub(crate) fn run_certify_phase(
     db: &Db,
     run_id: &str,
     bare: &GitDir,
     wt: &Path,
+    _default_branch: &str,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(), CertifyError> {
     let cmds = load_trusted_commands(db, run_id, bare)?;
@@ -81,15 +84,16 @@ fn load_trusted_commands(db: &Db, run_id: &str, bare: &GitDir) -> Result<Command
     let run = db
         .run_by_id(run_id)?
         .ok_or_else(|| CertifyError::Msg(format!("unknown run {run_id}")))?;
-    let trusted_sha = run
-        .base_sha
-        .as_deref()
-        .ok_or_else(|| CertifyError::Msg("certify requires base_sha".into()))?;
-
-    match porch_git::show_path_at(bare, trusted_sha, TRUSTED_CONFIG_PATH)? {
-        None => Ok(Commands::default()),
-        Some(bytes) => parse_porch_yaml(&bytes).map_err(CertifyError::Msg),
+    // Rebase must have completed (base_sha set) before certify.
+    if run.base_sha.is_none() {
+        return Err(CertifyError::Msg("certify requires base_sha".into()));
     }
+    let trusted_sha = run.trusted_config_sha.as_deref().ok_or_else(|| {
+        CertifyError::Msg("certify requires trusted_config_sha (pin at rebase)".into())
+    })?;
+    Ok(load_trusted_at_sha(bare, trusted_sha)
+        .map_err(CertifyError::Msg)?
+        .commands)
 }
 
 fn non_empty(s: &str) -> Option<&str> {

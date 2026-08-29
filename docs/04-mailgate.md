@@ -76,45 +76,12 @@ Cold enclave compile: 6–15 min, disk reclaim composite action, rust-cache `sha
 - Publish secrets, wallet addresses, or home paths in PR bodies (redact home-directory prefixes).
 - `test.evidence.store_in_repo` if artifacts can contain keys/addresses.
 
-## Suggested mailgate `.porch.yaml` sketch (not implemented)
+## Canonical config
 
-Trusted default-branch only for executing fields:
+**Canonical file:** [`examples/mailgate.porch.yaml`](examples/mailgate.porch.yaml).
 
-```yaml
-# certify adapters — cheap, no Postgres, no Nitro
-commands:
-  format: bun run check:fix && just fmt
-  lint: bun run check && bun run types:check && bun run api:check && bun run docs:check
+Trusted default-branch only for executing fields. `pr.base_branch: dev` matches how they open PRs (once a PR exists, the live forge base wins).
 
-# commands.test omitted — certify/review/intent-targeted only
+**Skip-as-Ready:** most PR Checks jobs are path-filtered. Allowlisted checks that report skip / skipped / skipping / neutral (state or bucket) are **Ready for that name**; a missing name is still Waiting. Without skip-as-Ready, babysit stalls on narrow PRs.
 
-deliver:
-  github:
-    watch_checks:
-      - lint
-      - types-check
-      - docs-check
-      - mcp-conformance
-      - test-js
-      - test-infra
-      - test-contract
-      - canon-schema
-      - cargo-audit
-    rerun_transient: 0
-
-auto_fix:
-  review: 0
-
-review:
-  path_instructions:
-    - path: crates/enclave/**
-      instructions: Treat TEE/attestation/key handling as ask-user if the remedy extends trust boundaries.
-    - path: crates/auth_service/**
-      instructions: Auth and session changes are ask-user when they alter who is trusted.
-    - path: contract/sources/**
-      instructions: On-chain behavior changes are ask-user. Do not auto-apply.
-    - path: infra/**
-      instructions: infra/ is SoT for secrets. Do not emit gh secret/variable mutations.
-```
-
-`pr.base_branch` must match how they actually open PRs (`dev` vs `main`). Once a PR exists, the live forge base wins.
+Never put `just gate` / `just test` / e2e / Coolify in certify or `watch_checks`. Keep `rerun_transient: 0`.

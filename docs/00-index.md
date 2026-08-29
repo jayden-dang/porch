@@ -1,6 +1,6 @@
 # Porch briefing index
 
-This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through M6 (GitHub deliver: lease-push exact SHA, `gh` PR create/update, allowlisted check watch, mechanical repair restart-at-review).
+This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through M7 (dogfood yaml + allowlist skip-as-Ready + trusted `pr.base_branch` + path_instructions persist).
 
 ## Read order
 
@@ -16,13 +16,17 @@ This directory is the product briefing. Treat these files as the current spec un
 | File | Takeaway |
 |---|---|
 | [05-review-loop.md](05-review-loop.md) | Adversarial review, session split, intent, park vs auto-fix |
-| [04-mailgate.md](04-mailgate.md) | Production CI porch must sit *in front of*, never absorb |
+| [04-mailgate.md](04-mailgate.md) | First dogfood; production CI porch must sit *in front of*, never absorb |
+| [04-klynt.md](04-klynt.md) | Second dogfood; monolith `moon ci`; PR base `dev` vs `origin/HEAD` `main` |
+| [examples/mailgate.porch.yaml](examples/mailgate.porch.yaml) | Canonical mailgate trusted yaml |
+| [examples/klynt.porch.yaml](examples/klynt.porch.yaml) | Canonical klynt trusted yaml |
 
 ## Dogfood
 
 Clickable path: **[references.md](references.md)**.
 
 - [mailgate](../../../work/CommandOss/mailgate)
+- [klynt](../../../klynt/klynt)
 
 ## One-sentence product
 

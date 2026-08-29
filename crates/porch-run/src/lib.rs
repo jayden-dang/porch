@@ -22,6 +22,11 @@ use porch_git::GitDir;
 use porch_review::{Finding, RunReviewOpts, review_bin, review_timeout, run_review};
 use serde::Serialize;
 
+use crate::config::{
+    effective_base_branch, load_trusted_at_sha, persist_path_instructions,
+    resolve_default_branch_tip,
+};
+
 /// Phases in locked order (D5).
 const PHASES: &[&str] = &["intent", "rebase", "review", "certify", "deliver"];
 
@@ -122,19 +127,21 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                         db.insert_step_result(run_id, phase, "skipped", Some("no intent"))?;
                     }
                 }
-                "rebase" => match run_rebase(&db, run_id, &bare, &wt_path, &repo.default_branch) {
-                    Ok(empty) => {
-                        db.insert_step_result(run_id, phase, "completed", None)?;
-                        if empty {
-                            skip_remaining = true;
+                "rebase" => {
+                    match run_rebase(&db, home, run_id, &bare, &wt_path, &repo.default_branch) {
+                        Ok(empty) => {
+                            db.insert_step_result(run_id, phase, "completed", None)?;
+                            if empty {
+                                skip_remaining = true;
+                            }
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            db.insert_step_result(run_id, phase, "failed", Some(&msg))?;
+                            return Err(e);
                         }
                     }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        db.insert_step_result(run_id, phase, "failed", Some(&msg))?;
-                        return Err(e);
-                    }
-                },
+                }
                 "review" => match run_review_phase(&db, run_id, &wt_path, false)? {
                     ReviewPhase::Approved => {
                         db.insert_step_result(run_id, phase, "completed", None)?;
@@ -145,7 +152,14 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                     }
                 },
                 "certify" => {
-                    execute_certify_step(&db, run_id, &bare, &wt_path, cancel)?;
+                    execute_certify_step(
+                        &db,
+                        run_id,
+                        &bare,
+                        &wt_path,
+                        &repo.default_branch,
+                        cancel,
+                    )?;
                 }
                 "deliver" => {
                     match execute_deliver_step(
@@ -296,10 +310,11 @@ fn execute_certify_step(
     run_id: &str,
     bare: &GitDir,
     wt: &Path,
+    default_branch: &str,
     cancel: &AtomicBool,
 ) -> Result<()> {
     assert_head_continuity(db, run_id, wt)?;
-    match certify::run_certify_phase(db, run_id, bare, wt, Some(cancel)) {
+    match certify::run_certify_phase(db, run_id, bare, wt, default_branch, Some(cancel)) {
         Ok(()) => {
             db.insert_step_result(run_id, "certify", "completed", None)?;
             Ok(())
@@ -377,7 +392,7 @@ fn deliver_with_repair(
                         attempt_allowlist_repair(db, home, run_id, wt, checks)?;
                     }
                     deliver::DeliverError::MergeConflicting => {
-                        attempt_merge_conflict_rebase(db, bare, wt, run_id, default_branch)?;
+                        attempt_merge_conflict_rebase(db, home, bare, wt, run_id, default_branch)?;
                     }
                     _ => unreachable!("filtered by repairable"),
                 }
@@ -408,7 +423,7 @@ fn deliver_with_repair(
                         )?;
                         let local_cancel = AtomicBool::new(false);
                         let cancel_flag = cancel.unwrap_or(&local_cancel);
-                        execute_certify_step(db, run_id, bare, wt, cancel_flag)?;
+                        execute_certify_step(db, run_id, bare, wt, default_branch, cancel_flag)?;
                         assert_head_continuity(db, run_id, wt)?;
                         // Loop: lease-push + PR update + re-watch.
                     }
@@ -470,21 +485,26 @@ fn attempt_allowlist_repair(
 
 fn attempt_merge_conflict_rebase(
     db: &Db,
+    home: &Path,
     bare: &GitDir,
     wt: &Path,
     run_id: &str,
     default_branch: &str,
 ) -> Result<()> {
+    let run = db
+        .run_by_id(run_id)?
+        .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
+    // Keep the initial-rebase pin; do not refresh trusted_config_sha on repair.
+    let trusted_sha = run
+        .trusted_config_sha
+        .as_deref()
+        .ok_or_else(|| RunError::Msg("merge conflict repair requires trusted_config_sha".into()))?;
+    let cfg = load_trusted_at_sha(bare, trusted_sha).map_err(RunError::Msg)?;
     let onto = {
         let _guard = FETCH_RESOLVE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let refspec = format!("refs/heads/{default_branch}:refs/remotes/origin/{default_branch}");
-        porch_git::fetch(bare, "origin", &refspec)
-            .map_err(|e| RunError::Msg(format!("fetch origin/{default_branch}: {e}")))?;
-        let origin_ref = format!("refs/remotes/origin/{default_branch}");
-        porch_git::rev_parse(bare, &origin_ref)
-            .map_err(|e| RunError::Msg(format!("resolve origin/{default_branch}: {e}")))?
+        resolve_onto_tip(bare, default_branch, &cfg.pr_base_branch)?
     };
     if let Err(e) = porch_git::rebase(wt, &onto) {
         let _ = porch_git::rebase_abort(wt);
@@ -492,7 +512,54 @@ fn attempt_merge_conflict_rebase(
     }
     let head = porch_git::rev_parse_c(wt, "HEAD")?;
     db.set_run_shas(run_id, Some(&head), None)?;
+    maybe_persist_path_instructions(home, run_id, wt, &onto, &head, &cfg.path_instructions)?;
     Ok(())
+}
+
+/// Fetch and resolve the effective rebase-onto tip without changing the trusted pin.
+fn resolve_onto_tip(bare: &GitDir, default_branch: &str, pr_base_branch: &str) -> Result<String> {
+    let base_branch = effective_base_branch(pr_base_branch, default_branch);
+    let refspec = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
+    porch_git::fetch(bare, "origin", &refspec)
+        .map_err(|e| RunError::Msg(format!("fetch origin/{base_branch}: {e}")))?;
+    let origin_ref = format!("refs/remotes/origin/{base_branch}");
+    porch_git::rev_parse(bare, &origin_ref)
+        .map_err(|e| RunError::Msg(format!("resolve origin/{base_branch}: {e}")))
+}
+
+/// Fetch trusted default tip, pin SHA, honor `pr.base_branch`.
+/// Returns `(onto_sha, config, trusted_config_sha)`.
+///
+/// Unparseable trusted yaml is treated as empty for rebase onto selection;
+/// certify/deliver still fail closed on the same pinned bytes.
+fn resolve_rebase_onto(
+    bare: &GitDir,
+    default_branch: &str,
+) -> Result<(String, crate::config::PorchConfig, String)> {
+    let default_refspec =
+        format!("refs/heads/{default_branch}:refs/remotes/origin/{default_branch}");
+    porch_git::fetch(bare, "origin", &default_refspec)
+        .map_err(|e| RunError::Msg(format!("fetch origin/{default_branch}: {e}")))?;
+    let trusted_sha = resolve_default_branch_tip(bare, default_branch).map_err(RunError::Msg)?;
+    let cfg = match load_trusted_at_sha(bare, &trusted_sha) {
+        Ok(c) => c,
+        Err(e) if e.contains("parse error") || e.contains("not utf-8") => {
+            tracing::warn!(error = %e, "trusted yaml unparseable at rebase; using default_branch");
+            crate::config::PorchConfig::default()
+        }
+        Err(e) => return Err(RunError::Msg(e)),
+    };
+    let base_branch = effective_base_branch(&cfg.pr_base_branch, default_branch).to_string();
+    if base_branch == default_branch {
+        return Ok((trusted_sha.clone(), cfg, trusted_sha));
+    }
+    let refspec = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
+    porch_git::fetch(bare, "origin", &refspec)
+        .map_err(|e| RunError::Msg(format!("fetch origin/{base_branch}: {e}")))?;
+    let origin_ref = format!("refs/remotes/origin/{base_branch}");
+    let onto = porch_git::rev_parse(bare, &origin_ref)
+        .map_err(|e| RunError::Msg(format!("resolve origin/{base_branch}: {e}")))?;
+    Ok((onto, cfg, trusted_sha))
 }
 
 fn maybe_deliver_repair_commit(wt: &Path) -> Result<bool> {
@@ -573,28 +640,26 @@ fn persist_uncertified_after_fix(
 
 fn run_rebase(
     db: &Db,
+    home: &Path,
     run_id: &str,
     bare: &GitDir,
     wt: &Path,
     default_branch: &str,
 ) -> Result<bool> {
-    let onto = {
+    let (onto, path_instructions, trusted_sha) = {
         let _guard = FETCH_RESOLVE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let refspec = format!("refs/heads/{default_branch}:refs/remotes/origin/{default_branch}");
-        porch_git::fetch(bare, "origin", &refspec)
-            .map_err(|e| RunError::Msg(format!("fetch origin/{default_branch}: {e}")))?;
-
-        let origin_ref = format!("refs/remotes/origin/{default_branch}");
-        porch_git::rev_parse(bare, &origin_ref)
-            .map_err(|e| RunError::Msg(format!("resolve origin/{default_branch}: {e}")))?
+        let (onto, cfg, trusted_sha) = resolve_rebase_onto(bare, default_branch)?;
+        (onto, cfg.path_instructions, trusted_sha)
     };
+    db.set_trusted_config_sha(run_id, &trusted_sha)?;
     db.set_run_shas(run_id, None, Some(&onto))?;
 
     let head = porch_git::rev_parse_c(wt, "HEAD")?;
     if head == onto {
         db.set_run_shas(run_id, Some(&head), Some(&onto))?;
+        maybe_persist_path_instructions(home, run_id, wt, &onto, &head, &path_instructions)?;
         return Ok(true);
     }
 
@@ -607,9 +672,27 @@ fn run_rebase(
 
     let head = porch_git::rev_parse_c(wt, "HEAD")?;
     db.set_run_shas(run_id, Some(&head), Some(&onto))?;
+    maybe_persist_path_instructions(home, run_id, wt, &onto, &head, &path_instructions)?;
     let range = format!("{onto}..{head}");
     let empty = porch_git::diff_is_empty(wt, &range)?;
     Ok(empty)
+}
+
+fn maybe_persist_path_instructions(
+    home: &Path,
+    run_id: &str,
+    wt: &Path,
+    onto: &str,
+    head: &str,
+    instructions: &[crate::config::PathInstruction],
+) -> Result<()> {
+    if instructions.is_empty() {
+        return Ok(());
+    }
+    let range = format!("{onto}..{head}");
+    let changed = porch_git::diff_name_only(wt, &range).unwrap_or_default();
+    persist_path_instructions(home, run_id, instructions, &changed).map_err(RunError::Msg)?;
+    Ok(())
 }
 
 fn remove_run_worktree(bare: &GitDir, wt: &Path) {
@@ -1023,7 +1106,7 @@ fn finish_certify_and_deliver(
     default_branch: &str,
 ) -> std::result::Result<bool, UsageOrFail> {
     assert_head_continuity(db, run_id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    match certify::run_certify_phase(db, run_id, bare, wt, None) {
+    match certify::run_certify_phase(db, run_id, bare, wt, default_branch, None) {
         Ok(()) => {
             db.insert_step_result(run_id, "certify", "completed", None)
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;

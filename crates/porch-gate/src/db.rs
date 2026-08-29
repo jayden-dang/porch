@@ -10,12 +10,12 @@ use crate::Result;
 const RUN_SELECT_FROM: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
                     intent, intent_source, error, review_approved_head_sha, findings_json,
-                    fixer_session_id, pr_url, deliver_repair_attempts
+                    fixer_session_id, pr_url, deliver_repair_attempts, trusted_config_sha
              FROM runs";
 const RUN_SELECT: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
                     intent, intent_source, error, review_approved_head_sha, findings_json,
-                    fixer_session_id, pr_url, deliver_repair_attempts
+                    fixer_session_id, pr_url, deliver_repair_attempts, trusted_config_sha
              FROM runs WHERE id = ?1";
 
 pub struct Db {
@@ -49,6 +49,8 @@ pub struct RunRow {
     pub pr_url: Option<String>,
     /// Deliver mechanical repair attempts started (budget default 3).
     pub deliver_repair_attempts: u32,
+    /// Pinned default-branch tip SHA used for trusted `.porch.yaml` (E10).
+    pub trusted_config_sha: Option<String>,
 }
 
 /// Persisted fixer commit span awaiting a completed review (E23).
@@ -135,6 +137,7 @@ impl Db {
             "deliver_repair_attempts",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        ensure_column(&conn, "runs", "trusted_config_sha", "TEXT")?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
@@ -288,6 +291,7 @@ impl Db {
             fixer_session_id: None,
             pr_url: None,
             deliver_repair_attempts: 0,
+            trusted_config_sha: None,
         })
     }
 
@@ -511,6 +515,24 @@ impl Db {
             "UPDATE runs SET head_sha = COALESCE(?1, head_sha), base_sha = COALESCE(?2, base_sha)
              WHERE id = ?3",
             rusqlite::params![head_sha, base_sha, id],
+        )?;
+        Ok(())
+    }
+
+    /// Pin the trusted default-branch tip SHA for `.porch.yaml` (E10).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the update fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn set_trusted_config_sha(&self, id: &str, sha: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex");
+        conn.execute(
+            "UPDATE runs SET trusted_config_sha = ?1 WHERE id = ?2",
+            rusqlite::params![sha, id],
         )?;
         Ok(())
     }
@@ -808,6 +830,7 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
             let n: i64 = row.get(15)?;
             u32::try_from(n).unwrap_or(0)
         },
+        trusted_config_sha: row.get(16)?,
     })
 }
 
