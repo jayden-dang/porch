@@ -58,3 +58,15 @@ pub fn worktrees_dir(home: &std::path::Path) -> PathBuf {
 pub fn run_worktree_dir(home: &std::path::Path, repo_id: &str, run_id: &str) -> PathBuf {
     worktrees_dir(home).join(repo_id).join(run_id)
 }
+
+/// Per-run artifact root outside the worktree: `$PORCH_HOME/runs/<run_id>/`.
+#[must_use]
+pub fn run_artifact_dir(home: &std::path::Path, run_id: &str) -> PathBuf {
+    home.join("runs").join(run_id)
+}
+
+/// Fixer prompt/findings directory: `$PORCH_HOME/runs/<run_id>/fixer/`.
+#[must_use]
+pub fn run_fixer_dir(home: &std::path::Path, run_id: &str) -> PathBuf {
+    run_artifact_dir(home, run_id).join("fixer")
+}

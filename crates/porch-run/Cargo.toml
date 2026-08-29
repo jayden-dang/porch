@@ -8,6 +8,7 @@ publish = false
 description = "Execute a run: worktree, intent, rebase, review, park"
 
 [dependencies]
+porch-agent = { path = "../porch-agent" }
 porch-gate = { path = "../porch-gate" }
 porch-git = { path = "../porch-git" }
 porch-review = { path = "../porch-review" }
@@ -18,6 +19,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+porch-git = { path = "../porch-git" }
 
 [lints]
 workspace = true

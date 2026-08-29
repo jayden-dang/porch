@@ -51,13 +51,19 @@ enum AgentCommand {
         #[arg(long)]
         run_id: Option<String>,
     },
-    /// Respond to a parked review: approve | skip | abort.
+    /// Respond to a parked review: approve | skip | abort | fix.
     Respond {
-        /// `approve`, `skip`, or `abort`.
+        /// `approve`, `skip`, `abort`, or `fix`.
         response: String,
         /// Run id (ULID). Defaults to latest parked run for the cwd repo.
         #[arg(long)]
         run_id: Option<String>,
+        /// Comma-separated finding ids (only with `fix`).
+        #[arg(long)]
+        findings: Option<String>,
+        /// After one fix round, approve remaining findings (only with `fix`).
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -138,24 +144,77 @@ fn main_inner() -> Result<ExitCode> {
             Ok(emit_agent(&result))
         }
         Command::Agent {
-            command: AgentCommand::Respond { response, run_id },
-        } => {
-            let parsed = match AgentResponse::parse(&response) {
-                Ok(r) => r,
-                Err(msg) => {
-                    let _ = writeln!(
-                        io::stdout(),
-                        "{}",
-                        serde_json::json!({"error": msg, "code": "usage"})
-                    );
-                    return Ok(ExitCode::from(2));
-                }
-            };
-            let home = porch_home();
-            let work = env::current_dir()?;
-            let result = agent_respond(&home, run_id.as_deref(), &work, parsed);
-            Ok(emit_agent(&result))
+            command:
+                AgentCommand::Respond {
+                    response,
+                    run_id,
+                    findings,
+                    yes,
+                },
+        } => Ok(run_agent_respond(
+            &response,
+            run_id.as_deref(),
+            findings.as_deref(),
+            yes,
+        )?),
+    }
+}
+
+fn run_agent_respond(
+    response: &str,
+    run_id: Option<&str>,
+    findings: Option<&str>,
+    yes: bool,
+) -> Result<ExitCode> {
+    if (findings.is_some() || yes) && response != "fix" {
+        let _ = writeln!(
+            io::stdout(),
+            "{}",
+            serde_json::json!({
+                "error": "--findings and --yes are only valid with fix",
+                "code": "usage"
+            })
+        );
+        return Ok(ExitCode::from(2));
+    }
+    let parsed = match parse_agent_response(response, findings, yes) {
+        Ok(r) => r,
+        Err(msg) => {
+            let _ = writeln!(
+                io::stdout(),
+                "{}",
+                serde_json::json!({"error": msg, "code": "usage"})
+            );
+            return Ok(ExitCode::from(2));
         }
+    };
+    let home = porch_home();
+    let work = env::current_dir()?;
+    Ok(emit_agent(&agent_respond(&home, run_id, &work, parsed)))
+}
+
+fn parse_agent_response(
+    response: &str,
+    findings: Option<&str>,
+    yes: bool,
+) -> std::result::Result<AgentResponse, String> {
+    match response {
+        "approve" => Ok(AgentResponse::Approve),
+        "skip" => Ok(AgentResponse::Skip),
+        "abort" => Ok(AgentResponse::Abort),
+        "fix" => {
+            let finding_ids = findings.map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
+            Ok(AgentResponse::Fix { finding_ids, yes })
+        }
+        other => Err(format!(
+            "unknown response {other:?}; expected approve|skip|abort|fix"
+        )),
     }
 }
 

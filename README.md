@@ -66,7 +66,7 @@ porch init                 # ~/.porch bare repo, remote `porch`, hooks, daemon
 git push porch HEAD:refs/heads/your-branch
 ```
 
-`$PORCH_HOME` overrides `~/.porch`. Today the gate is **dead**: the push updates the bare repo and records a pending run. The five-phase pipeline is not wired yet.
+`$PORCH_HOME` overrides `~/.porch`. Push updates the bare, runs intent → rebase → review (park / `porch agent respond` including `fix`), then certify/deliver stubs. GitHub deliver is not wired yet.
 
 ```sh
 cargo test --workspace

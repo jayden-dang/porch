@@ -1,6 +1,6 @@
 # Porch briefing index
 
-This directory is the product briefing. Implementation has not started. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing.
+This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through M4 (fixer + rereview); certify/deliver remain stubs.
 
 ## Read order
 

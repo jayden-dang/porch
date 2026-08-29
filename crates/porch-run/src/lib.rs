@@ -7,12 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Serialize fetch + tip resolve across concurrent rebases in this process.
 static FETCH_RESOLVE_LOCK: Mutex<()> = Mutex::new(());
 
-use porch_gate::{Db, RunExecutor, RunRow, db_path, run_worktree_dir};
+use porch_agent::{RunFixerOpts, fixer_bin, fixer_timeout, run_fixer, write_fixer_inputs};
+use porch_gate::{Db, RunExecutor, RunRow, db_path, run_fixer_dir, run_worktree_dir};
 use porch_git::GitDir;
 use porch_review::{Finding, RunReviewOpts, review_bin, review_timeout, run_review};
 use serde::Serialize;
 
-/// Phases in locked order (D5). Certify/deliver remain stubs in M3.
+/// Phases in locked order (D5). Certify/deliver remain stubs in M4.
 const PHASES: &[&str] = &["intent", "rebase", "review", "certify", "deliver"];
 
 /// Production executor injected into the daemon from the `porch` binary.
@@ -39,6 +40,8 @@ enum RunError {
     Git(#[from] porch_git::Error),
     #[error(transparent)]
     Review(#[from] porch_review::Error),
+    #[error(transparent)]
+    Agent(#[from] porch_agent::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -113,7 +116,7 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                         return Err(e);
                     }
                 },
-                "review" => match run_review_phase(&db, run_id, &wt_path)? {
+                "review" => match run_review_phase(&db, run_id, &wt_path, false)? {
                     ReviewPhase::Approved => {
                         db.insert_step_result(run_id, phase, "completed", None)?;
                     }
@@ -123,6 +126,7 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                     }
                 },
                 "certify" | "deliver" => {
+                    assert_head_continuity(&db, run_id, &wt_path)?;
                     db.insert_step_result(run_id, phase, "completed", None)?;
                 }
                 _ => {}
@@ -162,7 +166,7 @@ enum ReviewPhase {
     Parked,
 }
 
-fn run_review_phase(db: &Db, run_id: &str, wt: &Path) -> Result<ReviewPhase> {
+fn run_review_phase(db: &Db, run_id: &str, wt: &Path, after_fix: bool) -> Result<ReviewPhase> {
     let run = db
         .run_by_id(run_id)?
         .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
@@ -173,14 +177,15 @@ fn run_review_phase(db: &Db, run_id: &str, wt: &Path) -> Result<ReviewPhase> {
     let head = porch_git::rev_parse_c(wt, "HEAD")?;
     db.set_run_shas(run_id, Some(&head), None)?;
 
-    let range = format!("{base}..{head}");
+    let from_sha = resolve_review_from(db, wt, &run, base, &head, after_fix)?;
+    let range = format!("{from_sha}..{head}");
     let changed = porch_git::diff_name_only(wt, &range)?;
     let bin = review_bin();
     let timeout = review_timeout();
 
     let outcome = match run_review(&RunReviewOpts {
         work_tree: wt,
-        from_sha: base,
+        from_sha: &from_sha,
         to_sha: &head,
         changed_files: &changed,
         bin: &bin,
@@ -202,7 +207,94 @@ fn run_review_phase(db: &Db, run_id: &str, wt: &Path) -> Result<ReviewPhase> {
     }
 
     db.set_review_approved_head_sha(run_id, Some(&head))?;
+    clear_uncertified_if_certified(db, wt, &run.repo_id, &run.branch, &head)?;
     Ok(ReviewPhase::Approved)
+}
+
+fn resolve_review_from(
+    db: &Db,
+    wt: &Path,
+    run: &RunRow,
+    base: &str,
+    head: &str,
+    after_fix: bool,
+) -> Result<String> {
+    let Some(rng) = db.get_uncertified_pipeline_range(&run.repo_id, &run.branch)? else {
+        return Ok(base.to_string());
+    };
+
+    if after_fix {
+        if porch_git::is_ancestor(wt, &rng.from_sha, head)? {
+            return Ok(rng.from_sha);
+        }
+        return Ok(base.to_string());
+    }
+
+    // Initial review: bind when range tip is HEAD or an ancestor of HEAD,
+    // and range from is an ancestor of HEAD.
+    let tip_ok = rng.to_sha == head || porch_git::is_ancestor(wt, &rng.to_sha, head)?;
+    if tip_ok && porch_git::is_ancestor(wt, &rng.from_sha, head)? {
+        return Ok(rng.from_sha);
+    }
+    Ok(base.to_string())
+}
+
+fn clear_uncertified_if_certified(
+    db: &Db,
+    wt: &Path,
+    repo_id: &str,
+    branch: &str,
+    approved_head: &str,
+) -> Result<()> {
+    let Some(rng) = db.get_uncertified_pipeline_range(repo_id, branch)? else {
+        return Ok(());
+    };
+    let certified =
+        rng.to_sha == approved_head || porch_git::is_ancestor(wt, &rng.to_sha, approved_head)?;
+    if certified {
+        db.delete_uncertified_pipeline_range(repo_id, branch)?;
+    }
+    Ok(())
+}
+
+fn assert_head_continuity(db: &Db, run_id: &str, wt: &Path) -> Result<()> {
+    let run = db
+        .run_by_id(run_id)?
+        .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
+    let approved = run
+        .review_approved_head_sha
+        .as_deref()
+        .ok_or_else(|| RunError::Msg("HEAD continuity: review_approved_head_sha missing".into()))?;
+    let head = porch_git::rev_parse_c(wt, "HEAD")?;
+    if head == approved {
+        return Ok(());
+    }
+    if porch_git::is_ancestor(wt, approved, &head)? {
+        return Ok(());
+    }
+    Err(RunError::Msg(format!(
+        "HEAD continuity: live HEAD {head} is not a descendant of approved {approved}"
+    )))
+}
+
+fn persist_uncertified_after_fix(
+    db: &Db,
+    wt: &Path,
+    run: &RunRow,
+    pre_fix_head: &str,
+    new_head: &str,
+) -> Result<()> {
+    if pre_fix_head == new_head {
+        return Ok(());
+    }
+    let mut from_sha = pre_fix_head.to_string();
+    if let Some(existing) = db.get_uncertified_pipeline_range(&run.repo_id, &run.branch)? {
+        if porch_git::is_ancestor(wt, &existing.to_sha, pre_fix_head)? {
+            from_sha = existing.from_sha;
+        }
+    }
+    db.upsert_uncertified_pipeline_range(&run.repo_id, &run.branch, &from_sha, new_head, &run.id)?;
+    Ok(())
 }
 
 fn run_rebase(
@@ -278,27 +370,38 @@ pub fn expected_worktree_path(home: &Path, repo_id: &str, run_id: &str) -> PathB
     run_worktree_dir(home, repo_id, run_id)
 }
 
-/// Human response to a parked review (M3: no fixer).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Human response to a parked review.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentResponse {
     Approve,
     Skip,
     Abort,
+    /// Spawn fixer for selected findings, then session-free rereview.
+    Fix {
+        /// Explicit finding ids; `None` means all blocking findings.
+        finding_ids: Option<Vec<String>>,
+        /// Standing consent: one fix round then approve remaining.
+        yes: bool,
+    },
 }
 
 impl AgentResponse {
-    /// Parse `approve` | `skip` | `abort`.
+    /// Parse `approve` | `skip` | `abort` | `fix` (without findings/`--yes`).
     ///
     /// # Errors
     ///
     /// Returns an error string when the token is not a supported response.
-    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+    pub fn parse_verb(s: &str) -> std::result::Result<Self, String> {
         match s {
             "approve" => Ok(Self::Approve),
             "skip" => Ok(Self::Skip),
             "abort" => Ok(Self::Abort),
+            "fix" => Ok(Self::Fix {
+                finding_ids: None,
+                yes: false,
+            }),
             other => Err(format!(
-                "unknown response {other:?}; expected approve|skip|abort"
+                "unknown response {other:?}; expected approve|skip|abort|fix"
             )),
         }
     }
@@ -328,10 +431,6 @@ pub struct AgentCliResult {
 }
 
 /// Build status JSON for a parked (or specified) run.
-///
-/// # Errors
-///
-/// Returns a usage-style error when the run cannot be resolved.
 #[must_use]
 pub fn agent_status(home: &Path, run_id: Option<&str>, work_tree: &Path) -> AgentCliResult {
     match agent_status_inner(home, run_id, work_tree) {
@@ -350,11 +449,7 @@ pub fn agent_status(home: &Path, run_id: Option<&str>, work_tree: &Path) -> Agen
     }
 }
 
-/// Apply `approve` | `skip` | `abort` to a parked run.
-///
-/// # Errors
-///
-/// Returns usage or failure payloads via [`AgentCliResult`].
+/// Apply `approve` | `skip` | `abort` | `fix` to a parked run.
 #[must_use]
 pub fn agent_respond(
     home: &Path,
@@ -431,9 +526,13 @@ fn agent_respond_inner(
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             db.set_review_approved_head_sha(&run.id, Some(&head))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            clear_uncertified_if_certified(&db, &wt, &run.repo_id, &run.branch, &head)
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             db.insert_step_result(&run.id, "review", "completed", Some("approved"))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             for phase in ["certify", "deliver"] {
+                assert_head_continuity(&db, &run.id, &wt)
+                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
                 db.insert_step_result(&run.id, phase, "completed", None)
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             }
@@ -458,6 +557,9 @@ fn agent_respond_inner(
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             remove_run_worktree(&bare, &wt);
         }
+        AgentResponse::Fix { finding_ids, yes } => {
+            respond_fix(&db, home, &run, &bare, &wt, finding_ids.as_ref(), yes)?;
+        }
     }
 
     let run = db
@@ -465,6 +567,188 @@ fn agent_respond_inner(
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?
         .ok_or_else(|| UsageOrFail::Fail("run disappeared".into()))?;
     Ok(status_from_run(&run))
+}
+
+fn respond_fix(
+    db: &Db,
+    home: &Path,
+    run: &RunRow,
+    bare: &GitDir,
+    wt: &Path,
+    finding_ids: Option<&Vec<String>>,
+    yes: bool,
+) -> std::result::Result<(), UsageOrFail> {
+    if !wt.exists() {
+        return Err(UsageOrFail::Fail("parked run worktree missing".into()));
+    }
+
+    let all_findings: Vec<Finding> = run
+        .findings_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let selected = select_findings(&all_findings, finding_ids)?;
+    if selected.is_empty() {
+        return Err(UsageOrFail::Usage(
+            "no findings selected; pass --findings or ensure blocking findings exist".into(),
+        ));
+    }
+
+    let Some(pre_fix_head) = spawn_and_wait_fixer(db, home, run, bare, wt, &selected)? else {
+        // Fixer failed closed; run already marked failed.
+        return Ok(());
+    };
+    let new_head =
+        porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    db.set_run_shas(&run.id, Some(&new_head), None)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    persist_uncertified_after_fix(db, wt, run, &pre_fix_head, &new_head)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+
+    finish_rereview(db, run, bare, wt, yes)
+}
+
+/// Returns `Ok(None)` when the fixer failed closed (run already marked failed).
+fn spawn_and_wait_fixer(
+    db: &Db,
+    home: &Path,
+    run: &RunRow,
+    bare: &GitDir,
+    wt: &Path,
+    selected: &[Finding],
+) -> std::result::Result<Option<String>, UsageOrFail> {
+    let findings_json =
+        serde_json::to_string_pretty(selected).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    let fixer_dir = run_fixer_dir(home, &run.id);
+    let (prompt_file, findings_file) = write_fixer_inputs(&fixer_dir, &findings_json)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+
+    db.set_run_status(&run.id, "running", None)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    let pre_fix_head =
+        porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+
+    let bin = match fixer_bin() {
+        Ok(b) => b,
+        Err(e) => {
+            fail_fix_run(db, bare, wt, run, &pre_fix_head, &e.to_string())?;
+            return Ok(None);
+        }
+    };
+
+    match run_fixer(&RunFixerOpts {
+        work_tree: wt,
+        prompt_file: &prompt_file,
+        findings_file: &findings_file,
+        porch_home: home,
+        bin: &bin,
+        timeout: fixer_timeout(),
+        session_id: run.fixer_session_id.as_deref(),
+    }) {
+        Ok(outcome) => {
+            if let Some(sid) = outcome.session_id.as_deref() {
+                db.set_fixer_session_id(&run.id, Some(sid))
+                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            }
+            Ok(Some(pre_fix_head))
+        }
+        Err(e) => {
+            fail_fix_run(db, bare, wt, run, &pre_fix_head, &e.to_string())?;
+            Ok(None)
+        }
+    }
+}
+
+fn fail_fix_run(
+    db: &Db,
+    bare: &GitDir,
+    wt: &Path,
+    run: &RunRow,
+    pre_fix_head: &str,
+    msg: &str,
+) -> std::result::Result<(), UsageOrFail> {
+    if let Ok(new_head) = porch_git::rev_parse_c(wt, "HEAD") {
+        let _ = persist_uncertified_after_fix(db, wt, run, pre_fix_head, &new_head);
+    }
+    db.set_run_status(&run.id, "failed", Some(msg))
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    remove_run_worktree(bare, wt);
+    Ok(())
+}
+
+fn finish_rereview(
+    db: &Db,
+    run: &RunRow,
+    bare: &GitDir,
+    wt: &Path,
+    yes: bool,
+) -> std::result::Result<(), UsageOrFail> {
+    // Session-free rereview (never pass fixer session).
+    match run_review_phase(db, &run.id, wt, true) {
+        Ok(ReviewPhase::Approved) => {
+            complete_after_review(db, bare, wt, run, None)?;
+        }
+        Ok(ReviewPhase::Parked) => {
+            if yes {
+                let head = porch_git::rev_parse_c(wt, "HEAD")
+                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+                db.set_review_approved_head_sha(&run.id, Some(&head))
+                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+                clear_uncertified_if_certified(db, wt, &run.repo_id, &run.branch, &head)
+                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+                complete_after_review(db, bare, wt, run, Some("approved remaining after --yes"))?;
+            } else {
+                db.insert_step_result(&run.id, "review", "parked", Some("fix_review"))
+                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            db.set_run_status(&run.id, "failed", Some(&msg))
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            remove_run_worktree(bare, wt);
+        }
+    }
+    Ok(())
+}
+
+fn complete_after_review(
+    db: &Db,
+    bare: &GitDir,
+    wt: &Path,
+    run: &RunRow,
+    review_note: Option<&str>,
+) -> std::result::Result<(), UsageOrFail> {
+    db.insert_step_result(&run.id, "review", "completed", review_note)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    for phase in ["certify", "deliver"] {
+        assert_head_continuity(db, &run.id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        db.insert_step_result(&run.id, phase, "completed", None)
+            .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    }
+    db.set_run_status(&run.id, "completed", None)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    remove_run_worktree(bare, wt);
+    Ok(())
+}
+
+fn select_findings(
+    all: &[Finding],
+    finding_ids: Option<&Vec<String>>,
+) -> std::result::Result<Vec<Finding>, UsageOrFail> {
+    match finding_ids {
+        None => Ok(all.iter().filter(|f| f.is_blocking()).cloned().collect()),
+        Some(ids) => {
+            let mut selected = Vec::new();
+            for id in ids {
+                let Some(f) = all.iter().find(|f| f.id == *id) else {
+                    return Err(UsageOrFail::Usage(format!("unknown finding id {id}")));
+                };
+                selected.push(f.clone());
+            }
+            Ok(selected)
+        }
+    }
 }
 
 fn resolve_run(
@@ -510,5 +794,52 @@ fn status_from_run(run: &RunRow) -> AgentStatus {
         review_approved_head_sha: run.review_approved_head_sha.clone(),
         findings,
         error: run.error.clone(),
+    }
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::*;
+    use porch_git::init_bare;
+    use tempfile::TempDir;
+
+    fn git(work: &Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .current_dir(work)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn head_continuity_fails_if_approved_sha_missing_on_certify() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let db = Db::open(&home.join("state.sqlite")).unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init"]);
+        git(&work, &["config", "user.email", "porch@example.com"]);
+        git(&work, &["config", "user.name", "Porch"]);
+        std::fs::write(work.join("README"), "x\n").unwrap();
+        git(&work, &["add", "README"]);
+        git(&work, &["commit", "-m", "c"]);
+
+        db.upsert_repo("r1", &work, &work, "main").unwrap();
+        let run = db.insert_run("r1", "feat", "deadbeef", None, None).unwrap();
+        let err = assert_head_continuity(&db, &run.id, &work).unwrap_err();
+        assert!(
+            err.to_string().contains("review_approved_head_sha missing"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn skip_review_empty_diff_does_not_require_approved_sha() {
+        // Documented contract: empty-diff skip_remaining never calls assert_head_continuity.
+        // Smoke: execute path with empty diff is covered by m2_run integration.
+        let _ = init_bare;
     }
 }

@@ -43,13 +43,16 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 
 **Out:** fixer.
 
-## M4 — Fixer + rereview + HEAD continuity (2 weeks)
+## M4 — Fixer + rereview + HEAD continuity (done)
 
-- ACP or one native fixer
-- Session-free rereview
-- Uncertified range on incomplete rereview
-- Process-group kill on step end
-- Instruction neutralization or refuse
+- [x] Native fixer CLI (`PORCH_FIXER_BIN`); ACP later
+- [x] `porch agent respond fix [--findings] [--yes]`
+- [x] Session-free rereview; fixer may resume
+- [x] Uncertified range on incomplete rereview
+- [x] Process-group kill on fixer step end
+- [x] Prompt files under `$PORCH_HOME` (refuse if missing)
+- [x] HEAD continuity before certify/deliver stubs
+- [x] Extra M1–M3 scenarios: coverage miss, parked-across-restart, status without `--run-id`, fetch fail closed, followTags
 
 ## M5 — Certify adapters (1 week)
 

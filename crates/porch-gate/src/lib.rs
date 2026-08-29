@@ -14,11 +14,11 @@ mod rpc;
 
 pub use admit::admit_push;
 pub use daemon::{ensure_daemon, run_daemon, wait_for_health};
-pub use db::{Db, RepoRow, RunRow, StepResultRow};
+pub use db::{Db, RepoRow, RunRow, StepResultRow, UncertifiedPipelineRange};
 pub use executor::RunExecutor;
 pub use home::{
-    db_path, lock_path, logs_dir, pid_path, porch_home, repos_dir, run_worktree_dir, socket_path,
-    worktrees_dir,
+    db_path, lock_path, logs_dir, pid_path, porch_home, repos_dir, run_artifact_dir, run_fixer_dir,
+    run_worktree_dir, socket_path, worktrees_dir,
 };
 pub use id::repo_id_for;
 pub use init::{InitOptions, InitResult, init};

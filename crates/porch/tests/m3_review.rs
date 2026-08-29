@@ -465,3 +465,104 @@ fn review_timeout_fails_not_parks() {
 
     kill_daemon(&home);
 }
+
+#[test]
+fn coverage_miss_fails_run() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("missing-file");
+    commit_change(&work, "extra.txt", "x\n");
+    push_with_env(&work, &home, "feat-cov", &fake, "missing-file");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["failed"], Duration::from_secs(20));
+    assert_eq!(run.status, "failed");
+    assert!(
+        run.error
+            .as_deref()
+            .is_some_and(|e| e.contains("coverage") || e.contains("missing")),
+        "error={:?}",
+        run.error
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn parked_survives_daemon_restart() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-restart", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    let wt = run.worktree_dir.clone().expect("worktree");
+    assert!(wt.exists());
+
+    kill_daemon(&home);
+    let bin = assert_cmd::cargo::cargo_bin("porch");
+    let path = format!(
+        "{}:{}",
+        fake.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    porch_gate::spawn_detached_with_env(
+        &bin,
+        &home,
+        &[
+            (REVIEW_BIN_ENV, fake.as_os_str()),
+            ("PORCH_FAKE_REVIEW_MODE", "blocking".as_ref()),
+            ("PATH", path.as_ref()),
+            ("PORCH_REVIEW_TIMEOUT_SECS", "5".as_ref()),
+        ],
+    )
+    .unwrap();
+    porch_gate::wait_for_health(&home, Duration::from_secs(5)).unwrap();
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "parked");
+    assert!(wt.exists(), "parked worktree must survive restart");
+
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .args(["agent", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "parked");
+    assert_eq!(v["run_id"], run.id);
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn agent_status_without_run_id_uses_latest_parked() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-status", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .args(["agent", "status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["run_id"], run.id);
+    assert_eq!(v["status"], "parked");
+
+    kill_daemon(&home);
+}

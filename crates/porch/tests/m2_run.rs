@@ -354,6 +354,101 @@ fn rebase_conflict_aborts_and_fails_run() {
 }
 
 #[test]
+fn follow_tags_does_not_enqueue_tag_runs() {
+    let (_tmp, work, home, _origin) = setup_with_origin();
+
+    std::fs::write(work.join("tagged.txt"), "t\n").unwrap();
+    git(&work, &["add", "tagged.txt"]);
+    git(&work, &["commit", "-m", "tagged"]);
+    git(&work, &["tag", "-a", "t1", "-m", "t1"]);
+
+    let out = StdCommand::new("git")
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .args([
+            "-c",
+            "push.followTags=true",
+            "push",
+            "porch",
+            "HEAD:refs/heads/feat-tags",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    wait_repo_idle(&db, &repo_id, Duration::from_secs(15));
+    let runs = db.runs_for_repo(&repo_id).unwrap();
+    assert!(
+        runs.iter().any(|r| r.branch == "feat-tags"),
+        "heads run missing: {runs:?}"
+    );
+    assert!(
+        runs.iter()
+            .all(|r| !r.branch.starts_with("refs/") && !r.branch.starts_with("tags/")),
+        "tag must not enqueue a run: {runs:?}"
+    );
+
+    let bare = db.repo_by_id(&repo_id).unwrap().unwrap().bare_path;
+    let tag = git_run(&GitDir::new(&bare).unwrap(), &["rev-parse", "refs/tags/t1"]).unwrap();
+    assert!(!stdout_trim(&tag).is_empty());
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn fetch_origin_failure_fails_the_run() {
+    let (_tmp, work, home, origin) = setup_with_origin();
+
+    // Point the bare gate's origin at a non-existent path so fetch fails closed.
+    let bare = {
+        let db = Db::open(&home.join("state.sqlite")).unwrap();
+        let repo_id = repo_id_for(&work);
+        db.repo_by_id(&repo_id).unwrap().unwrap().bare_path
+    };
+    let st = StdCommand::new("git")
+        .args([
+            "-C",
+            bare.to_str().unwrap(),
+            "remote",
+            "set-url",
+            "origin",
+            "/no/such/origin.git",
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let _ = origin;
+
+    std::fs::write(work.join("extra.txt"), "x\n").unwrap();
+    git(&work, &["add", "extra.txt"]);
+    git(&work, &["commit", "-m", "extra"]);
+    push_branch(&work, &home, "feat-fetch-fail");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    wait_repo_idle(&db, &repo_id, Duration::from_secs(15));
+    let runs = db.runs_for_repo(&repo_id).unwrap();
+    let run = runs
+        .iter()
+        .find(|r| r.branch == "feat-fetch-fail")
+        .expect("run");
+    assert_eq!(run.status, "failed", "err={:?}", run.error);
+    assert!(
+        run.error.as_deref().is_some_and(|e| e.contains("fetch")),
+        "error={:?}",
+        run.error
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
 fn daemon_restart_fails_running_run_and_removes_worktree() {
     let (_tmp, work, home, _origin) = setup_with_origin();
     // Populate bare with objects.

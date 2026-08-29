@@ -38,6 +38,9 @@ pub enum Action {
 /// One mapped finding from a review comment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
+    /// Stable id assigned at map time (`f0`, `f1`, …). Empty when deserializing old JSON.
+    #[serde(default)]
+    pub id: String,
     pub path: String,
     pub message: String,
     pub severity: Severity,
@@ -158,6 +161,7 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
 
     if matches!(category.as_str(), "style" | "documentation") {
         return Some(Finding {
+            id: String::new(),
             path: comment.path.clone(),
             message: comment.content.clone(),
             severity: Severity::Info,
@@ -192,6 +196,7 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
     };
 
     Some(Finding {
+        id: String::new(),
         path: comment.path.clone(),
         message: comment.content.clone(),
         severity,
@@ -204,12 +209,17 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
 
 /// Parse review JSON bytes into an outcome (no coverage check yet).
 ///
+/// Finding ids `f0`, `f1`, … are assigned in comment order after mapping.
+///
 /// # Errors
 ///
 /// Returns [`Error::Json`] when the payload is not valid review JSON.
 pub fn parse_review_json(bytes: &[u8]) -> Result<ReviewOutcome, Error> {
     let parsed: ReviewJson = serde_json::from_slice(bytes)?;
-    let findings = parsed.comments.iter().filter_map(map_comment).collect();
+    let mut findings: Vec<Finding> = parsed.comments.iter().filter_map(map_comment).collect();
+    for (i, f) in findings.iter_mut().enumerate() {
+        f.id = format!("f{i}");
+    }
     Ok(ReviewOutcome {
         findings,
         covered_files: parsed.files,
@@ -423,5 +433,24 @@ mod tests {
         assert!(out.findings.is_empty());
         assert_eq!(out.covered_files, vec!["README"]);
         assert!(!out.has_blocking());
+    }
+
+    #[test]
+    fn parse_assigns_finding_ids_in_order() {
+        let raw = br#"{"comments":[
+            {"path":"a.rs","content":"bug a","category":"bug","severity":"high"},
+            {"path":"b.rs","content":"bug b","category":"bug","severity":"high"}
+        ],"files":["a.rs","b.rs"]}"#;
+        let out = parse_review_json(raw).unwrap();
+        assert_eq!(out.findings.len(), 2);
+        assert_eq!(out.findings[0].id, "f0");
+        assert_eq!(out.findings[1].id, "f1");
+    }
+
+    #[test]
+    fn finding_id_defaults_empty_on_old_json() {
+        let raw = br#"{"path":"a.rs","message":"x","severity":"warning","action":"ask-user"}"#;
+        let f: Finding = serde_json::from_slice(raw).unwrap();
+        assert!(f.id.is_empty());
     }
 }

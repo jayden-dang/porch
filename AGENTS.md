@@ -33,6 +33,7 @@ crates/porch-git/          # git CLI wrapper, --git-dir absolute; publish = fals
 crates/porch-gate/         # init, hooks, admit, notify, sqlite, daemon (+ RunExecutor inject)
 crates/porch-run/          # worktree, intent, rebase, review phase, agent respond
 crates/porch-review/       # external review CLI adapter (PATH fake in tests)
+crates/porch-agent/        # native fixer CLI adapter (PATH fake in tests)
 # later slices:
 # crates/porch-deliver/    # GitHub PR + allowlisted checks
 ```

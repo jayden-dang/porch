@@ -9,11 +9,13 @@ use crate::Result;
 
 const RUN_SELECT_FROM: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
-                    intent, intent_source, error, review_approved_head_sha, findings_json
+                    intent, intent_source, error, review_approved_head_sha, findings_json,
+                    fixer_session_id
              FROM runs";
 const RUN_SELECT: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
-                    intent, intent_source, error, review_approved_head_sha, findings_json
+                    intent, intent_source, error, review_approved_head_sha, findings_json,
+                    fixer_session_id
              FROM runs WHERE id = ?1";
 
 pub struct Db {
@@ -43,6 +45,18 @@ pub struct RunRow {
     pub error: Option<String>,
     pub review_approved_head_sha: Option<String>,
     pub findings_json: Option<String>,
+    pub fixer_session_id: Option<String>,
+}
+
+/// Persisted fixer commit span awaiting a completed review (E23).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncertifiedPipelineRange {
+    pub repo_id: String,
+    pub branch: String,
+    pub from_sha: String,
+    pub to_sha: String,
+    pub source_run_id: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +124,20 @@ impl Db {
         ensure_column(&conn, "runs", "error", "TEXT")?;
         ensure_column(&conn, "runs", "review_approved_head_sha", "TEXT")?;
         ensure_column(&conn, "runs", "findings_json", "TEXT")?;
+        ensure_column(&conn, "runs", "fixer_session_id", "TEXT")?;
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
+                repo_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                from_sha TEXT NOT NULL,
+                to_sha TEXT NOT NULL,
+                source_run_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (repo_id, branch)
+            );
+            ",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -247,6 +275,7 @@ impl Db {
             error: None,
             review_approved_head_sha: None,
             findings_json: None,
+            fixer_session_id: None,
         })
     }
 
@@ -493,6 +522,108 @@ impl Db {
         Ok(())
     }
 
+    /// Persist fixer session id for later fix rounds of the same run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the update fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn set_fixer_session_id(&self, id: &str, session_id: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex");
+        conn.execute(
+            "UPDATE runs SET fixer_session_id = ?1 WHERE id = ?2",
+            rusqlite::params![session_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert or replace the uncertified fixer range for a repo branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the upsert fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn upsert_uncertified_pipeline_range(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        from_sha: &str,
+        to_sha: &str,
+        source_run_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex");
+        conn.execute(
+            "INSERT INTO uncertified_pipeline_ranges (
+                repo_id, branch, from_sha, to_sha, source_run_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(repo_id, branch) DO UPDATE SET
+               from_sha = excluded.from_sha,
+               to_sha = excluded.to_sha,
+               source_run_id = excluded.source_run_id,
+               created_at = excluded.created_at",
+            rusqlite::params![repo_id, branch, from_sha, to_sha, source_run_id, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Load the uncertified fixer range for a repo branch, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the query fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn get_uncertified_pipeline_range(
+        &self,
+        repo_id: &str,
+        branch: &str,
+    ) -> Result<Option<UncertifiedPipelineRange>> {
+        let conn = self.conn.lock().expect("db mutex");
+        let mut stmt = conn.prepare(
+            "SELECT repo_id, branch, from_sha, to_sha, source_run_id, created_at
+             FROM uncertified_pipeline_ranges
+             WHERE repo_id = ?1 AND branch = ?2",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![repo_id, branch])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(UncertifiedPipelineRange {
+                repo_id: row.get(0)?,
+                branch: row.get(1)?,
+                from_sha: row.get(2)?,
+                to_sha: row.get(3)?,
+                source_run_id: row.get(4)?,
+                created_at: row.get(5)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Delete the uncertified fixer range for a repo branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the delete fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn delete_uncertified_pipeline_range(&self, repo_id: &str, branch: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex");
+        conn.execute(
+            "DELETE FROM uncertified_pipeline_ranges WHERE repo_id = ?1 AND branch = ?2",
+            rusqlite::params![repo_id, branch],
+        )?;
+        Ok(())
+    }
+
     /// Insert a step result row.
     ///
     /// # Errors
@@ -600,6 +731,7 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         error: row.get(10)?,
         review_approved_head_sha: row.get(11)?,
         findings_json: row.get(12)?,
+        fixer_session_id: row.get(13)?,
     })
 }
 
