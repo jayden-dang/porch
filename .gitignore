@@ -1,0 +1,19 @@
+/target/
+**/*.rs.bk
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+*.orig
+/tmp/
+.env
+.env.*
+!/.env.example
+/debug/
+/porch
+/bin/
+
+# Local implementation notes. Never commit.
+.research/
+.skills/

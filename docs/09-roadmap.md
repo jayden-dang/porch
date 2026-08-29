@@ -1,0 +1,100 @@
+# Roadmap
+
+Dogfood target: mailgate. Each milestone should be runnable on a toy git repo first, then on mailgate.
+
+## M0 — Repo and briefing (this milestone)
+
+- [x] Research dump in `docs/`
+- [x] Locked decisions
+- [ ] `LICENSE` Apache-2.0 when ready to publish
+- [ ] crates.io name check
+- [ ] Confirm review-CLI flags for range review + JSON output against current `--help` at implementation time (flags drift). Details in `.research/`.
+
+## M1 — Push into a dead gate (1–2 weeks)
+
+Goal: `porch init` + `git push porch` updates a local bare repo and returns. No pipeline.
+
+- Cargo binary, clap: `init`, `daemon run`, `daemon notify-push`, `daemon admit-push`
+- Bare repo, hooks, remote `porch`
+- Flock + socket + health RPC
+- SQLite `repos` + `runs` insert on notify
+- Git wrapper
+- Tests: tempfile repo, init, push, run row
+
+**Out:** TUI, review CLI, PR, Windows polish can be stubbed but process-group spawn wrapper should exist empty-tested.
+
+## M2 — Worktree + intent + rebase (1–2 weeks)
+
+- Worktree add at recorded path
+- Phase runner skeleton (skip flags)
+- Intent: store `--intent` on the run
+- Rebase onto `origin/<default>` (GitHub `main`/`dev` configurable later)
+- Empty diff → complete run skipped remaining
+- Crash: fail stale running runs
+
+## M3 — Review + park (2 weeks)
+
+- Require the review CLI on PATH
+- Run range review in the worktree
+- Parse JSON → findings; park on blocking
+- `porch agent status` / `respond` (JSON stdout)
+- `review_approved_head_sha` on success
+- Fixtures: fake review binary
+
+**Out:** fixer.
+
+## M4 — Fixer + rereview + HEAD continuity (2 weeks)
+
+- ACP or one native fixer
+- Session-free rereview
+- Uncertified range on incomplete rereview
+- Process-group kill on step end
+- Instruction neutralization or refuse
+
+## M5 — Certify adapters (1 week)
+
+- `commands.format` / `commands.lint` from **trusted** config
+- Mailgate sketch: biome + types/api/docs drift
+- No Postgres, no Playwright
+
+## M6 — Deliver GitHub (2 weeks)
+
+- Lease-push exact SHA
+- `gh pr create/update`, body + attestation comment
+- Watch allowlisted checks
+- Repair: restart at **review**
+- `rerun_transient = 0`
+
+## M7 — Dogfood on mailgate
+
+- `.porch.yaml` on default branch (trusted)
+- Path instructions for enclave/auth/contract/infra
+- Measure: did PR Checks fail less often for mechanical drift? Did review park real `ask-user` issues?
+- Worktree cold-compile pain: document sccache; still do not run full `just gate`
+
+## M8 — Operator UX
+
+- TUI (ratatui)
+- launchd/systemd/schtasks
+- `porch agent` skill markdown
+- Socket activation
+- APFS clone worktrees
+- Eval corpus of gold findings (mailgate diffs)
+
+## Explicitly later / never
+
+| Later | Never (as porch) |
+|---|---|
+| Embed the review engine as a library | Replace mailgate CI/CD or E2E |
+| GitLab/Gitea | libgit2 gate operations |
+| More native agents | Nine adapters day-1 |
+| Evidence branch publish | Contributor `no_ci` |
+| Document phase | Auto-fix review default on |
+| Transcript intent inference | Merge bot |
+
+## First coding session checklist
+
+1. Read `docs/decisions.md` and this file.
+2. Scaffold `Cargo.toml` + `src/main.rs` clap + `src/git.rs` stub.
+3. Do not implement review in the first PR.
+4. Keep the tree English, `rustfmt`, clippy `-D warnings`.
