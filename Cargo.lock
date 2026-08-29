@@ -538,6 +538,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "porch-agent",
+ "porch-deliver",
  "porch-gate",
  "porch-git",
  "porch-review",
@@ -551,6 +552,17 @@ dependencies = [
 
 [[package]]
 name = "porch-agent"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "porch-deliver"
 version = "0.1.0"
 dependencies = [
  "nix",
@@ -603,6 +615,7 @@ version = "0.1.0"
 dependencies = [
  "nix",
  "porch-agent",
+ "porch-deliver",
  "porch-gate",
  "porch-git",
  "porch-review",

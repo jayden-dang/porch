@@ -5,6 +5,7 @@ use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use porch_deliver::GH_BIN_ENV;
 use porch_gate::{Db, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
@@ -102,6 +103,45 @@ esac
     path
 }
 
+/// Noop `gh` so deliver does not hit a real GitHub CLI (E13).
+fn install_noop_gh(bin_dir: &Path) -> PathBuf {
+    let path = bin_dir.join("fake-gh");
+    let script = r#"#!/bin/sh
+set -e
+: "${PORCH_HOME:?}"
+STATE="$PORCH_HOME/gh-pr-state"
+for a in "$@"; do
+  [ "$a" = "--version" ] && echo "gh version 2.50.0 (fake)" && exit 0
+done
+CMD=""
+PREV=""
+for a in "$@"; do
+  if [ "$PREV" = "pr" ]; then CMD="$a"; break; fi
+  PREV="$a"
+done
+case "$CMD" in
+  list)
+    if [ -f "$STATE" ]; then cat "$STATE"; else printf '[]\n'; fi
+    ;;
+  create)
+    cat >/dev/null
+    printf '[{"number":1,"url":"https://example.com/pull/1","title":"t"}]\n' > "$STATE"
+    echo "https://example.com/pull/1"
+    ;;
+  edit)
+    cat >/dev/null
+    ;;
+  checks)
+    printf '[]\n'
+    ;;
+  *) echo "noop-gh: $*" >&2; exit 1 ;;
+esac
+"#;
+    std::fs::write(&path, script).unwrap();
+    chmod_755(&path);
+    path
+}
+
 fn install_certify_fakes(bin_dir: &Path) {
     let format = bin_dir.join("porch-fake-format");
     std::fs::write(
@@ -170,6 +210,7 @@ struct Setup {
     work: PathBuf,
     home: PathBuf,
     fake_review: PathBuf,
+    fake_gh: PathBuf,
     path: String,
 }
 
@@ -197,6 +238,7 @@ fn setup_with_opts(
     std::fs::create_dir_all(&empty_home).unwrap();
     std::fs::create_dir_all(&bin_dir).unwrap();
     let fake_review = install_fake_review(&bin_dir);
+    let fake_gh = install_noop_gh(&bin_dir);
     install_certify_fakes(&bin_dir);
 
     init_bare(&origin).unwrap();
@@ -239,6 +281,7 @@ fn setup_with_opts(
         .current_dir(&work)
         .env("PORCH_HOME", &home)
         .env(REVIEW_BIN_ENV, &fake_review)
+        .env(GH_BIN_ENV, &fake_gh)
         .env("PORCH_FAKE_REVIEW_MODE", review_mode)
         .env("PATH", &path)
         .arg("init")
@@ -253,6 +296,7 @@ fn setup_with_opts(
     restart_certify_daemon(
         &home,
         &fake_review,
+        &fake_gh,
         review_mode,
         &path,
         isolate_git_identity.then_some(empty_home.as_path()),
@@ -264,6 +308,7 @@ fn setup_with_opts(
         work,
         home,
         fake_review,
+        fake_gh,
         path,
     }
 }
@@ -296,6 +341,7 @@ fn harden_gate_bare_no_identity(home: &Path) {
 fn restart_certify_daemon(
     home: &Path,
     fake_review: &Path,
+    fake_gh: &Path,
     review_mode: &str,
     path: &str,
     empty_home: Option<&Path>,
@@ -303,6 +349,7 @@ fn restart_certify_daemon(
     let bin = assert_cmd::cargo::cargo_bin("porch");
     let mut extra: Vec<(&str, &std::ffi::OsStr)> = vec![
         (REVIEW_BIN_ENV, fake_review.as_os_str()),
+        (GH_BIN_ENV, fake_gh.as_os_str()),
         ("PORCH_FAKE_REVIEW_MODE", review_mode.as_ref()),
         ("PATH", path.as_ref()),
         ("PORCH_REVIEW_TIMEOUT_SECS", "10".as_ref()),
@@ -531,12 +578,13 @@ commands:
     let repo_id = repo_id_for(&s.work);
     let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(30));
 
-    // Approve runs certify in this CLI process (not the daemon), so PATH must
-    // include the format/lint fakes here.
+    // Approve runs certify+deliver in this CLI process (not the daemon), so
+    // PATH must include format/lint fakes and PORCH_GH_BIN must be the noop.
     let out = Command::cargo_bin("porch")
         .unwrap()
         .current_dir(&s.work)
         .env("PORCH_HOME", &s.home)
+        .env(GH_BIN_ENV, &s.fake_gh)
         .env("PATH", &s.path)
         .args(["agent", "respond", "approve", "--run-id", &run.id])
         .output()

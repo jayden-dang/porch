@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Execute a run: worktree, intent, rebase, review, certify"
+description = "Execute a run: worktree, intent, rebase, review, certify, deliver"
 
 [dependencies]
 porch-agent = { path = "../porch-agent" }
+porch-deliver = { path = "../porch-deliver" }
 porch-gate = { path = "../porch-gate" }
 porch-git = { path = "../porch-git" }
 porch-review = { path = "../porch-review" }

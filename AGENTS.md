@@ -31,11 +31,10 @@ Cargo.toml                 # workspace; resolver = "3"; members = ["crates/*"]
 crates/porch/              # binary; clap; `porch daemon run` is a fast path
 crates/porch-git/          # git CLI wrapper, --git-dir absolute; publish = false
 crates/porch-gate/         # init, hooks, admit, notify, sqlite, daemon (+ RunExecutor inject)
-crates/porch-run/          # worktree, intent, rebase, review phase, agent respond
+crates/porch-run/          # worktree, intent, rebase, review, certify, deliver, agent respond
 crates/porch-review/       # external review CLI adapter (PATH fake in tests)
 crates/porch-agent/        # native fixer CLI adapter (PATH fake in tests)
-# later slices:
-# crates/porch-deliver/    # GitHub PR + allowlisted checks
+crates/porch-deliver/    # GitHub PR + allowlisted checks (`gh`)
 ```
 
 State root: `$PORCH_HOME` (default `~/.porch`).

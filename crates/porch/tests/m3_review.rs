@@ -5,11 +5,57 @@ use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use porch_deliver::GH_BIN_ENV;
 use porch_gate::{Db, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
 use serde_json::Value;
 use tempfile::TempDir;
+
+/// Noop `gh` so deliver does not hit a real GitHub CLI (E13).
+fn install_noop_gh(bin_dir: &Path) -> PathBuf {
+    let path = bin_dir.join("fake-gh");
+    let script = r#"#!/bin/sh
+set -e
+: "${PORCH_HOME:?}"
+STATE="$PORCH_HOME/gh-pr-state"
+for a in "$@"; do
+  [ "$a" = "--version" ] && echo "gh version 2.50.0 (fake)" && exit 0
+done
+CMD=""
+PREV=""
+for a in "$@"; do
+  if [ "$PREV" = "pr" ]; then CMD="$a"; break; fi
+  PREV="$a"
+done
+case "$CMD" in
+  list)
+    if [ -f "$STATE" ]; then cat "$STATE"; else printf '[]\n'; fi
+    ;;
+  create)
+    cat >/dev/null
+    printf '[{"number":1,"url":"https://example.com/pull/1","title":"t"}]\n' > "$STATE"
+    echo "https://example.com/pull/1"
+    ;;
+  edit)
+    cat >/dev/null
+    ;;
+  checks)
+    printf '[]\n'
+    ;;
+  *) echo "noop-gh: $*" >&2; exit 1 ;;
+esac
+"#;
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
 
 fn git(work: &Path, args: &[&str]) {
     let st = StdCommand::new("git")
@@ -117,6 +163,7 @@ fn setup_with_origin_and_fake(mode: &str) -> (TempDir, PathBuf, PathBuf, PathBuf
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&bin_dir).unwrap();
     let fake = install_fake_review(&bin_dir);
+    let fake_gh = install_noop_gh(&bin_dir);
 
     init_bare(&origin).unwrap();
 
@@ -155,6 +202,7 @@ fn setup_with_origin_and_fake(mode: &str) -> (TempDir, PathBuf, PathBuf, PathBuf
         .current_dir(&work)
         .env("PORCH_HOME", &home)
         .env(REVIEW_BIN_ENV, &fake)
+        .env(GH_BIN_ENV, &fake_gh)
         .env("PORCH_FAKE_REVIEW_MODE", mode)
         .env("PATH", &path)
         .arg("init")
@@ -169,6 +217,7 @@ fn setup_with_origin_and_fake(mode: &str) -> (TempDir, PathBuf, PathBuf, PathBuf
         &home,
         &[
             (REVIEW_BIN_ENV, fake.as_os_str()),
+            (GH_BIN_ENV, fake_gh.as_os_str()),
             ("PORCH_FAKE_REVIEW_MODE", mode.as_ref()),
             ("PATH", path.as_ref()),
             ("PORCH_REVIEW_TIMEOUT_SECS", "5".as_ref()),
@@ -288,10 +337,18 @@ fn respond_approve_writes_sha_and_completes() {
     let repo_id = repo_id_for(&work);
     let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
 
+    let fake_gh = fake.parent().unwrap().join("fake-gh");
+    let path = format!(
+        "{}:{}",
+        fake.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let out = Command::cargo_bin("porch")
         .unwrap()
         .current_dir(&work)
         .env("PORCH_HOME", &home)
+        .env(GH_BIN_ENV, &fake_gh)
+        .env("PATH", &path)
         .args(["agent", "respond", "approve", "--run-id", &run.id])
         .output()
         .unwrap();
@@ -387,11 +444,13 @@ fn missing_review_bin_fails_closed() {
     // Restart daemon pointing at a non-existent binary.
     let bin = assert_cmd::cargo::cargo_bin("porch");
     let missing = fake.parent().unwrap().join("no-such-review");
+    let fake_gh = fake.parent().unwrap().join("fake-gh");
     porch_gate::spawn_detached_with_env(
         &bin,
         &home,
         &[
             (REVIEW_BIN_ENV, missing.as_os_str()),
+            (GH_BIN_ENV, fake_gh.as_os_str()),
             ("PORCH_REVIEW_TIMEOUT_SECS", "5".as_ref()),
         ],
     )
@@ -434,11 +493,13 @@ fn review_timeout_fails_not_parks() {
         fake.parent().unwrap().display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    let fake_gh = fake.parent().unwrap().join("fake-gh");
     porch_gate::spawn_detached_with_env(
         &bin,
         &home,
         &[
             (REVIEW_BIN_ENV, fake.as_os_str()),
+            (GH_BIN_ENV, fake_gh.as_os_str()),
             ("PORCH_FAKE_REVIEW_MODE", "hang".as_ref()),
             ("PATH", path.as_ref()),
             ("PORCH_REVIEW_TIMEOUT_SECS", "1".as_ref()),
@@ -506,11 +567,13 @@ fn parked_survives_daemon_restart() {
         fake.parent().unwrap().display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    let fake_gh = fake.parent().unwrap().join("fake-gh");
     porch_gate::spawn_detached_with_env(
         &bin,
         &home,
         &[
             (REVIEW_BIN_ENV, fake.as_os_str()),
+            (GH_BIN_ENV, fake_gh.as_os_str()),
             ("PORCH_FAKE_REVIEW_MODE", "blocking".as_ref()),
             ("PATH", path.as_ref()),
             ("PORCH_REVIEW_TIMEOUT_SECS", "5".as_ref()),

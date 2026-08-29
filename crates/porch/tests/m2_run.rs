@@ -5,10 +5,57 @@ use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use porch_deliver::GH_BIN_ENV;
 use porch_gate::{Db, kill_group, repo_id_for, run_worktree_dir};
 use porch_git::{GitDir, init_bare, run as git_run, stdout_trim, worktree_add_detach};
 use porch_review::REVIEW_BIN_ENV;
 use tempfile::TempDir;
+
+/// Noop `gh` so deliver does not hit a real GitHub CLI (E13).
+fn install_noop_gh(bin_dir: &Path) -> PathBuf {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let path = bin_dir.join("fake-gh");
+    let script = r#"#!/bin/sh
+set -e
+: "${PORCH_HOME:?}"
+STATE="$PORCH_HOME/gh-pr-state"
+for a in "$@"; do
+  [ "$a" = "--version" ] && echo "gh version 2.50.0 (fake)" && exit 0
+done
+CMD=""
+PREV=""
+for a in "$@"; do
+  if [ "$PREV" = "pr" ]; then CMD="$a"; break; fi
+  PREV="$a"
+done
+case "$CMD" in
+  list)
+    if [ -f "$STATE" ]; then cat "$STATE"; else printf '[]\n'; fi
+    ;;
+  create)
+    cat >/dev/null
+    printf '[{"number":1,"url":"https://example.com/pull/1","title":"t"}]\n' > "$STATE"
+    echo "https://example.com/pull/1"
+    ;;
+  edit)
+    cat >/dev/null
+    ;;
+  checks)
+    printf '[]\n'
+    ;;
+  *) echo "noop-gh: $*" >&2; exit 1 ;;
+esac
+"#;
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
 
 /// Minimal clean review fake so non-empty M2 diffs pass the M3 review phase.
 fn install_clean_review_fake(bin_dir: &Path) -> PathBuf {
@@ -106,6 +153,7 @@ fn setup_with_origin() -> (TempDir, PathBuf, PathBuf, PathBuf) {
     let bin_dir = root.join("bin");
     std::fs::create_dir_all(&home).unwrap();
     let fake = install_clean_review_fake(&bin_dir);
+    let fake_gh = install_noop_gh(&bin_dir);
     let path = format!(
         "{}:{}",
         bin_dir.display(),
@@ -143,6 +191,7 @@ fn setup_with_origin() -> (TempDir, PathBuf, PathBuf, PathBuf) {
         .current_dir(&work)
         .env("PORCH_HOME", &home)
         .env(REVIEW_BIN_ENV, &fake)
+        .env(GH_BIN_ENV, &fake_gh)
         .env("PATH", &path)
         .arg("init")
         .assert()
@@ -156,6 +205,7 @@ fn setup_with_origin() -> (TempDir, PathBuf, PathBuf, PathBuf) {
         &home,
         &[
             (REVIEW_BIN_ENV, fake.as_os_str()),
+            (GH_BIN_ENV, fake_gh.as_os_str()),
             ("PATH", path.as_ref()),
             ("PORCH_REVIEW_TIMEOUT_SECS", "10".as_ref()),
         ],

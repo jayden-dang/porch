@@ -10,12 +10,12 @@ use crate::Result;
 const RUN_SELECT_FROM: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
                     intent, intent_source, error, review_approved_head_sha, findings_json,
-                    fixer_session_id
+                    fixer_session_id, pr_url
              FROM runs";
 const RUN_SELECT: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
                     intent, intent_source, error, review_approved_head_sha, findings_json,
-                    fixer_session_id
+                    fixer_session_id, pr_url
              FROM runs WHERE id = ?1";
 
 pub struct Db {
@@ -46,6 +46,7 @@ pub struct RunRow {
     pub review_approved_head_sha: Option<String>,
     pub findings_json: Option<String>,
     pub fixer_session_id: Option<String>,
+    pub pr_url: Option<String>,
 }
 
 /// Persisted fixer commit span awaiting a completed review (E23).
@@ -125,6 +126,7 @@ impl Db {
         ensure_column(&conn, "runs", "review_approved_head_sha", "TEXT")?;
         ensure_column(&conn, "runs", "findings_json", "TEXT")?;
         ensure_column(&conn, "runs", "fixer_session_id", "TEXT")?;
+        ensure_column(&conn, "runs", "pr_url", "TEXT")?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
@@ -276,6 +278,7 @@ impl Db {
             review_approved_head_sha: None,
             findings_json: None,
             fixer_session_id: None,
+            pr_url: None,
         })
     }
 
@@ -395,8 +398,10 @@ impl Db {
         Ok(out)
     }
 
-    /// Mark all `running` runs as failed; return them (for worktree cleanup).
+    /// Recover stale `running` runs after a daemon restart.
     ///
+    /// Runs with a non-empty `pr_url` become `ci_monitor_interrupted` (PR already
+    /// open; do not claim a failed push). Other `running` rows become `failed`.
     /// Parked runs are left alone (resume is operator-driven).
     ///
     /// # Errors
@@ -415,12 +420,27 @@ impl Db {
             stale.push(row?);
         }
         drop(stmt);
-        conn.execute(
-            "UPDATE runs SET status = 'failed', error = ?1 WHERE status = 'running'",
-            rusqlite::params![error],
-        )?;
+        // Runs that already opened a PR were likely only babysitting checks —
+        // mark interrupted, not failed, so an open PR is not claimed as a failed push.
+        for run in &stale {
+            if run.pr_url.as_ref().is_some_and(|u| !u.trim().is_empty()) {
+                conn.execute(
+                    "UPDATE runs SET status = 'ci_monitor_interrupted', error = ?1 WHERE id = ?2",
+                    rusqlite::params![error, run.id],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE runs SET status = 'failed', error = ?1 WHERE id = ?2",
+                    rusqlite::params![error, run.id],
+                )?;
+            }
+        }
         for run in &mut stale {
-            run.status = "failed".into();
+            if run.pr_url.as_ref().is_some_and(|u| !u.trim().is_empty()) {
+                run.status = "ci_monitor_interrupted".into();
+            } else {
+                run.status = "failed".into();
+            }
             run.error = Some(error.to_string());
         }
         Ok(stale)
@@ -536,6 +556,24 @@ impl Db {
         conn.execute(
             "UPDATE runs SET fixer_session_id = ?1 WHERE id = ?2",
             rusqlite::params![session_id, id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the GitHub PR URL after create/update.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the update fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn set_pr_url(&self, id: &str, url: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex");
+        conn.execute(
+            "UPDATE runs SET pr_url = ?1 WHERE id = ?2",
+            rusqlite::params![url, id],
         )?;
         Ok(())
     }
@@ -732,6 +770,7 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         review_approved_head_sha: row.get(11)?,
         findings_json: row.get(12)?,
         fixer_session_id: row.get(13)?,
+        pr_url: row.get(14)?,
     })
 }
 
@@ -747,4 +786,44 @@ fn now_secs() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or_else(|_| "0".into(), |d| d.as_secs().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn fail_stale_running_splits_on_pr_url() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("state.sqlite");
+        let db = Db::open(&db_path).unwrap();
+        db.upsert_repo("repo1", tmp.path(), &tmp.path().join("bare.git"), "main")
+            .unwrap();
+
+        let with_pr = db
+            .insert_run("repo1", "feat-pr", "aaa", None, None)
+            .unwrap();
+        db.set_run_status(&with_pr.id, "running", None).unwrap();
+        db.set_pr_url(&with_pr.id, Some("https://example.com/pull/1"))
+            .unwrap();
+
+        let no_pr = db
+            .insert_run("repo1", "feat-none", "bbb", None, None)
+            .unwrap();
+        db.set_run_status(&no_pr.id, "running", None).unwrap();
+
+        let stale = db
+            .fail_stale_running("daemon restarted while run was in progress")
+            .unwrap();
+        assert_eq!(stale.len(), 2);
+
+        let with = db.run_by_id(&with_pr.id).unwrap().unwrap();
+        assert_eq!(with.status, "ci_monitor_interrupted");
+        assert!(with.pr_url.is_some());
+
+        let without = db.run_by_id(&no_pr.id).unwrap().unwrap();
+        assert_eq!(without.status, "failed");
+        assert!(without.pr_url.is_none());
+    }
 }

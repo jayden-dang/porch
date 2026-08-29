@@ -1,7 +1,8 @@
-//! Execute a porch run: disposable worktree, intent, rebase, review, certify.
+//! Execute a porch run: disposable worktree, intent, rebase, review, certify, deliver.
 
 mod certify;
 mod config;
+mod deliver;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -16,7 +17,7 @@ use porch_git::GitDir;
 use porch_review::{Finding, RunReviewOpts, review_bin, review_timeout, run_review};
 use serde::Serialize;
 
-/// Phases in locked order (D5). Deliver remains a stub until M6.
+/// Phases in locked order (D5).
 const PHASES: &[&str] = &["intent", "rebase", "review", "certify", "deliver"];
 
 /// Production executor injected into the daemon from the `porch` binary.
@@ -48,6 +49,8 @@ enum RunError {
     #[error(transparent)]
     Certify(#[from] certify::CertifyError),
     #[error(transparent)]
+    Deliver(#[from] deliver::DeliverError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -64,6 +67,7 @@ enum PhaseLoop {
     Parked,
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
     let db = Db::open(&db_path(home))?;
     let run = db
@@ -134,8 +138,14 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                     execute_certify_step(&db, run_id, &bare, &wt_path, cancel)?;
                 }
                 "deliver" => {
-                    assert_head_continuity(&db, run_id, &wt_path)?;
-                    db.insert_step_result(run_id, phase, "completed", None)?;
+                    execute_deliver_step(
+                        &db,
+                        run_id,
+                        &bare,
+                        &wt_path,
+                        &repo.default_branch,
+                        cancel,
+                    )?;
                 }
                 _ => {}
             }
@@ -144,21 +154,23 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
     })();
 
     let cancelled = cancel.load(Ordering::SeqCst);
-    match outcome {
+    match &outcome {
         Ok(PhaseLoop::Parked) => {
             // Worktree kept for agent respond.
             return Ok(());
         }
-        Ok(PhaseLoop::Continue) if cancelled => {
+        // Supersede wins over success and over deliver/certify failure (e.g.
+        // watch poll timeout after cancel while babysitting checks).
+        _ if cancelled => {
             let _ = db.set_run_status(run_id, "cancelled", Some("superseded by new push"));
         }
         Ok(PhaseLoop::Continue) => {
             let _ = db.set_run_status(run_id, "completed", None);
         }
-        Err(RunError::Msg(ref m)) if m == "cancelled" || cancelled => {
+        Err(RunError::Msg(m)) if m == "cancelled" => {
             let _ = db.set_run_status(run_id, "cancelled", Some("superseded by new push"));
         }
-        Err(ref e) => {
+        Err(e) => {
             let _ = db.set_run_status(run_id, "failed", Some(&e.to_string()));
         }
     }
@@ -285,6 +297,31 @@ fn execute_certify_step(
                 return Err(RunError::Msg("cancelled".into()));
             }
             Err(RunError::Certify(e))
+        }
+    }
+}
+
+fn execute_deliver_step(
+    db: &Db,
+    run_id: &str,
+    bare: &GitDir,
+    wt: &Path,
+    default_branch: &str,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    assert_head_continuity(db, run_id, wt)?;
+    match deliver::run_deliver_phase(db, run_id, bare, wt, default_branch, Some(cancel)) {
+        Ok(()) => {
+            db.insert_step_result(run_id, "deliver", "completed", None)?;
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            db.insert_step_result(run_id, "deliver", "failed", Some(&msg))?;
+            if msg == "cancelled" {
+                return Err(RunError::Msg("cancelled".into()));
+            }
+            Err(RunError::Deliver(e))
         }
     }
 }
@@ -562,7 +599,7 @@ fn agent_respond_inner(
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             db.insert_step_result(&run.id, "review", "completed", Some("approved"))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            finish_certify_and_deliver(&db, &bare, &wt, &run.id)?;
+            finish_certify_and_deliver(&db, &bare, &wt, &run.id, &repo.default_branch)?;
             remove_run_worktree(&bare, &wt);
         }
         AgentResponse::Skip => {
@@ -746,17 +783,22 @@ fn complete_after_review(
 ) -> std::result::Result<(), UsageOrFail> {
     db.insert_step_result(&run.id, "review", "completed", review_note)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    finish_certify_and_deliver(db, bare, wt, &run.id)?;
+    let repo = db
+        .repo_by_id(&run.repo_id)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?
+        .ok_or_else(|| UsageOrFail::Fail(format!("unknown repo {}", run.repo_id)))?;
+    finish_certify_and_deliver(db, bare, wt, &run.id, &repo.default_branch)?;
     remove_run_worktree(bare, wt);
     Ok(())
 }
 
-/// Shared certify → deliver stub path for approve / post-fix complete.
+/// Shared certify → deliver path for approve / post-fix complete.
 fn finish_certify_and_deliver(
     db: &Db,
     bare: &GitDir,
     wt: &Path,
     run_id: &str,
+    default_branch: &str,
 ) -> std::result::Result<(), UsageOrFail> {
     assert_head_continuity(db, run_id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     match certify::run_certify_phase(db, run_id, bare, wt, None) {
@@ -773,8 +815,19 @@ fn finish_certify_and_deliver(
         }
     }
     assert_head_continuity(db, run_id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    db.insert_step_result(run_id, "deliver", "completed", None)
-        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    match deliver::run_deliver_phase(db, run_id, bare, wt, default_branch, None) {
+        Ok(()) => {
+            db.insert_step_result(run_id, "deliver", "completed", None)
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = db.insert_step_result(run_id, "deliver", "failed", Some(&msg));
+            let _ = db.set_run_status(run_id, "failed", Some(&msg));
+            remove_run_worktree(bare, wt);
+            return Err(UsageOrFail::Fail(msg));
+        }
+    }
     db.set_run_status(run_id, "completed", None)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     Ok(())

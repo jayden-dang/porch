@@ -374,3 +374,181 @@ pub fn timeout_placeholder() -> Duration {
 pub fn arg_os(s: impl AsRef<OsStr>) -> std::ffi::OsString {
     s.as_ref().to_os_string()
 }
+
+/// Result of observing a remote tip before push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteTip {
+    /// Ref does not exist on the remote.
+    Absent,
+    /// Ref resolves to this full SHA.
+    Present(String),
+}
+
+/// How to update the remote branch given an observed tip and local SHA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushDecision {
+    /// Ref absent: plain `push <sha>:refs/heads/<branch>`.
+    NewBranch,
+    /// Remote already at `local_sha`: no objects move.
+    UpToDate,
+    /// Force-with-lease anchored at the just-observed remote SHA.
+    Lease { observed_sha: String },
+    /// Remote has commits not incorporated into validated history.
+    RefuseIncorporate,
+}
+
+/// Decide push strategy from `ls-remote` result and whether remote tip is
+/// incorporated (`rev-list --cherry-pick --right-only` empty).
+///
+/// `remote_incorporated` is only consulted when the tip is present and differs
+/// from `local_sha`. Callers must fail closed before calling when incorporate
+/// cannot be verified.
+#[must_use]
+pub fn resolve_push_decision(
+    tip: &RemoteTip,
+    local_sha: &str,
+    remote_incorporated: bool,
+) -> PushDecision {
+    match tip {
+        RemoteTip::Absent => PushDecision::NewBranch,
+        RemoteTip::Present(remote_sha) if remote_sha == local_sha => PushDecision::UpToDate,
+        RemoteTip::Present(remote_sha) if remote_incorporated => PushDecision::Lease {
+            observed_sha: remote_sha.clone(),
+        },
+        RemoteTip::Present(_) => PushDecision::RefuseIncorporate,
+    }
+}
+
+/// `git ls-remote <remote> <ref>` → tip SHA or absent. Fail closed on git error.
+///
+/// # Errors
+///
+/// Returns [`Error::Command`] / [`Error::Spawn`] when the remote cannot be
+/// queried. Empty stdout is [`RemoteTip::Absent`], not an error.
+pub fn ls_remote_sha(git_dir: &GitDir, remote: &str, refname: &str) -> Result<RemoteTip, Error> {
+    let out = run(git_dir, &["ls-remote", remote, refname])?;
+    let text = stdout_trim(&out);
+    if text.is_empty() {
+        return Ok(RemoteTip::Absent);
+    }
+    // `ls-remote` lines: `<sha>\t<ref>`. Take the first field of the first line.
+    let sha = text
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    if sha.len() < 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::Command {
+            args: format!("ls-remote {remote} {refname}"),
+            status: -1,
+            stderr: format!("unverifiable ls-remote output: {text}"),
+        });
+    }
+    Ok(RemoteTip::Present(sha.to_string()))
+}
+
+/// Whether every commit reachable from `remote_sha` but not `local_sha` is a
+/// cherry-pick equivalent of something on the local side (empty
+/// `rev-list --cherry-pick --right-only local...remote`).
+///
+/// Optional `base_sha` excludes history at/before the integration base.
+///
+/// # Errors
+///
+/// Returns git errors when objects are missing or `rev-list` fails.
+pub fn remote_commits_incorporated(
+    git_dir: &GitDir,
+    local_sha: &str,
+    remote_sha: &str,
+    base_sha: Option<&str>,
+) -> Result<bool, Error> {
+    let range = format!("{local_sha}...{remote_sha}");
+    let base_arg = base_sha.map(|base| format!("^{base}"));
+    let mut args = vec!["rev-list", "--cherry-pick", "--right-only", range.as_str()];
+    if let Some(ref base) = base_arg {
+        args.push(base.as_str());
+    }
+    let out = run(git_dir, &args)?;
+    Ok(stdout_trim(&out).is_empty())
+}
+
+/// Push exact commit SHA to `remote` as `refname` (`<sha>:<ref>`), never `HEAD`.
+///
+/// - [`PushDecision::NewBranch`][]: plain push
+/// - [`PushDecision::UpToDate`][]: no-op success
+/// - [`PushDecision::Lease`][]: `--force-with-lease=<ref>:<observed>`
+/// - [`PushDecision::RefuseIncorporate`][]: error without mutating
+///
+/// After a mutating push, callers should re-`ls-remote` and require equality.
+///
+/// # Errors
+///
+/// Returns [`Error::Command`] when push is refused or git fails.
+pub fn push_exact_sha(
+    git_dir: &GitDir,
+    remote: &str,
+    refname: &str,
+    exact_sha: &str,
+    decision: PushDecision,
+) -> Result<(), Error> {
+    match decision {
+        PushDecision::UpToDate => Ok(()),
+        PushDecision::RefuseIncorporate => Err(Error::Command {
+            args: format!("push {remote} {exact_sha}:{refname}"),
+            status: -1,
+            stderr: "refuse: remote has commits not incorporated into validated history".into(),
+        }),
+        PushDecision::NewBranch => {
+            let spec = format!("{exact_sha}:{refname}");
+            run(git_dir, &["push", remote, &spec])?;
+            Ok(())
+        }
+        PushDecision::Lease { observed_sha } => {
+            let lease = format!("--force-with-lease={refname}:{observed_sha}");
+            let spec = format!("{exact_sha}:{refname}");
+            run(git_dir, &["push", &lease, remote, &spec])?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod push_decision_tests {
+    use super::*;
+
+    #[test]
+    fn absent_is_new_branch() {
+        assert_eq!(
+            resolve_push_decision(&RemoteTip::Absent, "abc", true),
+            PushDecision::NewBranch
+        );
+    }
+
+    #[test]
+    fn same_sha_is_up_to_date() {
+        assert_eq!(
+            resolve_push_decision(&RemoteTip::Present("abc".into()), "abc", false),
+            PushDecision::UpToDate
+        );
+    }
+
+    #[test]
+    fn incorporated_divergence_is_lease() {
+        assert_eq!(
+            resolve_push_decision(&RemoteTip::Present("old".into()), "new", true),
+            PushDecision::Lease {
+                observed_sha: "old".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unincorporated_refuses() {
+        assert_eq!(
+            resolve_push_decision(&RemoteTip::Present("other".into()), "local", false),
+            PushDecision::RefuseIncorporate
+        );
+    }
+}

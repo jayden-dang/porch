@@ -51,7 +51,7 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 - [x] Uncertified range on incomplete rereview
 - [x] Process-group kill on fixer step end
 - [x] Prompt files under `$PORCH_HOME` (refuse if missing)
-- [x] HEAD continuity before certify/deliver stubs
+- [x] HEAD continuity before certify/deliver
 - [x] Extra M1–M3 scenarios: coverage miss, parked-across-restart, status without `--run-id`, fetch fail closed, followTags
 
 ## M5 — Certify adapters (1 week)
@@ -63,13 +63,15 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 - [ ] Mailgate sketch smoke: biome + types/api/docs drift (operator-gated; not `cargo test`)
 - [x] No Postgres, no Playwright as certify defaults
 
-## M6 — Deliver GitHub (2 weeks)
+## M6 — Deliver GitHub (done for push+PR+allowlist watch)
 
-- Lease-push exact SHA
-- `gh pr create/update`, body + attestation comment
-- Watch allowlisted checks
-- Repair: restart at **review**
-- `rerun_transient = 0`
+- [x] Lease-push exact SHA (`--force-with-lease=<ref>:<observed>`; never bare `--force`)
+- [x] `gh pr create/update`, body + `<!-- porch-attestation … -->` binding `head_sha`
+- [x] Watch allowlisted checks only (`deliver.github.watch_checks`); empty allowlist → push+PR, no babysit
+- [x] `rerun_transient` default **0**; no `gh run rerun` in this milestone
+- [x] Fail closed on incorporate refuse / missing `gh` (before push) / red allowlisted checks after poll
+- [x] `runs.pr_url`; daemon restart while watching → `ci_monitor_interrupted` (not failed)
+- [ ] Repair: agent CI-fix loop restart at **review** (deferred — fail closed on red allowlisted checks instead)
 
 ## M7 — Dogfood on mailgate
 

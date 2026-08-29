@@ -66,7 +66,7 @@ porch init                 # ~/.porch bare repo, remote `porch`, hooks, daemon
 git push porch HEAD:refs/heads/your-branch
 ```
 
-`$PORCH_HOME` overrides `~/.porch`. Push updates the bare, runs intent → rebase → review (park / `porch agent respond` including `fix`), then cheap certify (`commands.format` / `commands.lint` from the trusted default-branch SHA). Deliver is still a stub; GitHub PR wiring is M6.
+`$PORCH_HOME` overrides `~/.porch`. Push updates the bare, runs intent → rebase → review (park / `porch agent respond` including `fix`), cheap certify (`commands.format` / `commands.lint` from the trusted default-branch SHA), then deliver: lease-push the certified SHA to `origin`, open or update a GitHub PR via `gh`, and babysit allowlisted checks from trusted `deliver.github.watch_checks` (`rerun_transient` default 0).
 
 ```sh
 cargo test --workspace

@@ -6,11 +6,57 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use porch_agent::FIXER_BIN_ENV;
+use porch_deliver::GH_BIN_ENV;
 use porch_gate::{Db, kill_group, repo_id_for, run_fixer_dir};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
 use serde_json::Value;
 use tempfile::TempDir;
+
+/// Noop `gh` so deliver does not hit a real GitHub CLI (E13).
+fn install_noop_gh(bin_dir: &Path) -> PathBuf {
+    let path = bin_dir.join("fake-gh");
+    let script = r#"#!/bin/sh
+set -e
+: "${PORCH_HOME:?}"
+STATE="$PORCH_HOME/gh-pr-state"
+for a in "$@"; do
+  [ "$a" = "--version" ] && echo "gh version 2.50.0 (fake)" && exit 0
+done
+CMD=""
+PREV=""
+for a in "$@"; do
+  if [ "$PREV" = "pr" ]; then CMD="$a"; break; fi
+  PREV="$a"
+done
+case "$CMD" in
+  list)
+    if [ -f "$STATE" ]; then cat "$STATE"; else printf '[]\n'; fi
+    ;;
+  create)
+    cat >/dev/null
+    printf '[{"number":1,"url":"https://example.com/pull/1","title":"t"}]\n' > "$STATE"
+    echo "https://example.com/pull/1"
+    ;;
+  edit)
+    cat >/dev/null
+    ;;
+  checks)
+    printf '[]\n'
+    ;;
+  *) echo "noop-gh: $*" >&2; exit 1 ;;
+esac
+"#;
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
 
 fn git(work: &Path, args: &[&str]) {
     let st = StdCommand::new("git")
@@ -207,6 +253,7 @@ struct Setup {
     _origin: PathBuf,
     fake_review: PathBuf,
     fake_fixer: PathBuf,
+    fake_gh: PathBuf,
     path: String,
 }
 
@@ -221,6 +268,7 @@ fn setup(review_mode: &str, fixer_mode: &str) -> Setup {
     std::fs::create_dir_all(&bin_dir).unwrap();
     let fake_review = install_fake_review(&bin_dir);
     let fake_fixer = install_fake_fixer(&bin_dir);
+    let fake_gh = install_noop_gh(&bin_dir);
 
     init_bare(&origin).unwrap();
 
@@ -259,6 +307,7 @@ fn setup(review_mode: &str, fixer_mode: &str) -> Setup {
         .env("PORCH_HOME", &home)
         .env(REVIEW_BIN_ENV, &fake_review)
         .env(FIXER_BIN_ENV, &fake_fixer)
+        .env(GH_BIN_ENV, &fake_gh)
         .env("PORCH_FAKE_REVIEW_MODE", review_mode)
         .env("PORCH_FAKE_FIXER_MODE", fixer_mode)
         .env("PATH", &path)
@@ -271,6 +320,7 @@ fn setup(review_mode: &str, fixer_mode: &str) -> Setup {
         &home,
         &fake_review,
         &fake_fixer,
+        &fake_gh,
         review_mode,
         fixer_mode,
         &path,
@@ -285,6 +335,7 @@ fn setup(review_mode: &str, fixer_mode: &str) -> Setup {
         _origin: origin,
         fake_review,
         fake_fixer,
+        fake_gh,
         path,
     }
 }
@@ -294,6 +345,7 @@ fn restart_daemon(
     home: &Path,
     fake_review: &Path,
     fake_fixer: &Path,
+    fake_gh: &Path,
     review_mode: &str,
     fixer_mode: &str,
     path: &str,
@@ -307,6 +359,7 @@ fn restart_daemon(
         &[
             (REVIEW_BIN_ENV, fake_review.as_os_str()),
             (FIXER_BIN_ENV, fake_fixer.as_os_str()),
+            (GH_BIN_ENV, fake_gh.as_os_str()),
             ("PORCH_FAKE_REVIEW_MODE", review_mode.as_ref()),
             ("PORCH_FAKE_FIXER_MODE", fixer_mode.as_ref()),
             ("PATH", path.as_ref()),
@@ -351,6 +404,7 @@ fn agent_fix(s: &Setup, run_id: &str, extra: &[&str], fixer_mode: &str) -> std::
         .env("PORCH_HOME", &s.home)
         .env(REVIEW_BIN_ENV, &s.fake_review)
         .env(FIXER_BIN_ENV, &s.fake_fixer)
+        .env(GH_BIN_ENV, &s.fake_gh)
         .env("PORCH_FAKE_REVIEW_MODE", "blocking")
         .env("PORCH_FAKE_FIXER_MODE", fixer_mode)
         .env("PORCH_REVIEW_TIMEOUT_SECS", "20")
@@ -463,6 +517,7 @@ fn rereview_timeout_after_commit_fails_and_persists_uncertified() {
         &s.home,
         &s.fake_review,
         &s.fake_fixer,
+        &s.fake_gh,
         "rereview-hang",
         "apply",
         &s.path,
@@ -489,6 +544,7 @@ fn rereview_timeout_after_commit_fails_and_persists_uncertified() {
         .env("PORCH_HOME", &s.home)
         .env(REVIEW_BIN_ENV, &s.fake_review)
         .env(FIXER_BIN_ENV, &s.fake_fixer)
+        .env(GH_BIN_ENV, &s.fake_gh)
         .env("PORCH_FAKE_REVIEW_MODE", "rereview-hang")
         .env("PORCH_FAKE_FIXER_MODE", "apply")
         .env("PORCH_REVIEW_TIMEOUT_SECS", "1")
@@ -546,6 +602,7 @@ fn next_initial_review_uses_uncertified_from_sha() {
         &s.home,
         &s.fake_review,
         &s.fake_fixer,
+        &s.fake_gh,
         "clean",
         "noop",
         &s.path,
