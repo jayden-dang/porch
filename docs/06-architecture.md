@@ -35,7 +35,7 @@ Skip is per-run (`--skip`, push option), never a standing config hole in the cor
 
 ## Components
 
-### Gate (`src/gate`)
+### Gate (`crates/porch-gate`)
 
 `porch init`:
 
@@ -47,7 +47,7 @@ Skip is per-run (`--skip`, push option), never a standing config hole in the cor
 
 Admission refuses descendants of an active validation step (recursive containment).
 
-### Daemon (`src/daemon`)
+### Daemon (in `crates/porch-gate`, not its own crate)
 
 Owns runs, worktrees, executor, IPC subscribers, crash recovery, child reaping.
 
@@ -57,7 +57,7 @@ Owns runs, worktrees, executor, IPC subscribers, crash recovery, child reaping.
 - Same-branch serialize: new push cancels old run
 - Recovery: resume only parked-complete gates; otherwise fail the stale run and pin unpublished commits under a recovery ref
 
-### Git wrapper (`src/git`)
+### Git wrapper (`crates/porch-git`)
 
 Every call: absolute git dir, env that won’t pick up the caller’s hooks (`core.hooksPath` empty **only** for porch’s own correction commits — husky in a disposable worktree otherwise sources missing `_/husky.sh`). Redact credentials in logs. Timeout per call.
 

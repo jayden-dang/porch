@@ -22,23 +22,19 @@ Local implementation notes (gitignored): **`.research/`**. Read that directory b
 - Year-1 review engine is an **external review CLI** composed as a subprocess. Do not reimplement grouping, relocation, or language-rule matching until that is an explicit milestone.
 - Day-1 forges: **GitHub only**. Day-1 agents: **ACP + one native CLI**. Do not add adapter surface because it is easy.
 
-## Layout (when code exists)
+## Layout
 
-One binary crate, internal modules. Do not split a 12-crate workspace on day 1.
+Virtual Cargo workspace. Slices are use cases, not layers. Do not add a crate per technical layer.
 
 ```
-src/main.rs          # clap; `porch daemon run` is a fast path
-src/daemon/
-src/gate/            # init, hooks, bare repo
-src/git/             # typed git CLI wrapper, --git-dir absolute
-src/pipeline/        # intent → rebase → review → certify → deliver
-src/review/          # external review CLI adapter
-src/agent/           # ACP + one native
-src/ipc/             # JSON-RPC
-src/db/              # rusqlite, single writer
-src/config/          # YAML + trust merge
-src/scm/github/
-src/tui/             # ratatui; secondary to porch agent
+Cargo.toml                 # workspace; resolver = "3"; members = ["crates/*"]
+crates/porch/              # binary; clap; `porch daemon run` is a fast path
+crates/porch-git/          # git CLI wrapper, --git-dir absolute; publish = false
+crates/porch-gate/         # M1 slice: init, hooks, admit, notify, sqlite, daemon
+# later slices (not M1):
+# crates/porch-run/        # worktree, intent, rebase
+# crates/porch-review/     # external review CLI adapter
+# crates/porch-deliver/    # GitHub PR + allowlisted checks
 ```
 
 State root: `$PORCH_HOME` (default `~/.porch`).

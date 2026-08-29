@@ -1,0 +1,28 @@
+[package]
+name = "porch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Local git gate"
+
+[[bin]]
+name = "porch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+porch-gate = { path = "../porch-gate" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+porch-gate = { path = "../porch-gate" }
+predicates.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

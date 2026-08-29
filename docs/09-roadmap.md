@@ -10,7 +10,7 @@ Dogfood target: mailgate. Each milestone should be runnable on a toy git repo fi
 - [ ] crates.io name check
 - [ ] Confirm review-CLI flags for range review + JSON output against current `--help` at implementation time (flags drift). Details in `.research/`.
 
-## M1 — Push into a dead gate (1–2 weeks)
+## M1 — Push into a dead gate (in progress)
 
 Goal: `porch init` + `git push porch` updates a local bare repo and returns. No pipeline.
 

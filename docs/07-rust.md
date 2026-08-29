@@ -4,11 +4,13 @@ Language is locked (E1). This is the engineering translation.
 
 ## Crate policy
 
-**One package, one binary, `src/` modules.** Name in Cargo.toml: `porch` (crates.io id free as of 2026-08-29). If that id is taken at publish time, package `porch-cli` with `[[bin]] name = "porch"`.
+Virtual workspace (`resolver = "3"`). Published package: `porch` (crates.io id free as of 2026-08-29). If that id is taken at publish time, package `porch-cli` with `[[bin]] name = "porch"`.
 
-Do not start a mailgate-sized workspace. Split when a second binary exists (e.g. a tiny hook helper) — and even then, hooks should still call the main binary.
+Slice libraries (`porch-git`, `porch-gate`, later phase crates) are `publish = false`. A crate is a use-case cluster, not a technical layer. Do not add `porch-daemon` / `porch-db` / `porch-ipc` as packages.
 
-Edition 2024. Pin MSRV in `rust-toolchain.toml` / mise when we care. `Cargo.lock` committed.
+`default-members = ["crates/porch"]`. Inherit edition, license, rust-version, lints, and third-party versions from `[workspace]`.
+
+Edition 2024. Pin MSRV (`1.85`) in `rust-toolchain.toml` / workspace `rust-version`. `Cargo.lock` committed.
 
 ## Dependencies (allowlist)
 
@@ -36,13 +38,13 @@ The review CLI, `gh`, and the native agent are **external binaries**, not crates
 ## Process model
 
 ```
-porch (CLI, short-lived)
-  └─ JSON-RPC ──► porch daemon (long-lived, Tokio)
+porch (CLI, short-lived)          # crates/porch
+  └─ JSON-RPC ──► porch daemon    # crates/porch-gate
                     ├─ rusqlite writer thread
                     ├─ run tasks (JoinHandle per run)
-                    │    ├─ git CLI (spawn_blocking)
-                    │    ├─ review CLI (tokio::process, process group)
-                    │    └─ fixer agent (tokio::process, process group)
+                    │    ├─ git CLI (crates/porch-git, spawn_blocking)
+                    │    ├─ review CLI (later slice, process group)
+                    │    └─ fixer agent (later slice, process group)
                     └─ IPC subscribers (bounded)
 ```
 
