@@ -229,6 +229,11 @@ pub fn ensure_daemon(porch_bin: &Path, home: &Path) -> Result<()> {
     if rpc::health_check(home).ok() == Some(true) {
         return Ok(());
     }
-    crate::spawn_detached(porch_bin, home)?;
+    let porch_env = crate::collect_porch_env();
+    let extra: Vec<(&str, &std::ffi::OsStr)> = porch_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_os_str()))
+        .collect();
+    crate::spawn_detached_with_env(porch_bin, home, &extra)?;
     wait_for_health(home, Duration::from_secs(5))
 }

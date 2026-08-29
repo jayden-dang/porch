@@ -41,7 +41,10 @@ pub fn notify_push(home: &Path, git_dir: &Path, mut stdin: impl Read) -> Result<
         if new.chars().all(|c| c == '0') {
             continue;
         }
-        let branch = rref.strip_prefix("refs/heads/").unwrap_or(rref);
+        // Tags and other non-branch refs still update the bare; do not enqueue runs.
+        let Some(branch) = rref.strip_prefix("refs/heads/") else {
+            continue;
+        };
         let row = db.insert_run(&repo.id, branch, new, intent.as_deref(), intent_source)?;
         ids.push(row.id);
     }

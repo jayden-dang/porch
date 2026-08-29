@@ -151,13 +151,39 @@ pub fn worktree_remove_force(git_dir: &GitDir, path: &Path) -> Result<(), Error>
     Ok(())
 }
 
-/// `git fetch <remote> <refspec>` with absolute `--git-dir`.
+/// Ensure a fetch refspec is force (`+…`) when the caller omitted `+`.
+#[must_use]
+pub fn force_fetch_refspec(refspec: &str) -> String {
+    if refspec.starts_with('+') {
+        refspec.to_string()
+    } else {
+        format!("+{refspec}")
+    }
+}
+
+/// Argv for `git fetch` after `--git-dir` (prune disabled, force refspec).
+#[must_use]
+pub fn fetch_git_args(remote: &str, refspec: &str) -> Vec<String> {
+    vec![
+        "-c".into(),
+        "fetch.prune=false".into(),
+        "fetch".into(),
+        remote.into(),
+        force_fetch_refspec(refspec),
+    ]
+}
+
+/// `git -c fetch.prune=false fetch <remote> +<refspec>` with absolute `--git-dir`.
+///
+/// Adds a leading `+` when `refspec` does not already include one.
 ///
 /// # Errors
 ///
 /// Returns git errors if fetch fails (including unreachable remote).
 pub fn fetch(git_dir: &GitDir, remote: &str, refspec: &str) -> Result<(), Error> {
-    run(git_dir, &["fetch", remote, refspec])?;
+    let args = fetch_git_args(remote, refspec);
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(git_dir, &args_ref)?;
     Ok(())
 }
 

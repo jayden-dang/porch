@@ -1,7 +1,11 @@
 //! Execute a porch run: disposable worktree, intent, rebase, review, stubs.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Serialize fetch + tip resolve across concurrent rebases in this process.
+static FETCH_RESOLVE_LOCK: Mutex<()> = Mutex::new(());
 
 use porch_gate::{Db, RunExecutor, RunRow, db_path, run_worktree_dir};
 use porch_git::GitDir;
@@ -208,13 +212,18 @@ fn run_rebase(
     wt: &Path,
     default_branch: &str,
 ) -> Result<bool> {
-    let refspec = format!("{default_branch}:refs/remotes/origin/{default_branch}");
-    porch_git::fetch(bare, "origin", &refspec)
-        .map_err(|e| RunError::Msg(format!("fetch origin/{default_branch}: {e}")))?;
+    let onto = {
+        let _guard = FETCH_RESOLVE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let refspec = format!("refs/heads/{default_branch}:refs/remotes/origin/{default_branch}");
+        porch_git::fetch(bare, "origin", &refspec)
+            .map_err(|e| RunError::Msg(format!("fetch origin/{default_branch}: {e}")))?;
 
-    let origin_ref = format!("refs/remotes/origin/{default_branch}");
-    let onto = porch_git::rev_parse(bare, &origin_ref)
-        .map_err(|e| RunError::Msg(format!("resolve origin/{default_branch}: {e}")))?;
+        let origin_ref = format!("refs/remotes/origin/{default_branch}");
+        porch_git::rev_parse(bare, &origin_ref)
+            .map_err(|e| RunError::Msg(format!("resolve origin/{default_branch}: {e}")))?
+    };
     db.set_run_shas(run_id, None, Some(&onto))?;
 
     let head = porch_git::rev_parse_c(wt, "HEAD")?;

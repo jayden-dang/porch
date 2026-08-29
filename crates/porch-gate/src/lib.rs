@@ -23,7 +23,9 @@ pub use home::{
 pub use id::repo_id_for;
 pub use init::{InitOptions, InitResult, init};
 pub use notify::{git_dir_from_env, notify_push};
-pub use proc::{kill_group, spawn_detached, spawn_detached_with_env};
+pub use proc::{
+    collect_porch_env, collect_porch_env_from, kill_group, spawn_detached, spawn_detached_with_env,
+};
 pub use rpc::start_run as rpc_start_run;
 
 #[derive(Debug, thiserror::Error)]

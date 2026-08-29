@@ -1,10 +1,36 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::Result;
 use crate::home::logs_dir;
+
+/// Collect every `PORCH_*` variable from an env-like key/value iterator.
+#[must_use]
+pub fn collect_porch_env_from<K, V, I>(vars: I) -> Vec<(String, OsString)>
+where
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    vars.into_iter()
+        .filter_map(|(k, v)| {
+            let key = k.as_ref().to_str()?.to_string();
+            if key.starts_with("PORCH_") {
+                Some((key, v.as_ref().to_os_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Collect every `PORCH_*` variable from the current process environment.
+#[must_use]
+pub fn collect_porch_env() -> Vec<(String, OsString)> {
+    collect_porch_env_from(std::env::vars_os())
+}
 
 /// Spawn `porch daemon run` in its own process group. Returns the child pid.
 ///
@@ -16,6 +42,8 @@ pub fn spawn_detached(porch_bin: &Path, home: &Path) -> Result<u32> {
 }
 
 /// Like [`spawn_detached`], with extra environment variables for the daemon.
+///
+/// `PORCH_HOME` is always set to `home` after `extra_env` so the explicit home wins.
 ///
 /// # Errors
 ///
@@ -30,10 +58,10 @@ pub fn spawn_detached_with_env(
     let log2 = log.try_clone()?;
     let mut cmd = Command::new(porch_bin);
     cmd.args(["daemon", "run"]);
-    cmd.env("PORCH_HOME", home);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+    cmd.env("PORCH_HOME", home);
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(log2));
@@ -78,5 +106,26 @@ mod tests {
         }
         let status = cmd.status().unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn collect_porch_env_from_keeps_only_porch_prefix() {
+        let collected = collect_porch_env_from([
+            ("PATH", "/usr/bin"),
+            ("PORCH_HOME", "/tmp/home"),
+            ("PORCH_REVIEW_BIN", "fake-review"),
+            ("OTHER", "nope"),
+        ]);
+        assert_eq!(collected.len(), 2);
+        assert!(
+            collected
+                .iter()
+                .any(|(k, v)| k == "PORCH_HOME" && v.to_string_lossy() == "/tmp/home")
+        );
+        assert!(
+            collected
+                .iter()
+                .any(|(k, v)| k == "PORCH_REVIEW_BIN" && v.to_string_lossy() == "fake-review")
+        );
     }
 }

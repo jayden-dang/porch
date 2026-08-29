@@ -51,12 +51,59 @@ pub fn init(opts: InitOptions<'_>) -> Result<InitResult> {
     add_or_set_remote(&work, &bare_path)?;
     copy_origin_to_bare(&work, &bare_path)?;
     porch_git::run_c(&work, &["config", "porch.repo-id", &repo_id])?;
+    let default_branch = detect_default_branch(&work);
     let db = Db::open(&db_path(&porch_home))?;
-    db.upsert_repo(&repo_id, &work, &bare_path, "main")?;
+    db.upsert_repo(&repo_id, &work, &bare_path, &default_branch)?;
     if opts.start_daemon {
         crate::ensure_daemon(opts.porch_bin, &porch_home)?;
     }
     Ok(InitResult { repo_id, bare_path })
+}
+
+/// Resolve the clone's default branch from `origin/HEAD`, fallback `main`.
+fn detect_default_branch(work: &Path) -> String {
+    let raw = porch_git::run_c(work, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .or_else(|_| porch_git::run_c(work, &["rev-parse", "--abbrev-ref", "origin/HEAD"]))
+        .ok()
+        .map(|out| porch_git::stdout_trim(&out))
+        .filter(|s| !s.is_empty());
+    let Some(raw) = raw else {
+        return "main".into();
+    };
+    strip_origin_head_prefix(&raw).unwrap_or_else(|| "main".into())
+}
+
+fn strip_origin_head_prefix(raw: &str) -> Option<String> {
+    let branch = raw
+        .strip_prefix("refs/remotes/origin/")
+        .or_else(|| raw.strip_prefix("origin/"))
+        .unwrap_or(raw);
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        None
+    } else {
+        Some(branch.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_origin_head_prefix;
+
+    #[test]
+    fn strip_origin_head_prefix_variants() {
+        assert_eq!(
+            strip_origin_head_prefix("refs/remotes/origin/dev").as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            strip_origin_head_prefix("origin/dev").as_deref(),
+            Some("dev")
+        );
+        assert_eq!(strip_origin_head_prefix("main").as_deref(), Some("main"));
+        assert_eq!(strip_origin_head_prefix("origin/HEAD"), None);
+        assert_eq!(strip_origin_head_prefix(""), None);
+    }
 }
 
 /// Mirror the author clone's `origin` URL onto the bare gate (for rebase fetch).

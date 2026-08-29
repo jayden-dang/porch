@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use porch_git::{GitDir, init_bare, run, run_c, stdout_trim};
+use porch_git::{GitDir, fetch_git_args, force_fetch_refspec, init_bare, run, run_c, stdout_trim};
 use tempfile::TempDir;
 
 fn write_commit(work: &std::path::Path) {
@@ -30,6 +30,28 @@ fn write_commit(work: &std::path::Path) {
         .args(["commit", "-m", "init"])
         .status()
         .unwrap();
+}
+
+#[test]
+fn fetch_args_disable_prune_and_force_refspec() {
+    assert_eq!(
+        force_fetch_refspec("refs/heads/main:refs/remotes/origin/main"),
+        "+refs/heads/main:refs/remotes/origin/main"
+    );
+    assert_eq!(
+        force_fetch_refspec("+refs/heads/dev:refs/remotes/origin/dev"),
+        "+refs/heads/dev:refs/remotes/origin/dev"
+    );
+    assert_eq!(
+        fetch_git_args("origin", "refs/heads/main:refs/remotes/origin/main"),
+        vec![
+            "-c",
+            "fetch.prune=false",
+            "fetch",
+            "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ]
+    );
 }
 
 #[test]

@@ -43,6 +43,10 @@ Reopen only with an explicit written change. Coding sessions do not get to “ju
 | E16 | Fetch/resolve of `origin/<default>` fails: **fail the run** (fail closed). Default-branch tip is a safety fact for rebase. |
 | E17 | Intent for execute: hook/`notify` reads **`PORCH_INTENT`**. Empty → skip intent phase, do not fail. Default branch column: `repos.default_branch` (default `main`). |
 | E18 | M3 park + agent JSON: blocking review findings set `status=parked` and keep the worktree; `porch agent status` / `respond` emit JSON on stdout (D11). Respond supports **`approve` \| `skip` \| `abort` only** (no fixer). `review_approved_head_sha` is written only on completed review or **approve**; **skip** does not write it. Review subprocess timeout **fails** the run (does not park). Review adapter lives in `porch-review`; `porch-gate` must not depend on it. |
+| E19 | `porch init` sets `repos.default_branch` from the clone's `origin/HEAD` (`symbolic-ref refs/remotes/origin/HEAD` or `rev-parse --abbrev-ref origin/HEAD`, stripping `refs/remotes/origin/` / `origin/`). Fallback **`main`**. |
+| E20 | `ensure_daemon` forwards every current-process `PORCH_*` env var into the detached daemon (`spawn_detached_with_env`), and always sets `PORCH_HOME` to the init home last so it wins. |
+| E21 | `notify_push` enqueues runs only for `refs/heads/*`. Other refs (e.g. tags) still update the bare via admit/receive so `followTags` can succeed, but do not create runs. |
+| E22 | Rebase fetch is `git -c fetch.prune=false fetch <remote> +<refspec>` (add `+` when the caller omitted it). Fetch + tip `rev-parse` in `run_rebase` are serialized with a process-wide mutex. |
 
 ## Explicitly rejected (for now)
 
