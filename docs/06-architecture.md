@@ -83,9 +83,9 @@ Spawn `gh`. Find PR by branch (not filtered by base — update existing rather t
 
 JSON-RPC on the socket. CLI:
 
-- `porch` — attach TUI or wizard (**M8 TUI**; **M9** first-run setup)
-- `porch init | eject | daemon | status | runs | doctor | setup`
-- `porch agent run|respond|status|logs|abort|sync`
+- `porch` — attach TUI when TTY + active run on branch; otherwise list runs / hint (**M8**). Wizard is **M9**.
+- `porch init | daemon | status | runs | doctor | attach` (**M9:** `setup`, `eject`)
+- `porch agent status|respond` (headless park path; JSON contract stable)
 
 ### Data (SQLite, first cut)
 
@@ -103,4 +103,4 @@ Global `$PORCH_HOME/config.yaml`. Repo `.porch.yaml`. Merge: trusted SHA for exe
 
 ## Eventing
 
-Bounded mailboxes. Slow TUI must not stall the run. State events must not be dropped silently (coalesce a gap signal; clients re-read).
+**Shipped (M8):** per-subscriber bounded mailbox (cap 64) on the daemon. Event kinds: `stream_gap` (forces `get_run`), `state` (compact hint + `state_rev`), `activity` (droppable). Publish is non-blocking; a full mailbox drops newest activity but sticky-gaps state so clients re-read. New `subscribe` always opens with `stream_gap`. Daemon accepts connections on a thread each so a held subscribe cannot stall `health` / `start_run`.

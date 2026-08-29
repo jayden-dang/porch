@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,6 +12,7 @@ use fs4::fs_std::FileExt;
 
 use crate::Result;
 use crate::db::Db;
+use crate::events::{EventHub, clear_event_hub, install_event_hub};
 use crate::executor::RunExecutor;
 use crate::home::{db_path, lock_path, logs_dir, pid_path, socket_path};
 use crate::rpc::{self, Request};
@@ -23,9 +24,13 @@ struct Inflight {
 
 struct DaemonState {
     inflight: HashMap<String, Inflight>,
+    hub: Arc<EventHub>,
 }
 
 /// Hold the lock, recover stale runs, bind the socket, serve JSON-RPC.
+///
+/// Each accepted connection is handled on its own thread so a long-lived
+/// `subscribe` does not stall `health` / `start_run`.
 ///
 /// # Errors
 ///
@@ -43,8 +48,11 @@ pub fn run_daemon(home: &Path, executor: &Arc<dyn RunExecutor>) -> Result<()> {
     if let Err(e) = executor.recover_stale(home) {
         return Err(crate::Error::Other(format!("recover stale runs: {e}")));
     }
+    let hub = Arc::new(EventHub::new());
+    install_event_hub(Arc::clone(&hub));
     let state = Arc::new(Mutex::new(DaemonState {
         inflight: HashMap::new(),
+        hub: Arc::clone(&hub),
     }));
     let sock = socket_path(home);
     let _ = std::fs::remove_file(&sock);
@@ -56,37 +64,48 @@ pub fn run_daemon(home: &Path, executor: &Arc<dyn RunExecutor>) -> Result<()> {
     kick_pending(&home_buf, &db, executor, &state);
 
     for stream in listener.incoming() {
-        let mut stream = match stream {
+        let stream = match stream {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("accept: {e}");
                 continue;
             }
         };
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            continue;
-        }
-        match handle_rpc_line(&line, &home_buf, &db, executor, &state) {
-            Ok(resp) => {
-                let _ = writeln!(stream, "{resp}");
+        let home_t = home_buf.clone();
+        let db_t = Arc::clone(&db);
+        let exec_t = Arc::clone(executor);
+        let state_t = Arc::clone(&state);
+        let hub_t = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            if let Err(e) = handle_connection(stream, &home_t, &db_t, &exec_t, &state_t, &hub_t) {
+                tracing::warn!("connection: {e}");
             }
-            Err(e) => tracing::warn!("rpc: {e}"),
-        }
+        });
     }
+    clear_event_hub();
     Ok(())
 }
 
-fn handle_rpc_line(
-    line: &str,
+fn handle_connection(
+    mut stream: UnixStream,
     home: &Path,
     db: &Arc<Db>,
     executor: &Arc<dyn RunExecutor>,
     state: &Arc<Mutex<DaemonState>>,
-) -> Result<String> {
+    hub: &Arc<EventHub>,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(());
+    }
     let req: Request =
         serde_json::from_str(line.trim()).map_err(|e| crate::Error::Other(e.to_string()))?;
+
+    if req.method == "subscribe" {
+        return handle_subscribe(stream, &req, hub);
+    }
+
     let result = match req.method.as_str() {
         "health" => serde_json::json!({"ok": true, "pid": std::process::id()}),
         "start_run" => {
@@ -101,6 +120,35 @@ fn handle_rpc_line(
                 Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
             }
         }
+        "list_runs" => {
+            let repo_id = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("repo_id"))
+                .and_then(|v| v.as_str());
+            let limit = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("limit"))
+                .and_then(serde_json::Value::as_u64)
+                .map_or(20, |n| usize::try_from(n).unwrap_or(20));
+            match rpc::list_runs_result(db, repo_id, limit) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({"error": e.to_string()}),
+            }
+        }
+        "get_run" => {
+            let run_id = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("run_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| crate::Error::Other("get_run requires params.run_id".into()))?;
+            match rpc::get_run_result(db, hub, run_id) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({"error": e.to_string()}),
+            }
+        }
         other => serde_json::json!({"error": format!("unknown method {other}")}),
     };
     let resp = rpc::Response {
@@ -108,7 +156,47 @@ fn handle_rpc_line(
         result,
         id: req.id,
     };
-    serde_json::to_string(&resp).map_err(|e| crate::Error::Other(e.to_string()))
+    let out = serde_json::to_string(&resp).map_err(|e| crate::Error::Other(e.to_string()))?;
+    writeln!(stream, "{out}")?;
+    Ok(())
+}
+
+fn handle_subscribe(mut stream: UnixStream, req: &Request, hub: &Arc<EventHub>) -> Result<()> {
+    let run_id = req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("run_id"))
+        .and_then(|v| v.as_str());
+    let ack = rpc::Response {
+        jsonrpc: "2.0".into(),
+        result: serde_json::json!({"ok": true, "subscribed": true}),
+        id: req.id,
+    };
+    let out = serde_json::to_string(&ack).map_err(|e| crate::Error::Other(e.to_string()))?;
+    writeln!(stream, "{out}")?;
+
+    let sub = hub.subscribe(run_id);
+    // Stream until the client hangs up (write fails) or we idle for a long time.
+    // Write errors end the loop; Drop unregisters the subscriber.
+    loop {
+        match sub.recv_timeout(Duration::from_secs(30)) {
+            Some(ev) => {
+                let line =
+                    serde_json::to_string(&ev).map_err(|e| crate::Error::Other(e.to_string()))?;
+                if writeln!(stream, "{line}").is_err() {
+                    break;
+                }
+            }
+            None => {
+                // Empty write often succeeds after peer close; a newline fails with
+                // EPIPE. Client skips blank lines (see subscribe_events).
+                if stream.write_all(b"\n").is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn kick_pending(
@@ -152,6 +240,10 @@ fn start_run(
         let mut guard = state.lock().expect("daemon state");
         for old in &prior {
             let _ = db.set_run_status(&old.id, "cancelled", Some("superseded by new push"));
+            guard.hub.publish_state(&old.id);
+            guard
+                .hub
+                .publish_activity(&old.id, "status=cancelled superseded");
             if let Some(inf) = guard.inflight.remove(&old.id) {
                 inf.cancel.store(true, Ordering::SeqCst);
                 wait_for.push(inf.handle);
@@ -236,4 +328,104 @@ pub fn ensure_daemon(porch_bin: &Path, home: &Path) -> Result<()> {
         .collect();
     crate::spawn_detached_with_env(porch_bin, home, &extra)?;
     wait_for_health(home, Duration::from_secs(5))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::RunExecutor;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    struct NoopExecutor;
+
+    impl RunExecutor for NoopExecutor {
+        fn execute(&self, _home: &Path, _run_id: &str, _cancel: &AtomicBool) {}
+
+        fn recover_stale(&self, _home: &Path) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn start_test_daemon(home: &Path) -> JoinHandle<()> {
+        let home = home.to_path_buf();
+        let exec: Arc<dyn RunExecutor> = Arc::new(NoopExecutor);
+        std::thread::spawn(move || {
+            let _ = run_daemon(&home, &exec);
+        })
+    }
+
+    #[test]
+    fn health_list_get_subscribe_with_thread_per_connection() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let db = Db::open(&db_path(&home)).unwrap();
+        db.upsert_repo("repo1", &home, &home.join("bare.git"), "main")
+            .unwrap();
+        let run = db
+            .insert_run("repo1", "feat", "abc123", Some("intent"), Some("cli"))
+            .unwrap();
+        db.set_run_status(&run.id, "parked", None).unwrap();
+        db.insert_step_result(&run.id, "review", "parked", None)
+            .unwrap();
+        db.set_findings_json(&run.id, Some(r#"[{"id":"f0"}]"#))
+            .unwrap();
+
+        let _handle = start_test_daemon(&home);
+        wait_for_health(&home, Duration::from_secs(5)).unwrap();
+
+        assert!(rpc::health_check(&home).unwrap());
+
+        let listed = rpc::list_runs(&home, Some("repo1"), Some(10)).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["id"], run.id);
+        assert_eq!(listed[0]["branch"], "feat");
+        assert_eq!(listed[0]["status"], "parked");
+
+        let snap = rpc::get_run(&home, &run.id).unwrap();
+        assert_eq!(snap.run_id, run.id);
+        assert_eq!(snap.status, "parked");
+        assert_eq!(snap.branch, "feat");
+        assert!(snap.findings.is_array());
+        assert_eq!(snap.steps.len(), 1);
+        assert_eq!(snap.steps[0].step, "review");
+
+        // Subscribe: first event is stream_gap; publish_state yields state or gap.
+        let hub = crate::event_hub().expect("hub installed");
+        let run_id = run.id.clone();
+        let home2 = home.clone();
+        let join = std::thread::spawn(move || {
+            let mut n = 0u32;
+            let mut saw_gap = false;
+            let mut saw_state_or_gap_after = false;
+            let _ = rpc::subscribe_events(&home2, Some(&run_id), |ev| {
+                n += 1;
+                match &ev {
+                    crate::events::Event::StreamGap { .. } if n == 1 => {
+                        saw_gap = true;
+                        true
+                    }
+                    crate::events::Event::State { .. } | crate::events::Event::StreamGap { .. } => {
+                        saw_state_or_gap_after = true;
+                        false
+                    }
+                    crate::events::Event::Activity { .. } => n < 20,
+                }
+            });
+            (saw_gap, saw_state_or_gap_after)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        hub.publish_state(&run.id);
+        let (gap, after) = join.join().unwrap();
+        assert!(gap, "subscribe must open with stream_gap");
+        assert!(after, "publish_state must deliver state or gap");
+
+        // Cleanup: remove socket so daemon accept may fail eventually; kill via pid.
+        if let Ok(pid) = std::fs::read_to_string(pid_path(&home)) {
+            if let Ok(pid) = pid.trim().parse::<u32>() {
+                crate::kill_group(pid);
+            }
+        }
+    }
 }

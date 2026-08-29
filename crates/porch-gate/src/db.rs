@@ -358,6 +358,76 @@ impl Db {
         Ok(out)
     }
 
+    /// Recent runs, newest first. Optional `repo_id` filter; `limit` capped implicitly by caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the query fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn recent_runs(&self, repo_id: Option<&str>, limit: usize) -> Result<Vec<RunRow>> {
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().expect("db mutex");
+        if let Some(repo_id) = repo_id {
+            let mut stmt = conn.prepare(&format!(
+                "{RUN_SELECT_FROM} WHERE repo_id = ?1 ORDER BY created_at DESC LIMIT ?2"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params![repo_id, limit_i], map_run)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        } else {
+            let mut stmt = conn.prepare(&format!(
+                "{RUN_SELECT_FROM} ORDER BY created_at DESC LIMIT ?1"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params![limit_i], map_run)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        }
+    }
+
+    /// Active (pending / running / parked) runs, optionally filtered by repo and/or branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the query fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn active_runs(&self, repo_id: Option<&str>, branch: Option<&str>) -> Result<Vec<RunRow>> {
+        let conn = self.conn.lock().expect("db mutex");
+        let mut stmt = conn.prepare(&format!(
+            "{RUN_SELECT_FROM}
+             WHERE status IN ('pending', 'running', 'parked')
+             ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map([], map_run)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let run = row?;
+            if let Some(want) = repo_id {
+                if run.repo_id != want {
+                    continue;
+                }
+            }
+            if let Some(want) = branch {
+                if run.branch != want {
+                    continue;
+                }
+            }
+            out.push(run);
+        }
+        Ok(out)
+    }
+
     /// Latest parked run for a repo (by creation time), if any.
     ///
     /// # Errors

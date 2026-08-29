@@ -85,13 +85,15 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 
 ## M8 — Operator UX
 
-- TUI (ratatui)
-- launchd/systemd/schtasks
-- [x] `porch agent` skill markdown (`docs/porch-agent.md`) — thin; not a TUI
+- [x] TUI attach (ratatui in `crates/porch`; no `porch-tui` crate) — park findings, a/f/s/x/q
+- [x] Event mailbox + RPC (`list_runs` / `get_run` / `subscribe`); thread-per-connection
+- [x] Managed service: `porch daemon install|uninstall|start|stop|status` (launchd/systemd render + write; Task Scheduler name render). KeepAlive / Restart=always + detached `ensure_daemon` fallback
+- [x] Headless operator CLI: bare `porch`, `porch runs`, `porch status`, `porch attach` (non-TTY snapshot)
+- [x] `porch agent` skill markdown (`docs/porch-agent.md`) — thin; TUI optional, agent JSON unchanged
 - [x] `porch doctor` + init next-steps + publish metadata (0.1.0 operator UX)
-- Socket activation
-- APFS clone worktrees
-- Eval corpus of gold findings (mailgate diffs)
+- [ ] Socket activation (`LISTEN_FDS`) — **not this slice / later** (E6); KeepAlive managed service + detached fallback is the M8 story
+- [ ] APFS clone / reflink worktrees — **not this slice / later** (would need unsafe or a new dep)
+- [ ] Eval corpus of gold findings (mailgate diffs) — **not this slice / later**
 
 ## M9 — First-run setup (after M8)
 

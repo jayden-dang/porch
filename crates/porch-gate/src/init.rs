@@ -91,26 +91,6 @@ fn strip_origin_head_prefix(raw: &str) -> Option<String> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::strip_origin_head_prefix;
-
-    #[test]
-    fn strip_origin_head_prefix_variants() {
-        assert_eq!(
-            strip_origin_head_prefix("refs/remotes/origin/dev").as_deref(),
-            Some("dev")
-        );
-        assert_eq!(
-            strip_origin_head_prefix("origin/dev").as_deref(),
-            Some("dev")
-        );
-        assert_eq!(strip_origin_head_prefix("main").as_deref(), Some("main"));
-        assert_eq!(strip_origin_head_prefix("origin/HEAD"), None);
-        assert_eq!(strip_origin_head_prefix(""), None);
-    }
-}
-
 /// Mirror the author clone's `origin` URL onto the bare gate (for rebase fetch).
 fn copy_origin_to_bare(work: &Path, bare: &Path) -> Result<()> {
     let url = match porch_git::run_c(work, &["remote", "get-url", "origin"]) {
@@ -170,4 +150,24 @@ fn write_hook(path: &Path, home: &Path, bin: &Path, sub: &str) -> Result<()> {
 
 fn shell_single(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_origin_head_prefix;
+
+    #[test]
+    fn strip_origin_head_prefix_variants() {
+        assert_eq!(
+            strip_origin_head_prefix("refs/remotes/origin/dev").as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            strip_origin_head_prefix("origin/dev").as_deref(),
+            Some("dev")
+        );
+        assert_eq!(strip_origin_head_prefix("main").as_deref(), Some("main"));
+        assert_eq!(strip_origin_head_prefix("origin/HEAD"), None);
+        assert_eq!(strip_origin_head_prefix(""), None);
+    }
 }

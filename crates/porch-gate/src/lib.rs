@@ -4,6 +4,7 @@
 mod admit;
 mod daemon;
 mod db;
+mod events;
 mod executor;
 mod home;
 mod id;
@@ -11,10 +12,12 @@ mod init;
 mod notify;
 mod proc;
 mod rpc;
+mod service;
 
 pub use admit::admit_push;
 pub use daemon::{ensure_daemon, run_daemon, wait_for_health};
 pub use db::{Db, RepoRow, RunRow, StepResultRow, UncertifiedPipelineRange};
+pub use events::{Event, EventHub, Subscriber, clear_event_hub, event_hub, install_event_hub};
 pub use executor::RunExecutor;
 pub use home::{
     db_path, lock_path, logs_dir, pid_path, porch_home, repos_dir, run_artifact_dir,
@@ -26,8 +29,15 @@ pub use notify::{git_dir_from_env, notify_push};
 pub use proc::{
     collect_porch_env, collect_porch_env_from, kill_group, spawn_detached, spawn_detached_with_env,
 };
-pub use rpc::health_check;
 pub use rpc::start_run as rpc_start_run;
+pub use rpc::{
+    RunSnapshot, StepSnapshot, compact_run_row, get_run, health_check, list_runs, subscribe_events,
+};
+pub use service::{
+    ServicePaths, ServiceStatus, daemon_service_suffix, install_service, render_launchd_plist,
+    render_systemd_unit, render_windows_task_command, service_paths, service_status,
+    set_skip_service_load_for_tests, start_service, stop_daemon, uninstall_service,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

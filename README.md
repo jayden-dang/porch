@@ -30,12 +30,14 @@ crates.io (`cargo install porch`) is a **future** option if/when the slice graph
 porch doctor
 cd /path/to/your/clone
 porch init
+porch daemon start                   # optional: install KeepAlive via `porch daemon install`
 git push porch HEAD:refs/heads/your-branch
+porch runs                           # or bare `porch` / `porch attach`
 ```
 
 `$PORCH_HOME` overrides `~/.porch`. Put a trusted `.porch.yaml` on the **default branch** (`commands.format` / `commands.lint`, `deliver.github.watch_checks`, …). Executing config is read from that SHA, never from the pushed tip.
 
-Review is an external CLI (`PORCH_REVIEW_BIN`, default `review`). Deliver uses `gh` (`PORCH_GH_BIN`). When review parks, respond headlessly:
+Review is an external CLI (`PORCH_REVIEW_BIN`, default `review`). Deliver uses `gh` (`PORCH_GH_BIN`). When review parks, attach the TUI (`porch` / `porch attach` on a TTY) or respond headlessly:
 
 ```sh
 porch agent status
@@ -43,7 +45,7 @@ porch agent respond approve          # or skip | abort | fix
 porch agent respond fix --findings f0,f1 --yes
 ```
 
-JSON on stdout; exit `0` ok/gate, `1` failed/cancelled, `2` usage.
+JSON on stdout; exit `0` ok/gate, `1` failed/cancelled, `2` usage. The TUI is optional; `porch agent` stays first-class.
 
 **Cold worktree:** certify runs without your clone’s `node_modules`. If format/lint shells out to `biome` / `bun`, those binaries must be on `PATH` (see `porch doctor`).
 
