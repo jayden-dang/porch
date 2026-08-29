@@ -56,9 +56,12 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 
 ## M5 — Certify adapters (1 week)
 
-- `commands.format` / `commands.lint` from **trusted** config
-- Mailgate sketch: biome + types/api/docs drift
-- No Postgres, no Playwright
+- [x] `commands.format` / `commands.lint` from **trusted** config
+- [x] Fail closed on unreadable/unparseable trusted yaml; missing file → empty commands
+- [x] Non-zero format/lint fails certify; process-group kill on every end path
+- [x] Correction commits for dirty format/lint (`--no-verify` + empty `core.hooksPath`)
+- [ ] Mailgate sketch smoke: biome + types/api/docs drift (operator-gated; not `cargo test`)
+- [x] No Postgres, no Playwright as certify defaults
 
 ## M6 — Deliver GitHub (2 weeks)
 

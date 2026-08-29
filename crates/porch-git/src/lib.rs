@@ -227,6 +227,42 @@ pub fn rev_parse(git_dir: &GitDir, rev: &str) -> Result<String, Error> {
     Ok(stdout_trim(&out))
 }
 
+/// `git show <sha>:<path>` → raw blob bytes.
+///
+/// Missing path in a readable commit returns `Ok(None)`. An unreadable commit
+/// (or other git failure) is an error. Callers that need text must decode UTF-8
+/// themselves (fail closed rather than lossy-replace).
+///
+/// # Errors
+///
+/// Returns [`Error::Command`] / [`Error::Spawn`] when the commit cannot be read
+/// or `git show` fails for a reason other than a missing path.
+pub fn show_path_at(git_dir: &GitDir, sha: &str, path: &str) -> Result<Option<Vec<u8>>, Error> {
+    // Fail closed if the commit itself is not readable.
+    let commitish = format!("{sha}^{{commit}}");
+    run(git_dir, &["rev-parse", "--verify", &commitish])?;
+
+    let spec = format!("{sha}:{path}");
+    let mut cmd = Command::new("git");
+    cmd.arg(format!("--git-dir={}", git_dir.as_path().display()));
+    cmd.args(["show", &spec]);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    let output = cmd.output().map_err(Error::Spawn)?;
+    if output.status.success() {
+        return Ok(Some(output.stdout));
+    }
+    let stderr = redact(&String::from_utf8_lossy(&output.stderr));
+    // `git show` reports missing paths this way even when the commit exists.
+    if stderr.contains("does not exist in") {
+        return Ok(None);
+    }
+    Err(Error::Command {
+        args: format!("show {spec}"),
+        status: output.status.code().unwrap_or(-1),
+        stderr,
+    })
+}
+
 /// Resolve a revision from a work tree (`git -C … rev-parse`).
 ///
 /// # Errors
@@ -327,7 +363,7 @@ fn redact(stderr: &str) -> String {
         .join("\n")
 }
 
-/// Reserved for correction-commit isolation (empty hooksPath). Unused in M1.
+/// Default duration for long-running git operations that take an explicit timeout.
 #[must_use]
 pub fn timeout_placeholder() -> Duration {
     Duration::from_secs(60)

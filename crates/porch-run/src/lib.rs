@@ -1,4 +1,7 @@
-//! Execute a porch run: disposable worktree, intent, rebase, review, stubs.
+//! Execute a porch run: disposable worktree, intent, rebase, review, certify.
+
+mod certify;
+mod config;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -13,7 +16,7 @@ use porch_git::GitDir;
 use porch_review::{Finding, RunReviewOpts, review_bin, review_timeout, run_review};
 use serde::Serialize;
 
-/// Phases in locked order (D5). Certify/deliver remain stubs in M4.
+/// Phases in locked order (D5). Deliver remains a stub until M6.
 const PHASES: &[&str] = &["intent", "rebase", "review", "certify", "deliver"];
 
 /// Production executor injected into the daemon from the `porch` binary.
@@ -42,6 +45,8 @@ enum RunError {
     Review(#[from] porch_review::Error),
     #[error(transparent)]
     Agent(#[from] porch_agent::Error),
+    #[error(transparent)]
+    Certify(#[from] certify::CertifyError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -125,7 +130,10 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                         return Ok(PhaseLoop::Parked);
                     }
                 },
-                "certify" | "deliver" => {
+                "certify" => {
+                    execute_certify_step(&db, run_id, &bare, &wt_path, cancel)?;
+                }
+                "deliver" => {
                     assert_head_continuity(&db, run_id, &wt_path)?;
                     db.insert_step_result(run_id, phase, "completed", None)?;
                 }
@@ -255,6 +263,30 @@ fn clear_uncertified_if_certified(
         db.delete_uncertified_pipeline_range(repo_id, branch)?;
     }
     Ok(())
+}
+
+fn execute_certify_step(
+    db: &Db,
+    run_id: &str,
+    bare: &GitDir,
+    wt: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    assert_head_continuity(db, run_id, wt)?;
+    match certify::run_certify_phase(db, run_id, bare, wt, Some(cancel)) {
+        Ok(()) => {
+            db.insert_step_result(run_id, "certify", "completed", None)?;
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            db.insert_step_result(run_id, "certify", "failed", Some(&msg))?;
+            if msg == "cancelled" {
+                return Err(RunError::Msg("cancelled".into()));
+            }
+            Err(RunError::Certify(e))
+        }
+    }
 }
 
 fn assert_head_continuity(db: &Db, run_id: &str, wt: &Path) -> Result<()> {
@@ -530,14 +562,7 @@ fn agent_respond_inner(
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             db.insert_step_result(&run.id, "review", "completed", Some("approved"))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            for phase in ["certify", "deliver"] {
-                assert_head_continuity(&db, &run.id, &wt)
-                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-                db.insert_step_result(&run.id, phase, "completed", None)
-                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            }
-            db.set_run_status(&run.id, "completed", None)
-                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            finish_certify_and_deliver(&db, &bare, &wt, &run.id)?;
             remove_run_worktree(&bare, &wt);
         }
         AgentResponse::Skip => {
@@ -721,14 +746,37 @@ fn complete_after_review(
 ) -> std::result::Result<(), UsageOrFail> {
     db.insert_step_result(&run.id, "review", "completed", review_note)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    for phase in ["certify", "deliver"] {
-        assert_head_continuity(db, &run.id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-        db.insert_step_result(&run.id, phase, "completed", None)
-            .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    }
-    db.set_run_status(&run.id, "completed", None)
-        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    finish_certify_and_deliver(db, bare, wt, &run.id)?;
     remove_run_worktree(bare, wt);
+    Ok(())
+}
+
+/// Shared certify → deliver stub path for approve / post-fix complete.
+fn finish_certify_and_deliver(
+    db: &Db,
+    bare: &GitDir,
+    wt: &Path,
+    run_id: &str,
+) -> std::result::Result<(), UsageOrFail> {
+    assert_head_continuity(db, run_id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    match certify::run_certify_phase(db, run_id, bare, wt, None) {
+        Ok(()) => {
+            db.insert_step_result(run_id, "certify", "completed", None)
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = db.insert_step_result(run_id, "certify", "failed", Some(&msg));
+            let _ = db.set_run_status(run_id, "failed", Some(&msg));
+            remove_run_worktree(bare, wt);
+            return Err(UsageOrFail::Fail(msg));
+        }
+    }
+    assert_head_continuity(db, run_id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    db.insert_step_result(run_id, "deliver", "completed", None)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    db.set_run_status(run_id, "completed", None)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     Ok(())
 }
 

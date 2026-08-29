@@ -1,6 +1,8 @@
 use std::process::Command;
 
-use porch_git::{GitDir, fetch_git_args, force_fetch_refspec, init_bare, run, run_c, stdout_trim};
+use porch_git::{
+    GitDir, fetch_git_args, force_fetch_refspec, init_bare, run, run_c, show_path_at, stdout_trim,
+};
 use tempfile::TempDir;
 
 fn write_commit(work: &std::path::Path) {
@@ -85,6 +87,46 @@ fn init_bare_creates_repository_at_absolute_path() {
 fn run_c_rejects_relative_work_tree() {
     let err = run_c(std::path::Path::new("rel"), &["status"]).unwrap_err();
     assert!(matches!(err, porch_git::Error::GitDirNotAbsolute(_)));
+}
+
+#[test]
+fn show_path_at_returns_none_when_path_missing() {
+    let tmp = TempDir::new().unwrap();
+    let work = tmp.path().canonicalize().unwrap();
+    write_commit(&work);
+    let git_dir = GitDir::new(work.join(".git")).unwrap();
+    let sha = stdout_trim(&run(&git_dir, &["rev-parse", "HEAD"]).unwrap());
+    let got = show_path_at(&git_dir, &sha, ".porch.yaml").unwrap();
+    assert_eq!(got, None);
+}
+
+#[test]
+fn show_path_at_returns_blob_when_present() {
+    let tmp = TempDir::new().unwrap();
+    let work = tmp.path().canonicalize().unwrap();
+    write_commit(&work);
+    let git_dir = GitDir::new(work.join(".git")).unwrap();
+    let sha = stdout_trim(&run(&git_dir, &["rev-parse", "HEAD"]).unwrap());
+    let got = show_path_at(&git_dir, &sha, "README").unwrap();
+    assert_eq!(got.as_deref(), Some(b"hi\n".as_slice()));
+}
+
+#[test]
+fn show_path_at_fails_closed_on_unreadable_commit() {
+    let tmp = TempDir::new().unwrap();
+    let work = tmp.path().canonicalize().unwrap();
+    write_commit(&work);
+    let git_dir = GitDir::new(work.join(".git")).unwrap();
+    let err = show_path_at(
+        &git_dir,
+        "0000000000000000000000000000000000000001",
+        ".porch.yaml",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, porch_git::Error::Command { .. }),
+        "expected command error, got {err:?}"
+    );
 }
 
 #[test]

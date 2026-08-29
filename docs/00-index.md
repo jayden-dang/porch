@@ -1,6 +1,6 @@
 # Porch briefing index
 
-This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through M4 (fixer + rereview); certify/deliver remain stubs.
+This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through M5 (cheap certify adapters from trusted `.porch.yaml`); deliver remains a stub until M6.
 
 ## Read order
 
