@@ -517,8 +517,10 @@ dependencies = [
  "clap",
  "porch-gate",
  "porch-git",
+ "porch-review",
  "porch-run",
  "predicates",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -551,11 +553,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "porch-review"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "porch-run"
 version = "0.1.0"
 dependencies = [
  "porch-gate",
  "porch-git",
+ "porch-review",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",

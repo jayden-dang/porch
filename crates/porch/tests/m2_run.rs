@@ -7,7 +7,47 @@ use std::time::{Duration, Instant};
 use assert_cmd::Command;
 use porch_gate::{Db, kill_group, repo_id_for, run_worktree_dir};
 use porch_git::{GitDir, init_bare, run as git_run, stdout_trim, worktree_add_detach};
+use porch_review::REVIEW_BIN_ENV;
 use tempfile::TempDir;
+
+/// Minimal clean review fake so non-empty M2 diffs pass the M3 review phase.
+fn install_clean_review_fake(bin_dir: &Path) -> PathBuf {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let path = bin_dir.join("fake-review");
+    let script = r#"#!/bin/sh
+set -e
+OUT=""
+FROM=""
+TO=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) OUT="$2"; shift 2 ;;
+    --from) FROM="$2"; shift 2 ;;
+    --to) TO="$2"; shift 2 ;;
+    --format) shift 2 ;;
+    *) shift ;;
+  esac
+done
+FILES=$(git diff --name-only "$FROM" "$TO" 2>/dev/null || true)
+FILES_JSON="["
+FIRST=1
+for f in $FILES; do
+  if [ $FIRST -eq 1 ]; then FIRST=0; else FILES_JSON="$FILES_JSON,"; fi
+  FILES_JSON="$FILES_JSON\"$f\""
+done
+FILES_JSON="$FILES_JSON]"
+printf '{"comments":[],"files":%s}\n' "$FILES_JSON" > "$OUT"
+"#;
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
 
 fn git(work: &Path, args: &[&str]) {
     let st = StdCommand::new("git")
@@ -63,7 +103,14 @@ fn setup_with_origin() -> (TempDir, PathBuf, PathBuf, PathBuf) {
     let origin = root.join("origin.git");
     let work = root.join("work");
     let home = root.join("home");
+    let bin_dir = root.join("bin");
     std::fs::create_dir_all(&home).unwrap();
+    let fake = install_clean_review_fake(&bin_dir);
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
 
     init_bare(&origin).unwrap();
 
@@ -95,9 +142,26 @@ fn setup_with_origin() -> (TempDir, PathBuf, PathBuf, PathBuf) {
         .unwrap()
         .current_dir(&work)
         .env("PORCH_HOME", &home)
+        .env(REVIEW_BIN_ENV, &fake)
+        .env("PATH", &path)
         .arg("init")
         .assert()
         .success();
+
+    // Detached daemon from init may omit PORCH_REVIEW_BIN; restart with it.
+    kill_daemon(&home);
+    let bin = assert_cmd::cargo::cargo_bin("porch");
+    porch_gate::spawn_detached_with_env(
+        &bin,
+        &home,
+        &[
+            (REVIEW_BIN_ENV, fake.as_os_str()),
+            ("PATH", path.as_ref()),
+            ("PORCH_REVIEW_TIMEOUT_SECS", "10".as_ref()),
+        ],
+    )
+    .unwrap();
+    porch_gate::wait_for_health(&home, Duration::from_secs(5)).unwrap();
 
     (tmp, work, home, origin)
 }

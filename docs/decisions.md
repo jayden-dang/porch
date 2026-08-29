@@ -42,6 +42,7 @@ Reopen only with an explicit written change. Coding sessions do not get to “ju
 | E15 | Rebase conflict: **fail the run** after `git rebase --abort`. No park until a later milestone owns the park TUI. |
 | E16 | Fetch/resolve of `origin/<default>` fails: **fail the run** (fail closed). Default-branch tip is a safety fact for rebase. |
 | E17 | Intent for execute: hook/`notify` reads **`PORCH_INTENT`**. Empty → skip intent phase, do not fail. Default branch column: `repos.default_branch` (default `main`). |
+| E18 | M3 park + agent JSON: blocking review findings set `status=parked` and keep the worktree; `porch agent status` / `respond` emit JSON on stdout (D11). Respond supports **`approve` \| `skip` \| `abort` only** (no fixer). `review_approved_head_sha` is written only on completed review or **approve**; **skip** does not write it. Review subprocess timeout **fails** the run (does not park). Review adapter lives in `porch-review`; `porch-gate` must not depend on it. |
 
 ## Explicitly rejected (for now)
 

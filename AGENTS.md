@@ -31,9 +31,9 @@ Cargo.toml                 # workspace; resolver = "3"; members = ["crates/*"]
 crates/porch/              # binary; clap; `porch daemon run` is a fast path
 crates/porch-git/          # git CLI wrapper, --git-dir absolute; publish = false
 crates/porch-gate/         # init, hooks, admit, notify, sqlite, daemon (+ RunExecutor inject)
-crates/porch-run/          # M2 slice: worktree, intent, rebase, phase stubs
+crates/porch-run/          # worktree, intent, rebase, review phase, agent respond
+crates/porch-review/       # external review CLI adapter (PATH fake in tests)
 # later slices:
-# crates/porch-review/     # external review CLI adapter
 # crates/porch-deliver/    # GitHub PR + allowlisted checks
 ```
 

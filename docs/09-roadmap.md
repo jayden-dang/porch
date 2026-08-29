@@ -32,14 +32,14 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 - [x] Empty diff → complete run skipped remaining
 - [x] Crash: fail stale running runs
 
-## M3 — Review + park (2 weeks)
+## M3 — Review + park (done)
 
-- Require the review CLI on PATH
-- Run range review in the worktree
-- Parse JSON → findings; park on blocking
-- `porch agent status` / `respond` (JSON stdout)
-- `review_approved_head_sha` on success
-- Fixtures: fake review binary
+- [x] Require the review CLI on PATH (`PORCH_REVIEW_BIN`)
+- [x] Run range review in the worktree
+- [x] Parse JSON → findings; park on blocking
+- [x] `porch agent status` / `respond` (JSON stdout; approve|skip|abort)
+- [x] `review_approved_head_sha` on success (not on skip)
+- [x] Fixtures: fake review binary
 
 **Out:** fixer.
 

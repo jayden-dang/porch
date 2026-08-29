@@ -237,6 +237,22 @@ pub fn is_ancestor(work_tree: &Path, maybe_ancestor: &str, tip: &str) -> Result<
     }
 }
 
+/// Paths changed in `range` (`git diff --name-only <range>`).
+///
+/// # Errors
+///
+/// Returns git errors if the diff cannot be produced.
+pub fn diff_name_only(work_tree: &Path, range: &str) -> Result<Vec<String>, Error> {
+    let out = run_c(work_tree, &["diff", "--name-only", range])?;
+    let mut files = Vec::new();
+    for line in stdout_trim(&out).lines() {
+        if !line.is_empty() {
+            files.push(line.to_string());
+        }
+    }
+    Ok(files)
+}
+
 /// Whether `git diff --quiet <range>` reports no difference.
 ///
 /// Diff command failures (bad range, etc.) are errors — not treated as empty.

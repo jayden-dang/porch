@@ -16,6 +16,7 @@ anyhow.workspace = true
 clap.workspace = true
 porch-gate = { path = "../porch-gate" }
 porch-run = { path = "../porch-run" }
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -23,7 +24,9 @@ tracing-subscriber.workspace = true
 assert_cmd.workspace = true
 porch-gate = { path = "../porch-gate" }
 porch-git = { path = "../porch-git" }
+porch-review = { path = "../porch-review" }
 predicates.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

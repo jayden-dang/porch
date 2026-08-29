@@ -7,6 +7,15 @@ use ulid::Ulid;
 
 use crate::Result;
 
+const RUN_SELECT_FROM: &str =
+    "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
+                    intent, intent_source, error, review_approved_head_sha, findings_json
+             FROM runs";
+const RUN_SELECT: &str =
+    "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
+                    intent, intent_source, error, review_approved_head_sha, findings_json
+             FROM runs WHERE id = ?1";
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -32,6 +41,8 @@ pub struct RunRow {
     pub intent: Option<String>,
     pub intent_source: Option<String>,
     pub error: Option<String>,
+    pub review_approved_head_sha: Option<String>,
+    pub findings_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +108,8 @@ impl Db {
         ensure_column(&conn, "runs", "intent", "TEXT")?;
         ensure_column(&conn, "runs", "intent_source", "TEXT")?;
         ensure_column(&conn, "runs", "error", "TEXT")?;
+        ensure_column(&conn, "runs", "review_approved_head_sha", "TEXT")?;
+        ensure_column(&conn, "runs", "findings_json", "TEXT")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -232,6 +245,8 @@ impl Db {
             intent: intent.map(str::to_string),
             intent_source: intent_source.map(str::to_string),
             error: None,
+            review_approved_head_sha: None,
+            findings_json: None,
         })
     }
 
@@ -246,11 +261,7 @@ impl Db {
     /// Panics if the connection mutex is poisoned.
     pub fn run_by_id(&self, id: &str) -> Result<Option<RunRow>> {
         let conn = self.conn.lock().expect("db mutex");
-        let mut stmt = conn.prepare(
-            "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
-                    intent, intent_source, error
-             FROM runs WHERE id = ?1",
-        )?;
+        let mut stmt = conn.prepare(RUN_SELECT)?;
         let mut rows = stmt.query(rusqlite::params![id])?;
         if let Some(row) = rows.next()? {
             return Ok(Some(map_run(row)?));
@@ -269,11 +280,9 @@ impl Db {
     /// Panics if the connection mutex is poisoned.
     pub fn runs_for_repo(&self, repo_id: &str) -> Result<Vec<RunRow>> {
         let conn = self.conn.lock().expect("db mutex");
-        let mut stmt = conn.prepare(
-            "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
-                    intent, intent_source, error
-             FROM runs WHERE repo_id = ?1 ORDER BY created_at",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{RUN_SELECT_FROM} WHERE repo_id = ?1 ORDER BY created_at"
+        ))?;
         let rows = stmt.query_map(rusqlite::params![repo_id], map_run)?;
         let mut out = Vec::new();
         for row in rows {
@@ -293,11 +302,9 @@ impl Db {
     /// Panics if the connection mutex is poisoned.
     pub fn pending_runs(&self) -> Result<Vec<RunRow>> {
         let conn = self.conn.lock().expect("db mutex");
-        let mut stmt = conn.prepare(
-            "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
-                    intent, intent_source, error
-             FROM runs WHERE status = 'pending' ORDER BY created_at",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{RUN_SELECT_FROM} WHERE status = 'pending' ORDER BY created_at"
+        ))?;
         let rows = stmt.query_map([], map_run)?;
         let mut out = Vec::new();
         for row in rows {
@@ -306,7 +313,30 @@ impl Db {
         Ok(out)
     }
 
-    /// In-flight runs (pending or running) for the same repo + branch, excluding `except_id`.
+    /// Latest parked run for a repo (by creation time), if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the query fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn latest_parked_for_repo(&self, repo_id: &str) -> Result<Option<RunRow>> {
+        let conn = self.conn.lock().expect("db mutex");
+        let mut stmt = conn.prepare(&format!(
+            "{RUN_SELECT_FROM} WHERE repo_id = ?1 AND status = 'parked'
+             ORDER BY created_at DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params![repo_id])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(map_run(row)?));
+        }
+        Ok(None)
+    }
+
+    /// In-flight runs (pending, running, or parked) for the same repo + branch,
+    /// excluding `except_id`.
     ///
     /// # Errors
     ///
@@ -322,14 +352,12 @@ impl Db {
         except_id: &str,
     ) -> Result<Vec<RunRow>> {
         let conn = self.conn.lock().expect("db mutex");
-        let mut stmt = conn.prepare(
-            "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
-                    intent, intent_source, error
-             FROM runs
+        let mut stmt = conn.prepare(&format!(
+            "{RUN_SELECT_FROM}
              WHERE repo_id = ?1 AND branch = ?2 AND id != ?3
-               AND status IN ('pending', 'running')
-             ORDER BY created_at",
-        )?;
+               AND status IN ('pending', 'running', 'parked')
+             ORDER BY created_at"
+        ))?;
         let rows = stmt.query_map(rusqlite::params![repo_id, branch, except_id], map_run)?;
         let mut out = Vec::new();
         for row in rows {
@@ -340,6 +368,8 @@ impl Db {
 
     /// Mark all `running` runs as failed; return them (for worktree cleanup).
     ///
+    /// Parked runs are left alone (resume is operator-driven).
+    ///
     /// # Errors
     ///
     /// Returns a `SQLite` error if the update or query fails.
@@ -349,11 +379,7 @@ impl Db {
     /// Panics if the connection mutex is poisoned.
     pub fn fail_stale_running(&self, error: &str) -> Result<Vec<RunRow>> {
         let conn = self.conn.lock().expect("db mutex");
-        let mut stmt = conn.prepare(
-            "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
-                    intent, intent_source, error
-             FROM runs WHERE status = 'running'",
-        )?;
+        let mut stmt = conn.prepare(&format!("{RUN_SELECT_FROM} WHERE status = 'running'"))?;
         let rows = stmt.query_map([], map_run)?;
         let mut stale = Vec::new();
         for row in rows {
@@ -427,6 +453,42 @@ impl Db {
             "UPDATE runs SET head_sha = COALESCE(?1, head_sha), base_sha = COALESCE(?2, base_sha)
              WHERE id = ?3",
             rusqlite::params![head_sha, base_sha, id],
+        )?;
+        Ok(())
+    }
+
+    /// Record the HEAD SHA approved by a completed review (or human approve).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the update fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn set_review_approved_head_sha(&self, id: &str, sha: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex");
+        conn.execute(
+            "UPDATE runs SET review_approved_head_sha = ?1 WHERE id = ?2",
+            rusqlite::params![sha, id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist findings JSON for a parked (or completed) review round.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the update fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn set_findings_json(&self, id: &str, json: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex");
+        conn.execute(
+            "UPDATE runs SET findings_json = ?1 WHERE id = ?2",
+            rusqlite::params![json, id],
         )?;
         Ok(())
     }
@@ -536,6 +598,8 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
         intent: row.get(8)?,
         intent_source: row.get(9)?,
         error: row.get(10)?,
+        review_approved_head_sha: row.get(11)?,
+        findings_json: row.get(12)?,
     })
 }
 

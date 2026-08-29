@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -11,12 +12,28 @@ use crate::home::logs_dir;
 ///
 /// Returns an I/O error if the log directory or process cannot be created.
 pub fn spawn_detached(porch_bin: &Path, home: &Path) -> Result<u32> {
+    spawn_detached_with_env(porch_bin, home, &[])
+}
+
+/// Like [`spawn_detached`], with extra environment variables for the daemon.
+///
+/// # Errors
+///
+/// Returns an I/O error if the log directory or process cannot be created.
+pub fn spawn_detached_with_env(
+    porch_bin: &Path,
+    home: &Path,
+    extra_env: &[(&str, &OsStr)],
+) -> Result<u32> {
     std::fs::create_dir_all(logs_dir(home))?;
     let log = File::create(logs_dir(home).join("daemon.log"))?;
     let log2 = log.try_clone()?;
     let mut cmd = Command::new(porch_bin);
     cmd.args(["daemon", "run"]);
     cmd.env("PORCH_HOME", home);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(log));
     cmd.stderr(Stdio::from(log2));

@@ -147,6 +147,7 @@ fn start_run(
 
     let prior = db.in_flight_same_branch(&run.repo_id, &run.branch, run_id)?;
     let mut wait_for: Vec<JoinHandle<()>> = Vec::new();
+    let mut orphan_worktrees: Vec<(String, PathBuf)> = Vec::new();
     {
         let mut guard = state.lock().expect("daemon state");
         for old in &prior {
@@ -154,11 +155,22 @@ fn start_run(
             if let Some(inf) = guard.inflight.remove(&old.id) {
                 inf.cancel.store(true, Ordering::SeqCst);
                 wait_for.push(inf.handle);
+            } else if let Some(wt) = old.worktree_dir.clone() {
+                // Parked runs have no inflight handle; sweep their worktrees.
+                orphan_worktrees.push((old.repo_id.clone(), wt));
             }
         }
     }
     for handle in wait_for {
         let _ = handle.join();
+    }
+    for (repo_id, wt) in orphan_worktrees {
+        if let Ok(Some(repo)) = db.repo_by_id(&repo_id) {
+            if let Ok(bare) = porch_git::GitDir::new(&repo.bare_path) {
+                let _ = porch_git::worktree_remove_force(&bare, &wt);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     // Re-check: may have been cancelled by a newer start_run while we waited.

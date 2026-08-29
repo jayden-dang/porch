@@ -1,0 +1,427 @@
+//! External review CLI adapter: spawn, parse JSON, map to findings.
+
+use std::fs;
+use std::io::Read;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+/// Env var naming the review CLI binary (PATH entry or absolute path).
+pub const REVIEW_BIN_ENV: &str = "PORCH_REVIEW_BIN";
+
+/// Env var for review subprocess timeout in seconds (default 600).
+pub const REVIEW_TIMEOUT_ENV: &str = "PORCH_REVIEW_TIMEOUT_SECS";
+
+const DEFAULT_BIN: &str = "review";
+const DEFAULT_TIMEOUT_SECS: u64 = 600;
+
+/// Porch finding severity after mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+}
+
+/// Suggested disposition (M3 does not run a fixer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Action {
+    AutoFix,
+    AskUser,
+    NoOp,
+}
+
+/// One mapped finding from a review comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    pub path: String,
+    pub message: String,
+    pub severity: Severity,
+    pub action: Action,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+}
+
+impl Finding {
+    /// Whether this finding parks the run.
+    #[must_use]
+    pub fn is_blocking(&self) -> bool {
+        matches!(self.severity, Severity::Error | Severity::Warning)
+            || self.action == Action::AskUser
+    }
+}
+
+/// Raw comment object from the review CLI JSON.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewComment {
+    pub path: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub existing_code: Option<String>,
+    #[serde(default)]
+    pub suggestion_code: Option<String>,
+    #[serde(default)]
+    pub start_line: Option<u32>,
+    #[serde(default)]
+    pub end_line: Option<u32>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+}
+
+/// Top-level review CLI JSON (`comments` + coverage `files`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewJson {
+    #[serde(default)]
+    pub comments: Vec<ReviewComment>,
+    /// Paths the engine claims to have covered (or explicitly skipped).
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// Successful parse + map of a review CLI run.
+#[derive(Debug, Clone)]
+pub struct ReviewOutcome {
+    pub findings: Vec<Finding>,
+    pub covered_files: Vec<String>,
+}
+
+impl ReviewOutcome {
+    /// True when any finding should park.
+    #[must_use]
+    pub fn has_blocking(&self) -> bool {
+        self.findings.iter().any(Finding::is_blocking)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("review CLI not found ({bin}): {source}")]
+    BinNotFound {
+        bin: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("review CLI timed out after {0:?}")]
+    Timeout(Duration),
+    #[error("review CLI exited {status}: {stderr}")]
+    Exit { status: i32, stderr: String },
+    #[error("review JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("coverage: changed file `{0}` missing from review manifest without skip")]
+    Coverage(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Msg(String),
+}
+
+/// Resolve the review binary from `PORCH_REVIEW_BIN` (default `review`).
+#[must_use]
+pub fn review_bin() -> String {
+    std::env::var(REVIEW_BIN_ENV).unwrap_or_else(|_| DEFAULT_BIN.to_string())
+}
+
+/// Resolve timeout from `PORCH_REVIEW_TIMEOUT_SECS`.
+#[must_use]
+pub fn review_timeout() -> Duration {
+    let secs = std::env::var(REVIEW_TIMEOUT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    Duration::from_secs(secs.max(1))
+}
+
+/// Map one raw comment to a porch finding (conservative M3 rules).
+#[must_use]
+pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
+    let category = comment
+        .category
+        .as_deref()
+        .unwrap_or("other")
+        .to_ascii_lowercase();
+    let sev_raw = comment
+        .severity
+        .as_deref()
+        .unwrap_or("medium")
+        .to_ascii_lowercase();
+
+    if matches!(category.as_str(), "style" | "documentation") {
+        return Some(Finding {
+            path: comment.path.clone(),
+            message: comment.content.clone(),
+            severity: Severity::Info,
+            action: Action::NoOp,
+            category: Some(category),
+            start_line: comment.start_line,
+            end_line: comment.end_line,
+        });
+    }
+
+    let text = comment.content.to_ascii_lowercase();
+    let extends_scope = text.contains("schema")
+        || text.contains("on-chain")
+        || text.contains("onchain")
+        || text.contains("new subsystem");
+
+    let (severity, action) = if extends_scope {
+        (Severity::Warning, Action::AskUser)
+    } else {
+        match sev_raw.as_str() {
+            "critical" => (Severity::Error, Action::AskUser),
+            "low" => {
+                if matches!(category.as_str(), "bug" | "security" | "performance") {
+                    (Severity::Warning, Action::AskUser)
+                } else {
+                    (Severity::Info, Action::NoOp)
+                }
+            }
+            // high, medium, and unknown → blocking warning
+            _ => (Severity::Warning, Action::AskUser),
+        }
+    };
+
+    Some(Finding {
+        path: comment.path.clone(),
+        message: comment.content.clone(),
+        severity,
+        action,
+        category: Some(category),
+        start_line: comment.start_line,
+        end_line: comment.end_line,
+    })
+}
+
+/// Parse review JSON bytes into an outcome (no coverage check yet).
+///
+/// # Errors
+///
+/// Returns [`Error::Json`] when the payload is not valid review JSON.
+pub fn parse_review_json(bytes: &[u8]) -> Result<ReviewOutcome, Error> {
+    let parsed: ReviewJson = serde_json::from_slice(bytes)?;
+    let findings = parsed.comments.iter().filter_map(map_comment).collect();
+    Ok(ReviewOutcome {
+        findings,
+        covered_files: parsed.files,
+    })
+}
+
+/// Fail if a changed path is absent from the coverage manifest.
+///
+/// # Errors
+///
+/// Returns [`Error::Coverage`] for the first missing path.
+pub fn assert_coverage(changed: &[String], covered: &[String]) -> Result<(), Error> {
+    for path in changed {
+        if !covered.iter().any(|c| c == path) {
+            return Err(Error::Coverage(path.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Options for one range-review invocation.
+#[derive(Debug, Clone)]
+pub struct RunReviewOpts<'a> {
+    pub work_tree: &'a Path,
+    pub from_sha: &'a str,
+    pub to_sha: &'a str,
+    pub changed_files: &'a [String],
+    pub bin: &'a str,
+    pub timeout: Duration,
+}
+
+/// Spawn the review CLI in `work_tree`, parse JSON, enforce coverage.
+///
+/// # Errors
+///
+/// Returns spawn, timeout, exit, JSON, coverage, or I/O errors.
+pub fn run_review(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
+    let out_dir = opts.work_tree.join(".porch-review");
+    fs::create_dir_all(&out_dir)?;
+    let out_file = out_dir.join("result.json");
+    if out_file.exists() {
+        let _ = fs::remove_file(&out_file);
+    }
+    let out_s = out_file
+        .to_str()
+        .ok_or_else(|| Error::Msg(format!("non-utf8 output path {}", out_file.display())))?
+        .to_string();
+
+    let mut cmd = Command::new(opts.bin);
+    cmd.current_dir(opts.work_tree);
+    cmd.args([
+        "--from",
+        opts.from_sha,
+        "--to",
+        opts.to_sha,
+        "--format",
+        "json",
+        "--output",
+        &out_s,
+    ]);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::BinNotFound {
+                bin: opts.bin.to_string(),
+                source: e,
+            }
+        } else {
+            Error::Io(e)
+        }
+    })?;
+
+    let deadline = Instant::now() + opts.timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_child_group(child.id());
+                    let _ = child.wait();
+                    return Err(Error::Timeout(opts.timeout));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+    };
+
+    let stderr = child
+        .stderr
+        .take()
+        .map(|mut s| {
+            let mut buf = String::new();
+            let _ = s.read_to_string(&mut buf);
+            buf
+        })
+        .unwrap_or_default();
+
+    if !status.success() {
+        return Err(Error::Exit {
+            status: status.code().unwrap_or(-1),
+            stderr: stderr.trim().to_string(),
+        });
+    }
+
+    let bytes = fs::read(&out_file).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::Msg(format!(
+                "review CLI produced no output file at {}",
+                out_file.display()
+            ))
+        } else {
+            Error::Io(e)
+        }
+    })?;
+    let outcome = parse_review_json(&bytes)?;
+    assert_coverage(opts.changed_files, &outcome.covered_files)?;
+    Ok(outcome)
+}
+
+fn kill_child_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+        if let Ok(raw) = i32::try_from(pid) {
+            let _ = killpg(Pid::from_raw(raw), Signal::SIGTERM);
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = killpg(Pid::from_raw(raw), Signal::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn high_bug_is_blocking() {
+        let c = ReviewComment {
+            path: "src/a.rs".into(),
+            content: "null deref".into(),
+            existing_code: None,
+            suggestion_code: None,
+            start_line: Some(1),
+            end_line: Some(2),
+            category: Some("bug".into()),
+            severity: Some("high".into()),
+        };
+        let f = map_comment(&c).unwrap();
+        assert!(f.is_blocking());
+        assert_eq!(f.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn style_is_info_non_blocking() {
+        let c = ReviewComment {
+            path: "src/a.rs".into(),
+            content: "prefer rename".into(),
+            existing_code: None,
+            suggestion_code: None,
+            start_line: None,
+            end_line: None,
+            category: Some("style".into()),
+            severity: Some("medium".into()),
+        };
+        let f = map_comment(&c).unwrap();
+        assert!(!f.is_blocking());
+        assert_eq!(f.severity, Severity::Info);
+    }
+
+    #[test]
+    fn schema_mention_is_ask_user() {
+        let c = ReviewComment {
+            path: "db.rs".into(),
+            content: "needs a schema migration".into(),
+            existing_code: None,
+            suggestion_code: None,
+            start_line: None,
+            end_line: None,
+            category: Some("maintainability".into()),
+            severity: Some("low".into()),
+        };
+        let f = map_comment(&c).unwrap();
+        assert!(f.is_blocking());
+        assert_eq!(f.action, Action::AskUser);
+    }
+
+    #[test]
+    fn coverage_requires_all_changed_files() {
+        let err = assert_coverage(&["a.rs".into(), "b.rs".into()], &["a.rs".into()]).unwrap_err();
+        assert!(matches!(err, Error::Coverage(ref p) if p == "b.rs"));
+    }
+
+    #[test]
+    fn parse_empty_comments() {
+        let raw = br#"{"comments":[],"files":["README"]}"#;
+        let out = parse_review_json(raw).unwrap();
+        assert!(out.findings.is_empty());
+        assert_eq!(out.covered_files, vec!["README"]);
+        assert!(!out.has_blocking());
+    }
+}
