@@ -23,6 +23,12 @@ pub struct Response {
     pub id: u64,
 }
 
+/// Probe the daemon health RPC over the Unix socket.
+///
+/// # Errors
+///
+/// Returns an error when the socket cannot be connected, written, read, or
+/// the response is not valid JSON-RPC health payload.
 pub fn health_check(home: &Path) -> Result<bool> {
     let mut stream = UnixStream::connect(socket_path(home))?;
     let req = Request {

@@ -12,6 +12,41 @@ Porch is the missing **inner gate**: opt-in, local, isolated. You push to a remo
 
 “Passed the porch” means independently reviewed and cheaply certified. It does **not** mean production CI, deploy, or E2E went green.
 
+## Install
+
+Slice crates stay unpublished (`publish = false`), so **0.1.0 is git/path install only** — not crates.io yet.
+
+```sh
+cargo install --git https://github.com/jayden-dang/porch --locked
+# or from a clone:
+cargo install --path crates/porch --locked
+```
+
+crates.io (`cargo install porch`) is a **future** option if/when the slice graph is published. Needs `git` and Rust 1.85+ (stable). Check the machine with `porch doctor`.
+
+## Loop
+
+```sh
+porch doctor
+cd /path/to/your/clone
+porch init
+git push porch HEAD:refs/heads/your-branch
+```
+
+`$PORCH_HOME` overrides `~/.porch`. Put a trusted `.porch.yaml` on the **default branch** (`commands.format` / `commands.lint`, `deliver.github.watch_checks`, …). Executing config is read from that SHA, never from the pushed tip.
+
+Review is an external CLI (`PORCH_REVIEW_BIN`, default `review`). Deliver uses `gh` (`PORCH_GH_BIN`). When review parks, respond headlessly:
+
+```sh
+porch agent status
+porch agent respond approve          # or skip | abort | fix
+porch agent respond fix --findings f0,f1 --yes
+```
+
+JSON on stdout; exit `0` ok/gate, `1` failed/cancelled, `2` usage.
+
+**Cold worktree:** certify runs without your clone’s `node_modules`. If format/lint shells out to `biome` / `bun`, those binaries must be on `PATH` (see `porch doctor`).
+
 ## How it works
 
 ```
@@ -27,52 +62,24 @@ your clone  --git push porch-->  local bare gate (~/.porch/repos/<id>.git)
                          GitHub (branch + PR + allowlisted checks)
 ```
 
-- **Consent is a git remote.** Installing a hook on `origin` is out of scope. You keep working while the gate runs in another tree.
-- **Reviewer ≠ fixer.** Review is a cold, session-free process with no shell. A fixer may resume a session and has a shell, but rereview treats pipeline-authored commits as new unreviewed code.
-- **Certify is cheap.** Format, lint, generated-artifact drift. Not Postgres, not Playwright, not a full workspace `just gate`.
-- **Deliver is narrow.** Force-push is `--force-with-lease` on the exact reviewed SHA. PR checks are babysat by **allowlist only**. Deploy, on-chain publish, and spend-money E2E are never rerun.
-- **Config that executes is untrusted from the branch you just pushed.** `commands.*`, agent selection, and review rules that change what runs are read from the default-branch SHA. Fetch failure fails closed.
-
-Findings that would extend scope (schema, durable state, on-chain, a new subsystem) park for a human. Review auto-fix is off unless you raise the limit.
-
-## Why these mechanics
-
-| Constraint | Why |
-|---|---|
-| Shell out to `git`, never libgit2 | Worktrees, hooks, credentials, `safe.bareRepository=explicit` |
-| Absolute `--git-dir` / `-C` | Agent harnesses and CI break cwd discovery |
-| OS flock, then Unix socket | PID file is identity, not liveness |
-| SQLite, one writer | Daemon state; no async connection pool |
-| External review CLI as a subprocess | Grouping, language rules, line anchors, coverage — not a generic “review this branch” agent |
-| GitHub only, ACP + one native agent | Adapter surface is a maintenance swamp |
-| Rust, virtual workspace | One published binary (`porch`); slice crates are use cases (`porch-git`, `porch-gate`), not layers |
-
-Year-1 review quality comes from that review engine, not from rustc.
+- **Consent is a git remote.** Installing a hook on `origin` is out of scope.
+- **Reviewer ≠ fixer.** Review is session-free. A fixer may resume; rereview treats pipeline-authored commits as new code.
+- **Certify is cheap.** Format, lint, generated-artifact drift — not Postgres or Playwright.
+- **Deliver is narrow.** `--force-with-lease=<ref>:<observed-sha>`; PR checks by **allowlist only**.
 
 ## What this is not
 
-Not CI. Not a deploy tool. Not a merge bot. Not team governance. Not a six-forge client. Production PR checks, Coolify, Nitro EIF, on-chain Move, and post-deploy E2E that spend testnet funds stay where they are. Porch sits in front of those rings; it does not swallow them.
+Not CI. Not a deploy tool. Not a merge bot. Not team governance. Porch sits in front of production rings; it does not swallow them.
 
-## Build
-
-Needs `git` and Rust 1.85+ (stable).
-
-```sh
-cargo build -p porch
-export PATH="$PWD/target/debug:$PATH"
-
-cd /path/to/your/clone
-porch init                 # ~/.porch bare repo, remote `porch`, hooks, daemon
-git push porch HEAD:refs/heads/your-branch
-```
-
-`$PORCH_HOME` overrides `~/.porch`. Push updates the bare, runs intent → rebase → review (park / `porch agent respond` including `fix`), cheap certify (`commands.format` / `commands.lint` from the trusted default-branch SHA), then deliver: lease-push the certified SHA to `origin`, open or update a GitHub PR via `gh`, and babysit allowlisted checks from trusted `deliver.github.watch_checks` (`rerun_transient` default 0).
+## Develop
 
 ```sh
 cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 ```
 
+Agent skill notes: [`docs/porch-agent.md`](docs/porch-agent.md). Product briefing: [`docs/00-index.md`](docs/00-index.md).
+
 ## License
 
-Intended Apache-2.0. No `LICENSE` file yet.
+Apache-2.0. Copyright 2026 The Porch Authors.

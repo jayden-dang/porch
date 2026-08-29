@@ -28,7 +28,9 @@ const ATTESTATION_MARKER: &str = "porch-attestation";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("gh CLI not found ({bin}): {source}")]
+    #[error(
+        "gh CLI not found ({bin}): {source}\nset PORCH_GH_BIN or install `gh` on PATH; see `porch doctor`"
+    )]
     BinNotFound {
         bin: String,
         #[source]
@@ -802,6 +804,17 @@ mod tests {
     #[test]
     fn pr_title_deterministic() {
         assert_eq!(pr_title("feat/x"), "porch: feat/x");
+    }
+
+    #[test]
+    fn bin_not_found_mentions_env_and_doctor() {
+        let err = Error::BinNotFound {
+            bin: "gh".into(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "nope"),
+        };
+        let s = err.to_string();
+        assert!(s.contains("PORCH_GH_BIN"), "{s}");
+        assert!(s.contains("porch doctor"), "{s}");
     }
 
     #[test]

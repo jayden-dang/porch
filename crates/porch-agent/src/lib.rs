@@ -58,9 +58,11 @@ pub struct RunFixerOpts<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("PORCH_FIXER_BIN is not set")]
+    #[error("PORCH_FIXER_BIN is not set; see `porch doctor`")]
     BinMissing,
-    #[error("fixer CLI not found ({bin}): {source}")]
+    #[error(
+        "fixer CLI not found ({bin}): {source}\nset PORCH_FIXER_BIN to a real binary; see `porch doctor`"
+    )]
     BinNotFound {
         bin: String,
         #[source]

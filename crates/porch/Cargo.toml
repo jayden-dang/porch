@@ -3,9 +3,16 @@ name = "porch"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "Apache-2.0"
+# false until path-dep slices are publishable (E1); metadata kept for a later crates.io cut
 publish = false
-description = "Local git gate"
+description = "Local git gate: push to porch, review and certify before origin"
+repository = "https://github.com/jayden-dang/porch"
+homepage = "https://github.com/jayden-dang/porch"
+readme = "../../README.md"
+keywords = ["git", "cli", "review", "gate"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["/target/", "/.research/", "/.skills/", "/.remember/"]
 
 [[bin]]
 name = "porch"

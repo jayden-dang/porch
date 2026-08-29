@@ -10,6 +10,8 @@ use porch_gate::{
 };
 use porch_run::{AgentResponse, PipelineExecutor, agent_respond, agent_status};
 
+mod doctor;
+
 #[derive(Parser)]
 #[command(name = "porch", version, about = "Local git gate")]
 struct Cli {
@@ -21,6 +23,8 @@ struct Cli {
 enum Command {
     /// Install the porch remote, bare repo, and hooks in this working tree.
     Init,
+    /// Check PATH / home / daemon prerequisites for a push.
+    Doctor,
     /// Daemon process (hooks call these subcommands).
     Daemon {
         #[command(subcommand)]
@@ -107,9 +111,10 @@ fn main_inner() -> Result<ExitCode> {
                 porch_bin: &bin,
                 start_daemon: true,
             })?;
-            println!("porch remote -> {}", result.bare_path.display());
+            print_init_next_steps(&result, &work, &home);
             Ok(ExitCode::SUCCESS)
         }
+        Command::Doctor => Ok(doctor::run()?),
         Command::Daemon {
             command: DaemonCommand::Run,
         } => {
@@ -157,6 +162,27 @@ fn main_inner() -> Result<ExitCode> {
             findings.as_deref(),
             yes,
         )?),
+    }
+}
+
+fn print_init_next_steps(
+    result: &porch_gate::InitResult,
+    work: &std::path::Path,
+    home: &std::path::Path,
+) {
+    let branch = doctor::current_branch(work);
+    println!("porch remote -> {}", result.bare_path.display());
+    println!("repo id: {}", result.repo_id);
+    println!("default branch: {}", result.default_branch);
+    println!("PORCH_HOME: {}", home.display());
+    println!("next: git push porch HEAD:refs/heads/{branch}");
+
+    let review_bin = env::var("PORCH_REVIEW_BIN").unwrap_or_else(|_| "review".into());
+    let gh_bin = env::var("PORCH_GH_BIN").unwrap_or_else(|_| "gh".into());
+    let missing_review = !doctor::bin_on_path(&review_bin);
+    let missing_gh = !doctor::bin_on_path(&gh_bin);
+    if missing_review || missing_gh {
+        println!("tip: run `porch doctor` — review and/or gh look missing for a complete run");
     }
 }
 

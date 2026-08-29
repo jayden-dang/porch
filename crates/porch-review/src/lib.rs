@@ -109,7 +109,9 @@ impl ReviewOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("review CLI not found ({bin}): {source}")]
+    #[error(
+        "review CLI not found ({bin}): {source}\nset PORCH_REVIEW_BIN or install `review` on PATH; see `porch doctor`"
+    )]
     BinNotFound {
         bin: String,
         #[source]
@@ -424,6 +426,17 @@ mod tests {
     fn coverage_requires_all_changed_files() {
         let err = assert_coverage(&["a.rs".into(), "b.rs".into()], &["a.rs".into()]).unwrap_err();
         assert!(matches!(err, Error::Coverage(ref p) if p == "b.rs"));
+    }
+
+    #[test]
+    fn bin_not_found_mentions_env_and_doctor() {
+        let err = Error::BinNotFound {
+            bin: "review".into(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "nope"),
+        };
+        let s = err.to_string();
+        assert!(s.contains("PORCH_REVIEW_BIN"), "{s}");
+        assert!(s.contains("porch doctor"), "{s}");
     }
 
     #[test]

@@ -6,8 +6,8 @@ Dogfood target: mailgate. Each milestone should be runnable on a toy git repo fi
 
 - [x] Research dump in `docs/`
 - [x] Locked decisions
-- [ ] `LICENSE` Apache-2.0 when ready to publish
-- [ ] crates.io name check
+- [x] `LICENSE` Apache-2.0 when ready to publish
+- [x] crates.io name check (`porch` free as of 2026-08-29; HTTP 404)
 - [ ] Confirm review-CLI flags for range review + JSON output against current `--help` at implementation time (flags drift). Details in `.research/`.
 
 ## M1 — Push into a dead gate (in progress)
@@ -87,7 +87,8 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 
 - TUI (ratatui)
 - launchd/systemd/schtasks
-- `porch agent` skill markdown
+- [x] `porch agent` skill markdown (`docs/porch-agent.md`) — thin; not a TUI
+- [x] `porch doctor` + init next-steps + publish metadata (0.1.0 operator UX)
 - Socket activation
 - APFS clone worktrees
 - Eval corpus of gold findings (mailgate diffs)

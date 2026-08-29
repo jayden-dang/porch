@@ -19,6 +19,7 @@ pub struct InitOptions<'a> {
 pub struct InitResult {
     pub repo_id: String,
     pub bare_path: PathBuf,
+    pub default_branch: String,
 }
 
 /// Install the named remote, bare repo, and hooks. Optionally start the daemon.
@@ -57,7 +58,11 @@ pub fn init(opts: InitOptions<'_>) -> Result<InitResult> {
     if opts.start_daemon {
         crate::ensure_daemon(opts.porch_bin, &porch_home)?;
     }
-    Ok(InitResult { repo_id, bare_path })
+    Ok(InitResult {
+        repo_id,
+        bare_path,
+        default_branch,
+    })
 }
 
 /// Resolve the clone's default branch from `origin/HEAD`, fallback `main`.
