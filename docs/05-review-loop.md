@@ -2,6 +2,8 @@
 
 This is the heart of the product.
 
+**Sequencing (D9, 2026-08-29):** M3–M9 compose an external review CLI (OCR wrapper). **M10** switches the default reviewer to a session-free **coding agent** so the operator workflow no longer depends on that CLI. The quality properties below (coverage, line anchors, language rules, precision bias) remain the bar for **M16**, a porch-owned engine built **last**, after M10–M15, then dogfood. Until M16, M10 is coverage-lite (changed-file list + skip reasons) and must not pretend to be the engine.
+
 ## When review runs
 
 **Always before push/PR.** Porch phase 3 of 5. The authoring session is biased. Validation is a fresh process in a disposable worktree.
@@ -40,7 +42,7 @@ Rules:
 
 | Role | Session | Shell | Duty |
 |---|---|---|---|
-| Reviewer | Always cold | Year-1: **no** (review-CLI tools only). If a native agent is used as fallback: still no full-suite tests | Judge the tree. Emit findings. |
+| Reviewer | Always cold | **No full-suite tests, no intended edits.** M10 agent reviewer: prefer a no-write invocation; if the CLI cannot drop the shell, file writes fail the review. M16 engine: no shell, no edit. | Judge the tree. Emit findings. |
 | Fixer | May resume | Yes, in the worktree | Fix selected findings narrowly; one focused verification of the touched area; **no** full repo test/lint suite |
 | Rereview | Always cold | Same as reviewer | Pipeline-authored commits are **unreviewed new code**. Prior findings and fix summaries are **claims**. Tests added in the same fix round are claims. If prior-round machinery **exceeds** the original finding, one `ask-user` to revert to the minimal fix — do not stack ten rounds. |
 
@@ -52,7 +54,7 @@ Timeout of a review round should **fail the run**, not park: parking a half-appl
 
 - **Coverage:** every reviewable file is in a group and gets a pass or an explicit skip (oversize, unsupported ext). Generic agents skip files; porch must not.
 - **Line anchors:** comments land on hunks, with relocate fallback — required if we ever post GitHub review comments; useful even for TUI/`porch agent`.
-- **Language rules:** depth no single prompt will match. Year-1 we get this from the external CLI. Extra porch `path_instructions` are **repo policy** (enclave, contract), not a replacement for language packs.
+- **Language rules:** depth no single prompt will match. M16 owns this in a porch engine. Extra porch `path_instructions` are **repo policy** (enclave, contract), not a replacement for language packs.
 - **Precision bias:** fewer false alarms. Porch’s gate makes false alarms expensive (they park humans). This matches.
 - **Filter:** drop only comments the diff proves wrong. Keep disputed concurrency/safety comments.
 

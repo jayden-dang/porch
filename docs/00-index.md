@@ -1,6 +1,6 @@
 # Porch briefing index
 
-This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through M8 (operator UX) plus **M9 first-run setup** (`porch setup` / easy TUI, `$PORCH_HOME/config.yaml`, porch-owned `ocr` → `review` wrapper, config-aware `review_bin()` + doctor).
+This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through **M9** (operator UX + first-run setup). Next: **M10–M15** finish the workflow with **coding-agent review** (OCR wrapper is transitional). **M16** (last) is a porch-owned review-quality engine — ideas only from constrained review tools, not that product. See [09-roadmap.md](09-roadmap.md) and D9/D15.
 
 ## Read order
 
@@ -30,4 +30,4 @@ Clickable path: **[references.md](references.md)**.
 
 ## One-sentence product
 
-Porch is a Rust local git gate whose review is coverage-enforcing and line-anchored, whose certify step is cheap and targeted, and whose deliver step talks only to GitHub PR checks — so “passed the porch” means independently reviewed and locally certified, **not** “production CI/CD is green.”
+Porch is a Rust local git gate whose review is independent of the authoring session, whose certify step is cheap and targeted, and whose deliver step talks only to GitHub PR checks — so “passed the porch” means independently reviewed and locally certified, **not** “production CI/CD is green.” Coverage-enforcing, line-anchored review is the **M16** quality engine; until then the reviewer is a session-free coding agent (M10).

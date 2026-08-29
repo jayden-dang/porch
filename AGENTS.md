@@ -19,7 +19,7 @@ Local implementation notes (gitignored): **`.research/`**. Read that directory b
 - Force-push is `--force-with-lease=<ref>:<observed-sha>` and refuses when live remote commits were not incorporated. Unverifiable safety facts fail closed.
 - Review auto-fix default is **off**. Findings that would extend scope (schema, durable state, on-chain, new subsystem) are `ask-user`.
 - Deliver babysits **PR checks by allowlist only**. Never rerun deploy, on-chain publish, or spend-money E2E.
-- Year-1 review engine is an **external review CLI** composed as a subprocess. Do not reimplement grouping, relocation, or language-rule matching until that is an explicit milestone.
+- Reviewer turns are session-free; do not collapse reviewer and fixer. **M10+** default reviewer is a coding-agent turn (JSON findings), not the OCR product. Do **not** start a porch-owned grouping/relocation/language-rule engine until **M16** (explicit milestone, after the workflow). Do not vendor or wrap a third-party review CLI as that engine.
 - Day-1 forges: **GitHub only**. Day-1 agents: **ACP + one native CLI**. Do not add adapter surface because it is easy.
 
 ## Layout
@@ -32,7 +32,7 @@ crates/porch/              # binary; clap; `porch daemon run` is a fast path
 crates/porch-git/          # git CLI wrapper, --git-dir absolute; publish = false
 crates/porch-gate/         # init, hooks, admit, notify, sqlite, daemon (+ RunExecutor inject)
 crates/porch-run/          # worktree, intent, rebase, review, certify, deliver, agent respond
-crates/porch-review/       # external review CLI adapter (PATH fake in tests)
+crates/porch-review/       # review adapter (agent or CLI; PATH fake in tests)
 crates/porch-agent/        # native fixer CLI adapter (PATH fake in tests)
 crates/porch-deliver/    # GitHub PR + allowlisted checks (`gh`)
 ```

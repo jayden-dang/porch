@@ -14,12 +14,13 @@ Reopen only with an explicit written change. Coding sessions do not get to “ju
 | D6 | Review auto-fix default is **0**. Test/lint-style certify adapters may auto-fix; review does not, unless the operator raises the limit. |
 | D7 | Year-1 forge: **GitHub only** (`gh`). |
 | D8 | Year-1 agents: **ACP + one native CLI**. No nine-adapter matrix. |
-| D9 | Year-1 review engine: compose an **external review CLI** as a subprocess. Do not reimplement its grouping/rules/relocation until a later milestone. Binary name, flags, and comment schema live in `.research/` (gitignored). |
+| D9 | **Superseded 2026-08-29 (workflow vs quality eras).** M3–M9 used an external review CLI (OCR via a porch-owned wrapper). That is **transitional**. **Workflow era (M10+):** the review *phase* is a **session-free coding-agent turn** (ACP or the one native CLI — D8). It must emit porch finding JSON. Reviewer ≠ fixer (E9) still holds: never resume the fixer session for rereview. **Quality era (last milestone, after the operator workflow is complete):** a **porch-owned** review engine (grouping, coverage manifest, line relocation, language rules). Borrow *ideas* from constrained review CLIs; do **not** compose, wrap, or vendor that product (D13). Do not start the quality engine until M10–M15 are dogfoodable. |
 | D10 | First dogfood target: **mailgate**. If porch cannot live on that monorepo without swallowing its CI, the product is wrong. |
 | D11 | Agent CLI is JSON (and JSONL for streams), not a custom encoding as the only option. Exit codes: 0 ok/gate, 1 failed/cancelled, 2 usage. |
 | D12 | TUI is secondary. Headless `porch agent` is first-class. |
 | D13 | Intended license: **Apache-2.0**. Do not paste third-party source into this tree. Ideas may be reimplemented. |
 | D14 | crates.io package name is **porch** (id free as of 2026-08-29). Binary `porch`. Fallbacks `git-porch` / `porch-gate` only if the id is taken at publish time. |
+| D15 | Borrow **operator UX and workflow** ideas from other inner gates (installer, skill, richer park TUI, eject, sync, rebase-park). Do **not** borrow: nine-step religion, nine-agent matrix, six forges, TOON as the only agent encoding, babysitting every PR check, review-auto-fix default on, a wizard that replaces `git push porch` as consent. |
 
 ## Engineering
 
@@ -54,7 +55,7 @@ Reopen only with an explicit written change. Coding sessions do not get to “ju
 | ID | Rejected idea | Why |
 |---|---|---|
 | R1 | Port an existing Go gate and rename | Wrong language; copies a 9-agent / 6-forge maintenance swamp |
-| R2 | Rewrite the review engine in Rust year 1 | The external CLI is already better at review than a generic agent |
+| R2 | Rewrite a full review engine in Rust **as the year-1 default** | Generic-agent review is accepted only as the **workflow** reviewer (D9). The quality engine is the **last** milestone, after M10–M15, then dogfood. Not an excuse to embed a third-party review product. |
 | R3 | Nine fixed steps including Document/Lint/Test/CI as first-class clones | Encoding is heavy; local Test must not be CI; Document can wait |
 | R4 | Always-on heavy daemon as the only mode | Socket activation + on-demand is enough; complexity tax is real |
 | R5 | libgit2 | Worktrees, hooks, credentials, `safe.bareRepository=explicit` |
