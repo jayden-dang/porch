@@ -97,14 +97,15 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 
 ## M9 — First-run setup (after M8)
 
-Today `porch doctor` only reports. Operators still wire `PORCH_REVIEW_BIN` (OCR is `ocr review …`, not a binary named `review`), `PORCH_FIXER_BIN`, and PATH for certify tools by hand. That is not the 1.0 loop.
-
-- **`porch setup`** (headless, JSON-friendly) **and** a TUI wizard (ratatui from M8; `porch` with no args can open it)
-- Write `$PORCH_HOME/config.yaml` (global; architecture already named this file). Env vars remain overrides.
-- Detect review CLIs on PATH (at least `ocr`): install a porch-owned wrapper so the adapter keeps `--from/--to/--format json --output` without forking OCR flags
-- Detect `gh`, optional fixer CLI, repo-specific tools (`biome`, `just`, `moon`, `cargo`) and record them
-- `porch init` offers setup if doctor would warn (non-interactive: `--yes` / skip)
-- Do **not** embed the review engine (D9). Do **not** download random binaries without operator consent. Fail closed if setup cannot verify the wrapper.
+- [x] **`porch setup`** headless JSON (`--yes` / `--verify` / `--engine` / `--apply`) **and** easy one-screen TUI (not a long wizard; `porch` with no args opens it when setup incomplete)
+- [x] Write `$PORCH_HOME/config.yaml` (operator config). Env overrides config (`PORCH_REVIEW_BIN` > wrapper > `review`)
+- [x] Engine registry: `ocr` + `generic` only; porch-owned `$PORCH_HOME/bin/review` wrapper (`exec <ocr> review "$@"`) so `run_review` argv stays `--from/--to/--format json --output`
+- [x] Detect `gh`, optional fixer, repo tools; record in config
+- [x] Fail-closed verify (backend, wrapper body under PORCH_HOME, `--help`, ocr `--preview` on tempfile repo); never leave config pointing at a broken wrapper
+- [x] `porch init --yes` / `--skip-setup`; non-TTY prints hint (no hang)
+- [x] Doctor config-aware; suggest `porch setup` when review missing
+- [x] OCR fixture parse derives coverage when top-level `files` absent
+- Do **not** embed the review engine (D9). Do **not** download binaries.
 
 ## Explicitly later / never
 

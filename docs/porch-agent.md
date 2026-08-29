@@ -1,6 +1,6 @@
 # Porch agent skill (headless)
 
-Use when a `git push porch` run is **parked** on review findings, or when you need gate status without a TUI. The optional park TUI (`porch` / `porch attach`) is additive; this JSON contract is unchanged.
+Use when a `git push porch` run is **parked** on review findings, or when you need gate status without a TUI. The optional park TUI (`porch` / `porch attach`) is additive; this JSON contract is unchanged. First-run review wiring is `porch setup` / `$PORCH_HOME/config.yaml` (not this skill).
 
 JSON on **stdout**. Human logs may appear on stderr. Exit codes (D11): `0` ok/in-progress gate, `1` failed/cancelled, `2` usage.
 

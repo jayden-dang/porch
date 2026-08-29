@@ -14,6 +14,7 @@ use porch_gate::{
 use porch_run::{AgentResponse, PipelineExecutor, agent_respond, agent_status};
 
 mod doctor;
+mod setup;
 mod tui;
 
 #[derive(Parser)]
@@ -26,7 +27,29 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Install the porch remote, bare repo, and hooks in this working tree.
-    Init,
+    Init {
+        /// Run setup non-interactively when review is missing, then init.
+        #[arg(long)]
+        yes: bool,
+        /// Skip first-run review setup entirely.
+        #[arg(long)]
+        skip_setup: bool,
+    },
+    /// Detect review engine, write `$PORCH_HOME/config.yaml` + wrapper.
+    Setup {
+        /// Detect, write, verify; print JSON (non-interactive).
+        #[arg(long)]
+        yes: bool,
+        /// Re-check wrapper/config without rewriting.
+        #[arg(long)]
+        verify: bool,
+        /// Force engine (`ocr` or `generic`).
+        #[arg(long)]
+        engine: Option<String>,
+        /// Rewrite wrapper from current config.yaml.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Check PATH / home / daemon prerequisites for a push.
     Doctor,
     /// List recent runs for this repo (JSON array).
@@ -140,18 +163,23 @@ fn main_inner() -> Result<ExitCode> {
 
     match Cli::parse().command {
         None => run_bare(),
-        Some(Command::Init) => {
-            let work = env::current_dir()?;
+        Some(Command::Init { yes, skip_setup }) => run_init(yes, skip_setup),
+        Some(Command::Setup {
+            yes,
+            verify,
+            engine,
+            apply,
+        }) => {
             let home = porch_home();
-            let bin = env::current_exe().context("current_exe")?;
-            let result = init(InitOptions {
-                work_tree: &work,
-                porch_home: &home,
-                porch_bin: &bin,
-                start_daemon: true,
-            })?;
-            print_init_next_steps(&result, &work, &home);
-            Ok(ExitCode::SUCCESS)
+            setup::run(
+                &home,
+                &setup::SetupArgs {
+                    yes,
+                    verify,
+                    apply,
+                    engine,
+                },
+            )
         }
         Some(Command::Doctor) => Ok(doctor::run()?),
         Some(Command::Runs { limit }) => run_runs(limit),
@@ -275,6 +303,44 @@ fn ensure_daemon_for_cwd(home: &Path) -> Result<()> {
     ensure_daemon(&bin, home).context("ensure daemon (try: porch daemon start)")
 }
 
+fn run_init(yes: bool, skip_setup: bool) -> Result<ExitCode> {
+    let work = env::current_dir()?;
+    let home = porch_home();
+    if !skip_setup {
+        let review_missing = setup::setup_incomplete(&home);
+        if review_missing {
+            if yes {
+                let result = porch_review::setup_yes(&home, None)?;
+                if !result.ok {
+                    eprintln!(
+                        "porch: setup failed: {}",
+                        result.error.as_deref().unwrap_or("unknown")
+                    );
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    return Ok(ExitCode::from(1));
+                }
+            } else if io::stdin().is_terminal() {
+                eprintln!(
+                    "porch: review setup incomplete — run `porch setup` (or `porch init --yes`)"
+                );
+            } else {
+                eprintln!(
+                    "porch: review setup incomplete — run `porch setup --yes` or `porch init --skip-setup`"
+                );
+            }
+        }
+    }
+    let bin = env::current_exe().context("current_exe")?;
+    let result = init(InitOptions {
+        work_tree: &work,
+        porch_home: &home,
+        porch_bin: &bin,
+        start_daemon: true,
+    })?;
+    print_init_next_steps(&result, &work, &home);
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run_bare() -> Result<ExitCode> {
     let work = env::current_dir()?;
     if !is_git_work_tree(&work) {
@@ -301,9 +367,23 @@ fn run_bare() -> Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
         }
+        if setup::setup_incomplete(&home) {
+            return setup::run(
+                &home,
+                &setup::SetupArgs {
+                    yes: false,
+                    verify: false,
+                    apply: false,
+                    engine: None,
+                },
+            );
+        }
     }
 
     print_runs_summary(&runs);
+    if setup::setup_incomplete(&home) {
+        println!("hint: review setup incomplete — run `porch setup --yes`");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -430,12 +510,14 @@ fn print_init_next_steps(
     println!("PORCH_HOME: {}", home.display());
     println!("next: git push porch HEAD:refs/heads/{branch}");
 
-    let review_bin = env::var("PORCH_REVIEW_BIN").unwrap_or_else(|_| "review".into());
+    let review_bin = porch_review::review_bin();
     let gh_bin = env::var("PORCH_GH_BIN").unwrap_or_else(|_| "gh".into());
     let missing_review = !doctor::bin_on_path(&review_bin);
     let missing_gh = !doctor::bin_on_path(&gh_bin);
     if missing_review || missing_gh {
-        println!("tip: run `porch doctor` — review and/or gh look missing for a complete run");
+        println!(
+            "tip: run `porch setup` / `porch doctor` — review and/or gh look missing for a complete run"
+        );
     }
 }
 

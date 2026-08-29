@@ -27,17 +27,18 @@ crates.io (`cargo install porch`) is a **future** option if/when the slice graph
 ## Loop
 
 ```sh
+porch setup                          # or: porch setup --yes  (writes OCR→review wrapper + config.yaml)
 porch doctor
 cd /path/to/your/clone
-porch init
+porch init                           # --yes also runs setup when review is missing
 porch daemon start                   # optional: install KeepAlive via `porch daemon install`
 git push porch HEAD:refs/heads/your-branch
 porch runs                           # or bare `porch` / `porch attach`
 ```
 
-`$PORCH_HOME` overrides `~/.porch`. Put a trusted `.porch.yaml` on the **default branch** (`commands.format` / `commands.lint`, `deliver.github.watch_checks`, …). Executing config is read from that SHA, never from the pushed tip.
+`$PORCH_HOME` overrides `~/.porch`. Operator config is `$PORCH_HOME/config.yaml` (from setup). Put a trusted `.porch.yaml` on the **default branch** (`commands.format` / `commands.lint`, `deliver.github.watch_checks`, …). Executing config is read from that SHA, never from the pushed tip.
 
-Review is an external CLI (`PORCH_REVIEW_BIN`, default `review`). Deliver uses `gh` (`PORCH_GH_BIN`). When review parks, attach the TUI (`porch` / `porch attach` on a TTY) or respond headlessly:
+Review is an external CLI. Prefer `porch setup` so OCR (`ocr review …`) is wrapped as `$PORCH_HOME/bin/review`; `PORCH_REVIEW_BIN` still overrides. To switch engines later: edit `review.engine` / `review.bin` in `$PORCH_HOME/config.yaml`, then `porch setup --apply` (rewrites the wrapper and re-verifies). Deliver uses `gh` (`PORCH_GH_BIN`). When review parks, attach the TUI (`porch` / `porch attach` on a TTY) or respond headlessly:
 
 ```sh
 porch agent status

@@ -10,6 +10,7 @@ description = "M3 slice: external review CLI adapter"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]

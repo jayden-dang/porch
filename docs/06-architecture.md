@@ -83,8 +83,8 @@ Spawn `gh`. Find PR by branch (not filtered by base — update existing rather t
 
 JSON-RPC on the socket. CLI:
 
-- `porch` — attach TUI when TTY + active run on branch; otherwise list runs / hint (**M8**). Wizard is **M9**.
-- `porch init | daemon | status | runs | doctor | attach` (**M9:** `setup`, `eject`)
+- `porch` — attach TUI when TTY + active run on branch; else if setup incomplete open easy setup TUI; otherwise list runs / hint
+- `porch init | setup | daemon | status | runs | doctor | attach` (`eject` later)
 - `porch agent status|respond` (headless park path; JSON contract stable)
 
 ### Data (SQLite, first cut)
@@ -99,7 +99,9 @@ Default `$PORCH_HOME/worktrees/<repo>/<run>/`. Placement recorded on the run at 
 
 ## Config
 
-Global `$PORCH_HOME/config.yaml`. Repo `.porch.yaml`. Merge: trusted SHA for executing fields; pushed branch may set ignore patterns and non-executing metadata.
+Global **`$PORCH_HOME/config.yaml`** is **operator** config (written by `porch setup`): review engine / wrapper path, optional fixer / `gh` / tool detections. Env vars override it (`PORCH_REVIEW_BIN` wins over `review.wrapper`). This is **not** the trusted executing `.porch.yaml` on the default-branch SHA (E10).
+
+Repo `.porch.yaml` (trusted SHA): executing fields (`commands.*`, deliver allowlist, …). Pushed branch may set ignore patterns and non-executing metadata only.
 
 ## Eventing
 

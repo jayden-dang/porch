@@ -1,12 +1,33 @@
 //! External review CLI adapter: spawn, parse JSON, map to findings.
+//!
+//! Also owns operator `$PORCH_HOME/config.yaml` load + review-engine setup
+//! (wrapper write/verify). Gate must not depend on this crate.
 
+mod engine;
+mod home_config;
+mod pathutil;
+mod setup;
+
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+
+pub use engine::{DetectedEngine, EngineKind, known_engines, wrapper_script};
+pub use home_config::{
+    CONFIG_FILE, FixerConfig, GithubConfig, HomeConfig, ReviewConfig, ToolsConfig, config_path,
+    load_home_config, write_home_config,
+};
+pub use pathutil::{is_executable, resolve_bin, which};
+pub use setup::{
+    SetupResult, WRAPPER_REL, default_engine, detect_engines, detect_optional_tools,
+    review_setup_ok, setup_apply, setup_verify, setup_yes, verify_setup, wrapper_path,
+    write_wrapper,
+};
 
 /// Env var naming the review CLI binary (PATH entry or absolute path).
 pub const REVIEW_BIN_ENV: &str = "PORCH_REVIEW_BIN";
@@ -82,7 +103,46 @@ pub struct ReviewComment {
     pub severity: Option<String>,
 }
 
+/// OCR / generic file-group entry (optional coverage source).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewGroup {
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// One OCR manifest coverage item.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoverageItem {
+    #[serde(default)]
+    pub path: String,
+}
+
+/// OCR coverage sets (optional).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReviewCoverage {
+    #[serde(default)]
+    pub selected: Vec<CoverageItem>,
+    #[serde(default)]
+    pub completed: Vec<CoverageItem>,
+    #[serde(default)]
+    pub reused: Vec<CoverageItem>,
+    #[serde(default)]
+    pub failed: Vec<CoverageItem>,
+    #[serde(default)]
+    pub waived: Vec<CoverageItem>,
+}
+
+/// OCR run manifest subset used for coverage derivation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewManifest {
+    #[serde(default)]
+    pub coverage: ReviewCoverage,
+}
+
 /// Top-level review CLI JSON (`comments` + coverage `files`).
+///
+/// OCR often omits top-level `files`; porch then derives coverage from
+/// `groups` / `manifest.coverage` / comment paths.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReviewJson {
     #[serde(default)]
@@ -90,6 +150,10 @@ pub struct ReviewJson {
     /// Paths the engine claims to have covered (or explicitly skipped).
     #[serde(default)]
     pub files: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<ReviewGroup>,
+    #[serde(default)]
+    pub manifest: Option<ReviewManifest>,
 }
 
 /// Successful parse + map of a review CLI run.
@@ -131,10 +195,31 @@ pub enum Error {
     Msg(String),
 }
 
-/// Resolve the review binary from `PORCH_REVIEW_BIN` (default `review`).
+/// Resolve the review binary: `PORCH_REVIEW_BIN` > `$PORCH_HOME/config.yaml` wrapper > `review`.
 #[must_use]
 pub fn review_bin() -> String {
-    std::env::var(REVIEW_BIN_ENV).unwrap_or_else(|_| DEFAULT_BIN.to_string())
+    if let Ok(v) = std::env::var(REVIEW_BIN_ENV) {
+        if !v.trim().is_empty() {
+            return v;
+        }
+    }
+    if let Some(home) = porch_home_dir() {
+        if let Ok(Some(cfg)) = load_home_config(&home) {
+            if let Some(w) = cfg.review.wrapper.as_deref() {
+                if !w.trim().is_empty() {
+                    return w.to_string();
+                }
+            }
+        }
+    }
+    DEFAULT_BIN.to_string()
+}
+
+fn porch_home_dir() -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os("PORCH_HOME") {
+        return Some(PathBuf::from(v));
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".porch"))
 }
 
 /// Resolve timeout from `PORCH_REVIEW_TIMEOUT_SECS`.
@@ -212,6 +297,8 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
 /// Parse review JSON bytes into an outcome (no coverage check yet).
 ///
 /// Finding ids `f0`, `f1`, … are assigned in comment order after mapping.
+/// When top-level `files` is empty (typical OCR), coverage is derived from
+/// `groups`, `manifest.coverage`, and comment paths.
 ///
 /// # Errors
 ///
@@ -222,10 +309,48 @@ pub fn parse_review_json(bytes: &[u8]) -> Result<ReviewOutcome, Error> {
     for (i, f) in findings.iter_mut().enumerate() {
         f.id = format!("f{i}");
     }
+    let covered_files = derive_covered_files(&parsed);
     Ok(ReviewOutcome {
         findings,
-        covered_files: parsed.files,
+        covered_files,
     })
+}
+
+/// Build the coverage path list porch asserts against.
+#[must_use]
+pub fn derive_covered_files(parsed: &ReviewJson) -> Vec<String> {
+    if !parsed.files.is_empty() {
+        return parsed.files.clone();
+    }
+    let mut set = BTreeSet::new();
+    for c in &parsed.comments {
+        if !c.path.is_empty() {
+            set.insert(c.path.clone());
+        }
+    }
+    for g in &parsed.groups {
+        for f in &g.files {
+            if !f.is_empty() {
+                set.insert(f.clone());
+            }
+        }
+    }
+    if let Some(m) = &parsed.manifest {
+        for item in m
+            .coverage
+            .selected
+            .iter()
+            .chain(m.coverage.completed.iter())
+            .chain(m.coverage.reused.iter())
+            .chain(m.coverage.failed.iter())
+            .chain(m.coverage.waived.iter())
+        {
+            if !item.path.is_empty() {
+                set.insert(item.path.clone());
+            }
+        }
+    }
+    set.into_iter().collect()
 }
 
 /// Fail if a changed path is absent from the coverage manifest.
@@ -465,5 +590,33 @@ mod tests {
         let raw = br#"{"path":"a.rs","message":"x","severity":"warning","action":"ask-user"}"#;
         let f: Finding = serde_json::from_slice(raw).unwrap();
         assert!(f.id.is_empty());
+    }
+
+    #[test]
+    fn ocr_fixture_parses_and_derives_files() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/review/ocr-sample.json");
+        let bytes = fs::read(&path).expect("ocr-sample.json");
+        let out = parse_review_json(&bytes).expect("parse ocr fixture");
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].id, "f0");
+        assert!(out.findings[0].is_blocking());
+        assert!(
+            out.covered_files.iter().any(|f| f == "src/lib.rs"),
+            "covered={:?}",
+            out.covered_files
+        );
+        assert!(
+            out.covered_files.iter().any(|f| f == "src/util.rs"),
+            "covered={:?}",
+            out.covered_files
+        );
+    }
+
+    #[test]
+    fn wrapper_script_ocr_prefixes_review() {
+        let body = wrapper_script(EngineKind::Ocr, Path::new("/opt/homebrew/bin/ocr"));
+        assert!(body.starts_with("#!/bin/sh\n"));
+        assert!(body.contains("exec /opt/homebrew/bin/ocr review \"$@\""));
     }
 }

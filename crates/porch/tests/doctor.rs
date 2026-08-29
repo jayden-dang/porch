@@ -57,9 +57,9 @@ fn doctor_ok_when_git_present_even_if_review_missing() {
         .success()
         .stdout(predicates::str::contains("[ok  ] git:"))
         .stdout(predicates::str::contains("[warn] review:"))
+        .stdout(predicates::str::contains("porch setup"))
         .stdout(predicates::str::contains("[warn] fixer:"))
-        .stdout(predicates::str::contains("PORCH_FIXER_BIN"))
-        .stdout(predicates::str::contains("porch doctor"));
+        .stdout(predicates::str::contains("PORCH_FIXER_BIN"));
 }
 
 #[test]

@@ -2,12 +2,14 @@
 
 use std::env;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use porch_gate::{health_check, porch_home, socket_path};
+use porch_review::{
+    REVIEW_BIN_ENV, is_executable, load_home_config, resolve_bin, review_bin, which,
+};
 
-const REVIEW_BIN_ENV: &str = "PORCH_REVIEW_BIN";
 const GH_BIN_ENV: &str = "PORCH_GH_BIN";
 const FIXER_BIN_ENV: &str = "PORCH_FIXER_BIN";
 
@@ -135,25 +137,57 @@ fn check_home_and_daemon() -> Vec<Check> {
 }
 
 fn check_review() -> Check {
-    let review_bin = env::var(REVIEW_BIN_ENV).unwrap_or_else(|_| "review".into());
-    match resolve_bin(&review_bin) {
-        Some(p) => Check::new(
+    let home = porch_home();
+    let from_env = env::var_os(REVIEW_BIN_ENV).is_some();
+    let bin = review_bin();
+    let resolved = resolve_bin(&bin);
+    if let Some(p) = resolved {
+        if from_env {
+            return Check::new(
+                Level::Ok,
+                "review",
+                format!("{} ({REVIEW_BIN_ENV})", p.display()),
+            );
+        }
+        if let Ok(Some(cfg)) = load_home_config(&home) {
+            if let Some(engine) = cfg.review.engine.as_deref() {
+                let wrap = cfg
+                    .review
+                    .wrapper
+                    .as_deref()
+                    .unwrap_or_else(|| p.to_str().unwrap_or(""));
+                return Check::new(
+                    Level::Ok,
+                    "review",
+                    format!("{} (engine={engine}, wrapper={wrap})", p.display()),
+                );
+            }
+        }
+        return Check::new(
             Level::Ok,
             "review",
-            format!("{} ({REVIEW_BIN_ENV} or default `review`)", p.display()),
-        ),
-        None => Check::new(
-            Level::Warn,
-            "review",
-            format!(
-                "`{review_bin}` not found — set {REVIEW_BIN_ENV} or install on PATH (needed for a complete run; init still works)"
-            ),
-        ),
+            format!("{} (PATH default `review`)", p.display()),
+        );
     }
+    Check::new(
+        Level::Warn,
+        "review",
+        format!(
+            "`{bin}` not found — run `porch setup` (or set {REVIEW_BIN_ENV}); needed for a complete run"
+        ),
+    )
 }
 
 fn check_gh() -> Check {
-    let gh_bin = env::var(GH_BIN_ENV).unwrap_or_else(|_| "gh".into());
+    let home = porch_home();
+    let from_config = load_home_config(&home)
+        .ok()
+        .flatten()
+        .and_then(|c| c.github.bin);
+    let gh_bin = env::var(GH_BIN_ENV)
+        .ok()
+        .or(from_config)
+        .unwrap_or_else(|| "gh".into());
     match resolve_bin(&gh_bin) {
         Some(p) => Check::new(
             Level::Ok,
@@ -171,12 +205,21 @@ fn check_gh() -> Check {
 }
 
 fn check_fixer() -> Check {
-    match env::var(FIXER_BIN_ENV) {
-        Ok(bin) if !bin.trim().is_empty() => match resolve_bin(bin.trim()) {
+    let home = porch_home();
+    let from_config = load_home_config(&home)
+        .ok()
+        .flatten()
+        .and_then(|c| c.fixer.bin);
+    match env::var(FIXER_BIN_ENV)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or(from_config)
+    {
+        Some(bin) => match resolve_bin(bin.trim()) {
             Some(p) => Check::new(
                 Level::Ok,
                 "fixer",
-                format!("{} ({FIXER_BIN_ENV})", p.display()),
+                format!("{} ({FIXER_BIN_ENV} or config)", p.display()),
             ),
             None => Check::new(
                 Level::Warn,
@@ -186,11 +229,11 @@ fn check_fixer() -> Check {
                 ),
             ),
         },
-        _ => Check::new(
+        None => Check::new(
             Level::Warn,
             "fixer",
             format!(
-                "{FIXER_BIN_ENV} unset — required for `porch agent respond fix` (no default binary)"
+                "{FIXER_BIN_ENV} unset — required for `porch agent respond fix` (optional at setup)"
             ),
         ),
     }
@@ -214,40 +257,10 @@ fn check_repo_tools() -> Vec<Check> {
         .collect()
 }
 
-fn resolve_bin(name_or_path: &str) -> Option<PathBuf> {
-    let p = Path::new(name_or_path);
-    if p.is_absolute() || name_or_path.contains('/') {
-        return p.exists().then(|| p.to_path_buf());
-    }
-    which(name_or_path)
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    for dir in env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() && is_executable(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.exists()
-}
-
 /// True when `name` resolves on PATH or as an absolute/relative existing path.
 #[must_use]
 pub fn bin_on_path(name_or_path: &str) -> bool {
-    resolve_bin(name_or_path).is_some()
+    resolve_bin(name_or_path).is_some_and(|p| is_executable(&p))
 }
 
 /// Best-effort current branch name for init hints (`HEAD` if detached).
