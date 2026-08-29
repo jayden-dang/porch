@@ -1,6 +1,6 @@
 # Porch briefing index
 
-This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through M7 (dogfood yaml + allowlist skip-as-Ready + trusted `pr.base_branch` + path_instructions persist).
+This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Implementation is through M7 (dogfood yaml + allowlist skip-as-Ready + trusted `pr.base_branch` + path_instructions persist) plus 0.1.0 operator UX (`porch doctor`). First-run auto-setup (OCR wrapper, `$PORCH_HOME/config.yaml`) is **M9**, after M8 TUI.
 
 ## Read order
 

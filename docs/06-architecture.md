@@ -83,8 +83,8 @@ Spawn `gh`. Find PR by branch (not filtered by base — update existing rather t
 
 JSON-RPC on the socket. CLI:
 
-- `porch` — attach TUI or wizard (later)
-- `porch init | eject | daemon | status | runs`
+- `porch` — attach TUI or wizard (**M8 TUI**; **M9** first-run setup)
+- `porch init | eject | daemon | status | runs | doctor | setup`
 - `porch agent run|respond|status|logs|abort|sync`
 
 ### Data (SQLite, first cut)

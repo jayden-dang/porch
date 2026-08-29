@@ -93,6 +93,17 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 - APFS clone worktrees
 - Eval corpus of gold findings (mailgate diffs)
 
+## M9 — First-run setup (after M8)
+
+Today `porch doctor` only reports. Operators still wire `PORCH_REVIEW_BIN` (OCR is `ocr review …`, not a binary named `review`), `PORCH_FIXER_BIN`, and PATH for certify tools by hand. That is not the 1.0 loop.
+
+- **`porch setup`** (headless, JSON-friendly) **and** a TUI wizard (ratatui from M8; `porch` with no args can open it)
+- Write `$PORCH_HOME/config.yaml` (global; architecture already named this file). Env vars remain overrides.
+- Detect review CLIs on PATH (at least `ocr`): install a porch-owned wrapper so the adapter keeps `--from/--to/--format json --output` without forking OCR flags
+- Detect `gh`, optional fixer CLI, repo-specific tools (`biome`, `just`, `moon`, `cargo`) and record them
+- `porch init` offers setup if doctor would warn (non-interactive: `--yes` / skip)
+- Do **not** embed the review engine (D9). Do **not** download random binaries without operator consent. Fail closed if setup cannot verify the wrapper.
+
 ## Explicitly later / never
 
 | Later | Never (as porch) |
