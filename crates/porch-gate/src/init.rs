@@ -49,13 +49,32 @@ pub fn init(opts: InitOptions<'_>) -> Result<InitResult> {
         "notify-push",
     )?;
     add_or_set_remote(&work, &bare_path)?;
+    copy_origin_to_bare(&work, &bare_path)?;
     porch_git::run_c(&work, &["config", "porch.repo-id", &repo_id])?;
     let db = Db::open(&db_path(&porch_home))?;
-    db.upsert_repo(&repo_id, &work, &bare_path)?;
+    db.upsert_repo(&repo_id, &work, &bare_path, "main")?;
     if opts.start_daemon {
         crate::ensure_daemon(opts.porch_bin, &porch_home)?;
     }
     Ok(InitResult { repo_id, bare_path })
+}
+
+/// Mirror the author clone's `origin` URL onto the bare gate (for rebase fetch).
+fn copy_origin_to_bare(work: &Path, bare: &Path) -> Result<()> {
+    let url = match porch_git::run_c(work, &["remote", "get-url", "origin"]) {
+        Ok(out) => {
+            let u = porch_git::stdout_trim(&out);
+            if u.is_empty() {
+                return Ok(());
+            }
+            u
+        }
+        Err(_) => return Ok(()),
+    };
+    let git_dir = GitDir::new(bare)?;
+    let _ = porch_git::run(&git_dir, &["remote", "remove", "origin"]);
+    porch_git::run(&git_dir, &["remote", "add", "origin", &url])?;
+    Ok(())
 }
 
 fn existing_repo_id(work: &Path) -> Result<Option<String>> {

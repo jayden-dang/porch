@@ -1,11 +1,13 @@
 use std::env;
 use std::io;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use porch_gate::{
     InitOptions, admit_push, git_dir_from_env, init, notify_push, porch_home, run_daemon,
 };
+use porch_run::PipelineExecutor;
 
 #[derive(Parser)]
 #[command(name = "porch", version, about = "Local git gate")]
@@ -27,11 +29,11 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DaemonCommand {
-    /// Long-lived process: flock, socket, sqlite.
+    /// Long-lived process: flock, socket, sqlite, run executor.
     Run,
     /// pre-receive: currently always allow.
     AdmitPush,
-    /// post-receive: record a pending run.
+    /// post-receive: record a pending run and ask the daemon to start it.
     NotifyPush,
 }
 
@@ -41,7 +43,8 @@ fn main() -> Result<()> {
     if argv.len() == 3 && argv[1] == "daemon" && argv[2] == "run" {
         init_file_tracing();
         let home = porch_home();
-        run_daemon(&home).context("daemon run")?;
+        let executor: Arc<dyn porch_gate::RunExecutor> = Arc::new(PipelineExecutor);
+        run_daemon(&home, &executor).context("daemon run")?;
         return Ok(());
     }
 
@@ -70,7 +73,8 @@ fn main() -> Result<()> {
             command: DaemonCommand::Run,
         } => {
             let home = porch_home();
-            run_daemon(&home)?;
+            let executor: Arc<dyn porch_gate::RunExecutor> = Arc::new(PipelineExecutor);
+            run_daemon(&home, &executor)?;
         }
         Command::Daemon {
             command: DaemonCommand::AdmitPush,
@@ -111,5 +115,3 @@ fn init_file_tracing() {
         }
     }
 }
-
-// Silence unused import if notify module path needs re-export.

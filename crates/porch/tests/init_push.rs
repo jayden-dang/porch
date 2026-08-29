@@ -1,17 +1,36 @@
+use std::path::Path;
 use std::process::Command as StdCommand;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use porch_gate::Db;
 use tempfile::TempDir;
 
-fn git(work: &std::path::Path, args: &[&str]) {
+fn git(work: &Path, args: &[&str]) {
     let st = StdCommand::new("git")
         .current_dir(work)
         .args(args)
         .status()
         .unwrap();
     assert!(st.success(), "git {args:?}");
+}
+
+fn wait_run_recorded(db: &Db, repo_id: &str, timeout: Duration) -> porch_gate::RunRow {
+    let start = Instant::now();
+    loop {
+        let runs = db.runs_for_repo(repo_id).unwrap();
+        if let Some(run) = runs.first() {
+            if run.status != "pending" && run.status != "running" {
+                return run.clone();
+            }
+        }
+        assert!(
+            start.elapsed() <= timeout,
+            "no terminal run for {repo_id}: {:?}",
+            db.runs_for_repo(repo_id).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -52,14 +71,16 @@ fn init_then_push_records_a_run() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Daemon may still be flushing; sqlite WAL should be readable immediately.
-    std::thread::sleep(Duration::from_millis(100));
     let db = Db::open(&home.join("state.sqlite")).unwrap();
     let id = porch_gate::repo_id_for(&work);
-    let runs = db.runs_for_repo(&id).unwrap();
-    assert_eq!(runs.len(), 1, "expected one run after push");
-    assert_eq!(runs[0].status, "pending");
-    assert_eq!(runs[0].branch, "main");
+    let run = wait_run_recorded(&db, &id, Duration::from_secs(10));
+    assert_eq!(run.branch, "main");
+    // Without origin on the author clone, rebase fetch fails closed.
+    assert!(
+        matches!(run.status.as_str(), "completed" | "failed" | "cancelled"),
+        "status={}",
+        run.status
+    );
 
     if let Ok(pid) = std::fs::read_to_string(home.join("daemon.pid")) {
         if let Ok(pid) = pid.trim().parse::<u32>() {
@@ -114,18 +135,16 @@ fn init_then_push_with_noncanonical_porch_home_records_a_run() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    std::thread::sleep(Duration::from_millis(100));
     let db_home = home.canonicalize().unwrap();
     let db = Db::open(&db_home.join("state.sqlite")).unwrap();
     let id = porch_gate::repo_id_for(&work);
-    let runs = db.runs_for_repo(&id).unwrap();
-    assert_eq!(
-        runs.len(),
-        1,
-        "expected one run after push with non-canonical PORCH_HOME"
+    let run = wait_run_recorded(&db, &id, Duration::from_secs(10));
+    assert_eq!(run.branch, "main");
+    assert!(
+        matches!(run.status.as_str(), "completed" | "failed" | "cancelled"),
+        "status={}",
+        run.status
     );
-    assert_eq!(runs[0].status, "pending");
-    assert_eq!(runs[0].branch, "main");
 
     if let Ok(pid) = std::fs::read_to_string(db_home.join("daemon.pid")) {
         if let Ok(pid) = pid.trim().parse::<u32>() {

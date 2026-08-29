@@ -30,9 +30,9 @@ Virtual Cargo workspace. Slices are use cases, not layers. Do not add a crate pe
 Cargo.toml                 # workspace; resolver = "3"; members = ["crates/*"]
 crates/porch/              # binary; clap; `porch daemon run` is a fast path
 crates/porch-git/          # git CLI wrapper, --git-dir absolute; publish = false
-crates/porch-gate/         # M1 slice: init, hooks, admit, notify, sqlite, daemon
-# later slices (not M1):
-# crates/porch-run/        # worktree, intent, rebase
+crates/porch-gate/         # init, hooks, admit, notify, sqlite, daemon (+ RunExecutor inject)
+crates/porch-run/          # M2 slice: worktree, intent, rebase, phase stubs
+# later slices:
 # crates/porch-review/     # external review CLI adapter
 # crates/porch-deliver/    # GitHub PR + allowlisted checks
 ```

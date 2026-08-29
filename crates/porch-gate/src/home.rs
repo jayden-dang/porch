@@ -46,3 +46,15 @@ pub fn db_path(home: &std::path::Path) -> PathBuf {
 pub fn logs_dir(home: &std::path::Path) -> PathBuf {
     home.join("logs")
 }
+
+/// Root directory for disposable run worktrees.
+#[must_use]
+pub fn worktrees_dir(home: &std::path::Path) -> PathBuf {
+    home.join("worktrees")
+}
+
+/// Absolute worktree path for a run: `$PORCH_HOME/worktrees/<repo>/<run>/`.
+#[must_use]
+pub fn run_worktree_dir(home: &std::path::Path, repo_id: &str, run_id: &str) -> PathBuf {
+    worktrees_dir(home).join(repo_id).join(run_id)
+}

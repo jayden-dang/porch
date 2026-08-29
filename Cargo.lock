@@ -516,6 +516,8 @@ dependencies = [
  "assert_cmd",
  "clap",
  "porch-gate",
+ "porch-git",
+ "porch-run",
  "predicates",
  "tempfile",
  "tracing",
@@ -546,6 +548,17 @@ version = "0.1.0"
 dependencies = [
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "porch-run"
+version = "0.1.0"
+dependencies = [
+ "porch-gate",
+ "porch-git",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

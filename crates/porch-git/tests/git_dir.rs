@@ -64,3 +64,35 @@ fn run_c_rejects_relative_work_tree() {
     let err = run_c(std::path::Path::new("rel"), &["status"]).unwrap_err();
     assert!(matches!(err, porch_git::Error::GitDirNotAbsolute(_)));
 }
+
+#[test]
+fn worktree_add_detach_creates_path() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    write_commit(&work);
+    let bare = root.join("bare.git");
+    let git_dir = init_bare(&bare).unwrap();
+    let sha = stdout_trim(
+        &run(
+            &GitDir::new(work.join(".git")).unwrap(),
+            &["rev-parse", "HEAD"],
+        )
+        .unwrap(),
+    );
+    Command::new("git")
+        .current_dir(&work)
+        .args(["remote", "add", "gate", bare.to_str().unwrap()])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(&work)
+        .args(["push", "gate", "HEAD:refs/heads/main"])
+        .status()
+        .unwrap();
+    let wt = root.join("wt");
+    porch_git::worktree_add_detach(&git_dir, &wt, &sha).unwrap();
+    assert!(wt.join("README").is_file());
+    porch_git::worktree_remove_force(&git_dir, &wt).unwrap();
+}

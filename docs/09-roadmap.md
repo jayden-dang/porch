@@ -23,14 +23,14 @@ Goal: `porch init` + `git push porch` updates a local bare repo and returns. No 
 
 **Out:** TUI, review CLI, PR, Windows polish can be stubbed but process-group spawn wrapper should exist empty-tested.
 
-## M2 — Worktree + intent + rebase (1–2 weeks)
+## M2 — Worktree + intent + rebase (done)
 
-- Worktree add at recorded path
-- Phase runner skeleton (skip flags)
-- Intent: store `--intent` on the run
-- Rebase onto `origin/<default>` (GitHub `main`/`dev` configurable later)
-- Empty diff → complete run skipped remaining
-- Crash: fail stale running runs
+- [x] Worktree add at recorded path
+- [x] Phase runner skeleton (skip flags)
+- [x] Intent: store `PORCH_INTENT` on the run
+- [x] Rebase onto `origin/<default>` (`repos.default_branch`, default `main`)
+- [x] Empty diff → complete run skipped remaining
+- [x] Crash: fail stale running runs
 
 ## M3 — Review + park (2 weeks)
 

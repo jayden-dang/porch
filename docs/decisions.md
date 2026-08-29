@@ -39,6 +39,9 @@ Reopen only with an explicit written change. Coding sessions do not get to “ju
 | E12 | Deliver watches **allowlisted PR check names** only. `ci.rerun_transient` default 0. Never rerun spend-money or deploy workflows. |
 | E13 | Unit tests never call real LLMs, a real review-CLI network, or real `gh`. PATH fakes + JSON fixtures. |
 | E14 | `Cargo.lock` is committed (this is a binary). |
+| E15 | Rebase conflict: **fail the run** after `git rebase --abort`. No park until a later milestone owns the park TUI. |
+| E16 | Fetch/resolve of `origin/<default>` fails: **fail the run** (fail closed). Default-branch tip is a safety fact for rebase. |
+| E17 | Intent for execute: hook/`notify` reads **`PORCH_INTENT`**. Empty → skip intent phase, do not fail. Default branch column: `repos.default_branch` (default `main`). |
 
 ## Explicitly rejected (for now)
 
