@@ -391,9 +391,8 @@ fn deliver_scaffolds_pr_and_parks_compose() {
         "steps={steps:?}"
     );
     assert!(
-        last_step(&steps, "deliver").is_none_or(|s| {
-            s.status.as_str() != "completed" && s.status.as_str() != "parked"
-        }),
+        last_step(&steps, "deliver")
+            .is_none_or(|s| { s.status.as_str() != "completed" && s.status.as_str() != "parked" }),
         "deliver must not be completed or parked; steps={steps:?}"
     );
     // parked_phase driver is compose+parked only

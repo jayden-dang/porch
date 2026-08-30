@@ -399,9 +399,8 @@ fn lease_push_exact_sha_and_pr_create() {
         "steps={steps:?}"
     );
     assert!(
-        last_step(&steps, "deliver").is_none_or(|s| {
-            s.status.as_str() != "completed" && s.status.as_str() != "parked"
-        }),
+        last_step(&steps, "deliver")
+            .is_none_or(|s| { s.status.as_str() != "completed" && s.status.as_str() != "parked" }),
         "deliver must not be completed or parked; steps={steps:?}"
     );
 

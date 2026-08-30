@@ -625,14 +625,7 @@ mod already_composed_tests {
         git(&seed, &["add", "feat.txt"]);
         git(&seed, &["commit", "-m", "feat change"]);
         let head = git_out(&seed, &["rev-parse", "HEAD"]);
-        git(
-            &seed,
-            &[
-                "push",
-                "origin",
-                "HEAD:refs/heads/feat-composed",
-            ],
-        );
+        git(&seed, &["push", "origin", "HEAD:refs/heads/feat-composed"]);
 
         let bare_path = root.join("bare.git");
         init_bare(&bare_path).unwrap();
