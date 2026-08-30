@@ -30,21 +30,40 @@ Never the operator's checkout.
 _Avoid_: "sandbox", "container" — no isolation boundary beyond the filesystem is implied.
 
 **Review**:
-The layered judgment stage of the **Assurance protocol**: a mandatory
+The layered assurance stage of the **Assurance protocol**: a mandatory
 **Deterministic floor** over the diff, plus a session-free **Judgment layer**
 that emits findings as JSON. The judgment layer is porch-native by default and
 may be supplied by an external **Producer** that meets the declared bar; the
 floor never is.
 _Avoid_: "lint" — lint is a certification check, not review.
 
+**Review round**:
+One execution of **Review** for a specific reviewed input within a **Run**,
+identified by a `review_round_id`. A post-fix review creates a new round;
+round records are never merged or overwritten.
+_Avoid_: "review pass"; "rereview" — a rereview is a round like any other.
+
 **Finding**:
 One reviewed issue. It identifies its criterion, evidence, consequence, action,
-producer provenance, and a stable fingerprint; confidence is optional and typed
+producer provenance, and a **Fingerprint**; confidence is optional and typed
 by producer epistemology — a deterministic producer never manufactures
 model-style confidence. A finding is **blocking** when its severity is error or
 warning, or its action is ask-user; blocking findings park the run, info findings
 do not.
 _Avoid_: "comment" — a comment is the raw producer output a finding is mapped from.
+
+**Finding instance**:
+One immutable occurrence of a **Finding** within one **Review round**,
+identified by a `finding_instance_id`. This is the durable audit key. The
+positional handles (`f0`, `f1`, …) are per-round ordinals for display and
+selection only, and are never audit keys.
+_Avoid_: "finding id" — ambiguous between the handle and the instance.
+
+**Fingerprint**:
+The logical reconciliation key for recognizing the same issue across
+**Review rounds**. It is never the database identity of a **Finding instance**
+and may recur on multiple instances over time.
+_Avoid_: "hash", "finding id"
 
 **Assurance protocol**:
 Porch's own end-to-end contract over a review: inventory, required coverage,
