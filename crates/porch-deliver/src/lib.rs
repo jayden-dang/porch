@@ -155,6 +155,18 @@ pub struct PullRequest {
     pub title: String,
 }
 
+/// PR fields from `gh pr view` (body included for managed merge).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrView {
+    pub number: u64,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+}
+
 /// One check row from `gh pr checks --json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckRow {
@@ -844,6 +856,41 @@ pub fn pr_mergeable(
         &["pr", "view", &num, "--json", "mergeable"],
     )?;
     parse_mergeable(&out.stdout)
+}
+
+/// Fetch title/body (and identity) for an open PR via `gh pr view`.
+///
+/// # Errors
+///
+/// Returns spawn / exit / JSON errors.
+pub fn view_pr(
+    bin: &str,
+    timeout: Duration,
+    work_tree: &Path,
+    number: u64,
+) -> Result<PrView, Error> {
+    let num = number.to_string();
+    let out = run_gh(
+        bin,
+        timeout,
+        work_tree,
+        &["pr", "view", &num, "--json", "number,url,title,body"],
+    )?;
+    let text =
+        std::str::from_utf8(&out.stdout).map_err(|e| Error::Msg(format!("pr view utf-8: {e}")))?;
+    Ok(serde_json::from_str(text.trim())?)
+}
+
+/// Structured theater-rejection rules shipped in the compose packet (design §8).
+#[must_use]
+pub fn theater_reject_rules() -> serde_json::Value {
+    serde_json::json!({
+        "forbid_pipeline_board": true,
+        "forbid_certify_transcript": true,
+        "forbid_review_findings_dump": true,
+        "forbid_approved_at_sha_line": true,
+        "forbid_visible_attestation_restatement": true,
+    })
 }
 
 /// Options for [`watch_allowlisted_checks`].

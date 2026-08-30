@@ -10,12 +10,14 @@ use crate::Result;
 const RUN_SELECT_FROM: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
                     intent, intent_source, error, review_approved_head_sha, findings_json,
-                    fixer_session_id, pr_url, deliver_repair_attempts, trusted_config_sha
+                    fixer_session_id, pr_url, deliver_repair_attempts, trusted_config_sha,
+                    pr_title_written
              FROM runs";
 const RUN_SELECT: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
                     intent, intent_source, error, review_approved_head_sha, findings_json,
-                    fixer_session_id, pr_url, deliver_repair_attempts, trusted_config_sha
+                    fixer_session_id, pr_url, deliver_repair_attempts, trusted_config_sha,
+                    pr_title_written
              FROM runs WHERE id = ?1";
 
 pub struct Db {
@@ -51,6 +53,8 @@ pub struct RunRow {
     pub deliver_repair_attempts: u32,
     /// Pinned default-branch tip SHA used for trusted `.porch.yaml` (E10).
     pub trusted_config_sha: Option<String>,
+    /// Last PR title porch wrote (managed-title heuristic).
+    pub pr_title_written: Option<String>,
 }
 
 /// Persisted fixer commit span awaiting a completed review (E23).
@@ -138,6 +142,7 @@ impl Db {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&conn, "runs", "trusted_config_sha", "TEXT")?;
+        ensure_column(&conn, "runs", "pr_title_written", "TEXT")?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
@@ -292,6 +297,7 @@ impl Db {
             pr_url: None,
             deliver_repair_attempts: 0,
             trusted_config_sha: None,
+            pr_title_written: None,
         })
     }
 
@@ -679,6 +685,24 @@ impl Db {
         Ok(())
     }
 
+    /// Persist the last PR title porch wrote (for managed-title heuristic).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the update fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn set_pr_title_written(&self, id: &str, title: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex");
+        conn.execute(
+            "UPDATE runs SET pr_title_written = ?1 WHERE id = ?2",
+            rusqlite::params![title, id],
+        )?;
+        Ok(())
+    }
+
     /// Increment `deliver_repair_attempts` when a fix attempt starts; returns the new count.
     ///
     /// # Errors
@@ -986,6 +1010,7 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
             u32::try_from(n).unwrap_or(0)
         },
         trusted_config_sha: row.get(16)?,
+        pr_title_written: row.get(17)?,
     })
 }
 

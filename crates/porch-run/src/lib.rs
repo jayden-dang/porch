@@ -402,8 +402,12 @@ fn deliver_with_repair(
         if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
             return Err(RunError::Msg("cancelled".into()));
         }
-        match deliver::run_deliver_phase(db, run_id, bare, wt, default_branch, cancel) {
-            Ok(()) => {
+        match deliver::run_deliver_phase(db, home, run_id, bare, wt, default_branch, cancel) {
+            Ok(deliver::DeliverOutcome::ParkedCompose) => {
+                // compose+parked already recorded inside deliver; do not complete deliver.
+                return Ok(PhaseLoop::Parked);
+            }
+            Ok(deliver::DeliverOutcome::Completed) => {
                 record_step(db, run_id, "deliver", "completed", None)?;
                 return Ok(PhaseLoop::Continue);
             }
