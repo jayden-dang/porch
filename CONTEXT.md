@@ -30,16 +30,58 @@ Never the operator's checkout.
 _Avoid_: "sandbox", "container" — no isolation boundary beyond the filesystem is implied.
 
 **Review**:
-A session-free reviewer turn that emits findings as JSON. The default engine is a
-coding-agent turn; `porch-quality` is the first-party engine; OCR is legacy
-(`--engine ocr`).
+The layered judgment stage of the **Assurance protocol**: a mandatory
+**Deterministic floor** over the diff, plus a session-free **Judgment layer**
+that emits findings as JSON. The judgment layer is porch-native by default and
+may be supplied by an external **Producer** that meets the declared bar; the
+floor never is.
 _Avoid_: "lint" — lint is a certification check, not review.
 
 **Finding**:
-One reviewed issue, with a stable id (`f0`, `f1`, …), a path, a severity, and an
-action. A finding is **blocking** when its severity is error or warning, or its
-action is ask-user; blocking findings park the run, info findings do not.
-_Avoid_: "comment" — a comment is the raw reviewer output a finding is mapped from.
+One reviewed issue. It identifies its criterion, evidence, consequence, action,
+producer provenance, and a stable fingerprint; confidence is optional and typed
+by producer epistemology — a deterministic producer never manufactures
+model-style confidence. A finding is **blocking** when its severity is error or
+warning, or its action is ask-user; blocking findings park the run, info findings
+do not.
+_Avoid_: "comment" — a comment is the raw producer output a finding is mapped from.
+
+**Assurance protocol**:
+Porch's own end-to-end contract over a review: inventory, required coverage,
+normalization, reconciliation, authority, SHA binding, and the fail-closed
+outcome. Porch owns it whoever produced the findings.
+_Avoid_: "pipeline", "review flow"
+
+**Producer**:
+Anything that emits findings for the assurance protocol to consume — the
+porch-native review, or an external review system. A producer's success verdict
+is evidence, never an approval (**ARCH-11**).
+_Avoid_: "engine" when the external case is meant; "reviewer" — that is the turn,
+not the party.
+
+**Deterministic floor**:
+The computation-only layer of an assurance run — rule packs and the coverage
+manifest over the diff, no shell, no network, no model. Always runs; never
+substitutable (**ARCH-12**).
+_Avoid_: "static analysis", "lint"
+
+**Judgment layer**:
+The layer above the floor that exercises judgment on the change. Supplied by the
+porch-native review by default, or by an external **Producer** that meets the
+declared bar.
+_Avoid_: "the reviewer" — that names the turn, not the layer.
+
+**Independence**:
+Context and process isolation of review from the writing of the change, so
+review is not anchored by it. Porch may inherit the harness's engine,
+credentials, and runtime; it never inherits the writing session, conversation,
+memory, or session id.
+_Avoid_: "impartial", "third-party" — independence is not vendor difference.
+
+**Incomplete**:
+The outcome when a **Producer** misses the declared bar or the protocol cannot
+establish its required facts. Fails closed; never a clean approval.
+_Avoid_: "failed" — a failed run is a different terminal status; "partial"
 
 **Fixer**:
 The agent turn that acts on review findings. May resume a session; the reviewer
@@ -76,8 +118,10 @@ splitting; the TUI's hunk view only shows a finding's diff snippet.
 
 **Eject**:
 The escape hatch back to a plain checkout: removes the `porch` remote and
-neutralizes the bare hooks. `--purge` also deletes this repo's bare, worktrees,
-run artifacts, and DB row, leaving other repos under `$PORCH_HOME` untouched.
+neutralizes the bare hooks. Safe eject preserves the database, bare repository,
+recovery refs, and custody evidence. `--purge` is destructive — it deletes this
+repo's bare, worktrees, run artifacts, and DB row (other repos under
+`$PORCH_HOME` untouched) — and is outside the no-loss guarantee of **GOAL-4**.
 _Avoid_: "uninstall" — that is the daemon-service verb (`porch daemon uninstall`).
 
 **Trusted SHA**:

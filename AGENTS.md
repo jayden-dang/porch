@@ -13,19 +13,28 @@ Local implementation notes (gitignored): **`.research/`**. Read that directory b
 ## Non-negotiables
 
 The invariant spine lives in **[docs/architecture/INDEX.md](docs/architecture/INDEX.md)**
-as **ARCH-1 … ARCH-10** — `origin` never rewritten, git via the CLI only, session-free
+as **ARCH-1 … ARCH-13** — `origin` never rewritten, git via the CLI only, session-free
 reviewer turns, config from the trusted default-branch SHA, fail-closed
 force-with-lease, auto-fix off, allowlisted check reruns, bounded adapter surface,
-first-party quality engine, use-case slices.
+first-party quality engine, use-case slices, porch-only assurance outcomes, a
+mandatory deterministic floor, and durable authorization before any external forward.
 
 They are **not to be silently reopened in a coding session.** A `design.md` that relies
 on one cites it as `Respects: ARCH-N`; `audit-trace` checks the citation resolves and
 `inspect-invariants` judges whether the diff conforms. Changing an invariant is a
 deliberate act with an ADR under `docs/adr/`.
 
-Engineering rules that are not invariants — English-only, no network in unit tests, no
-vendored third-party source — live in
-**[docs/product/guidelines.md](docs/product/guidelines.md)**.
+Engineering rules that are not invariants live in this file: English-only
+(**Language**), no network in unit tests (**Commands**), no vendored third-party source
+and no clone paths in committed files (**What porch is**), plus:
+
+- Anything `cargo fmt` and `cargo clippy` already enforce is not restated. The workspace
+  sets `unsafe_code = "forbid"`, `clippy::all = deny`, and `clippy::pedantic = warn` —
+  fix a pedantic warning or `allow` it with a reason; do not ignore it.
+- Integration test files are named for the milestone that introduced them:
+  `crates/<slice>/tests/m<N>_<topic>.rs`.
+- Domain terms follow **[CONTEXT.md](CONTEXT.md)** — use the glossary term, not a
+  paraphrase.
 
 ## Layout
 
@@ -63,10 +72,12 @@ Do not run real LLM / review-CLI network / `gh` network in unit tests. Use PATH 
 
 Consumers: **mailgate** (first) and **klynt** (second). Porch must help those monorepos without replacing their CI.
 
-| Tree | Role | Clone |
-|---|---|---|
-| mailgate | Production CI porch must not replace; first dogfood | [../../work/CommandOss/mailgate](../../work/CommandOss/mailgate) |
-| klynt | Messy monolith CI; PR base `dev` vs `origin/HEAD` `main` | [../../klynt/klynt](../../klynt/klynt) |
+| Tree | Role |
+|---|---|
+| mailgate | Production CI porch must not replace; first dogfood |
+| klynt | Messy monolith CI; PR base `dev` vs `origin/HEAD` `main` |
+
+Local clone locations live in the gitignored `.research/`, not in committed files.
 
 ## Language
 
@@ -86,9 +97,9 @@ This repo is configured for a spec-driven skill set.
 - Incoming issues and PRs: `/triage` (user-run)
 - Traceability check: the docs-only `audit-trace` skill — run by `prove-claim` and `cut-release`;
   keep it clean
-- Project docs (layer enabled): `/define-project` maintains
-  `docs/product/vision.md`, the `docs/architecture/` invariant spine, and
-  `docs/product/guidelines.md`; the feature skills consult them
+- Project docs (layer enabled): `/define-project` maintains `docs/product/vision.md`
+  and the `docs/architecture/` invariant spine; engineering rules live in this file's
+  **Non-negotiables**; the feature skills consult them
 
 Repo config the skills read:
 

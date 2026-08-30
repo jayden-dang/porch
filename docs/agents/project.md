@@ -2,8 +2,8 @@
 
 Written by `configure-repo`. Skills read this file for repo-specific **machine config** —
 commands, globs, paths — plus **posture** and **team** (below). Human-facing engineering
-guidelines (coding standards, naming, house rules) live in `docs/product/guidelines.md`;
-`plan-tasks` sources them from there.
+guidelines (coding standards, naming, house rules) live in `AGENTS.md`
+(**Non-negotiables**); `plan-tasks` sources them from there.
 
 ## Project posture
 
@@ -142,5 +142,5 @@ Consumed by `cut-release`. Ordered; do not reorder step 5.
 - ADRs: `docs/adr/`
 - Glossary: `CONTEXT.md`
 - Out-of-scope KB: `.out-of-scope/`
-- Engineering guidelines: `docs/product/guidelines.md`
+- Engineering guidelines: `AGENTS.md` (**Non-negotiables**)
 - Product vision / architecture spine: `docs/product/vision.md`, `docs/architecture/`

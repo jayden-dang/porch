@@ -41,6 +41,12 @@ now points here.
 - **ARCH-9** The porch-owned review quality engine is first-party; never vendor or wrap a
   third-party review CLI as that engine.
 - **ARCH-10** Crates are use-case slices, not technical layers; do not add a crate per layer.
+- **ARCH-11** Porch alone issues assurance outcomes; a producer's verdict is evidence, never an
+  approval.
+- **ARCH-12** The deterministic floor runs on every assurance run and is never substitutable by an
+  external judgment producer.
+- **ARCH-13** Durable authorization and reviewed-input binding precede any external forward, and
+  ambiguous external effects are reconciled before a retry.
 
 ## Domains
 
