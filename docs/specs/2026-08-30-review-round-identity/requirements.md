@@ -292,10 +292,20 @@ Files this feature touches, and what each must keep doing:
 **Story:** As a stakeholder, I want measurable quality targets for this feature, so that
 how-well is not left implicit.
 
-- **Performance:** **ROUND-7.1** WHEN a review round is opened THE SYSTEM SHALL add at most
-  one additional database transaction to the review phase — verified by a test asserting
-  the transaction count across a review phase. (No standing product-metric or reliability
-  doc exists; no latency number is invented.)
+- **Performance:** ~~**ROUND-7.1**~~ superseded by ROUND-7.4 through ROUND-7.6: durable open,
+  terminal recording, and bounded contention cannot satisfy one transaction bound on every
+  terminal path.
+- **Performance:** **ROUND-7.4** WHEN a review phase runs without history contention THE SYSTEM
+  SHALL add at most two committed write transactions beyond the pre-ROUND path: one durable
+  round-open transaction and one terminal-finalization transaction — verified by a test counting
+  committed write transactions on each terminal path.
+- **Performance:** **ROUND-7.5** WHEN finalization observes stale reconciliation history THE
+  SYSTEM SHALL attempt at most three additional write transactions, each leaving no durable
+  finalization when its revision check fails — verified by a test that mutates history between
+  phases.
+- **Performance:** **ROUND-7.6** IF the process dies after round open and before finalization
+  THEN THE SYSTEM SHALL use at most one later committed write transaction to reconcile that round
+  during startup — verified by a fault-injection test.
 - **Security:** **ROUND-7.2** THE SYSTEM SHALL write round records only within
   `$PORCH_HOME`, under the same ownership and permissions as the existing database —
   verified by an integration test asserting that no round-storage artifact is created
