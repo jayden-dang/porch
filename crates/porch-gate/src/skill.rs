@@ -1,6 +1,7 @@
 //! Best-effort install of the `/porch` agent skill into user skill dirs.
 //!
-//! Copies an embedded skill (from `docs/porch-agent.md`) for coding agents already
+//! Copies an embedded skill (`porch-agent.md` in this crate; keep in sync with
+//! `docs/porch-agent.md`) for coding agents already
 //! on PATH (`claude`, `codex`). Fail soft when agent home dirs are missing.
 
 use std::env;
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 /// Skill directory name under each agent's `skills/` root.
 pub const SKILL_NAME: &str = "porch";
 
-const AGENT_BODY: &str = include_str!("../../../docs/porch-agent.md");
+const AGENT_BODY: &str = include_str!("../porch-agent.md");
 
 /// One coding-agent binary → relative skills root under `$HOME`.
 const AGENT_TARGETS: &[(&str, &str)] = &[("claude", ".claude/skills"), ("codex", ".codex/skills")];
