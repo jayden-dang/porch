@@ -1,6 +1,7 @@
 //! Park-run TUI (additive to headless `porch agent`).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -10,8 +11,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use porch_gate::{
-    Event, RunSnapshot, get_finding_hunk, get_run, load_finding_notes, set_finding_note,
-    subscribe_events,
+    Event, RunSnapshot, get_finding_hunk, get_run, load_finding_notes, run_artifact_dir,
+    set_finding_note, subscribe_events,
 };
 use porch_run::{AgentResponse, agent_respond, sync_hint_for};
 use ratatui::backend::CrosstermBackend;
@@ -124,6 +125,19 @@ impl App {
         self.snapshot.status == "parked" && !self.working && self.note_editing.is_none()
     }
 
+    /// True when the parked step driving the run is `compose`.
+    #[must_use]
+    pub fn compose_parked(&self) -> bool {
+        self.snapshot.status == "parked"
+            && self
+                .snapshot
+                .steps
+                .iter()
+                .rev()
+                .find(|s| s.status == "parked")
+                .is_some_and(|s| s.step == "compose")
+    }
+
     /// Apply a fresh snapshot (e.g. after `stream_gap` + `get_run`).
     pub fn apply_snapshot(&mut self, snapshot: RunSnapshot) {
         let findings = parse_findings(&snapshot.findings);
@@ -190,17 +204,19 @@ impl App {
             }
             KeyCode::Char(' ') => self.toggle_selection(),
             KeyCode::Char('d') => self.toggle_detail(),
-            KeyCode::Char('n') if self.actions_enabled() => self.begin_note_edit(),
-            KeyCode::Char('a') if self.actions_enabled() => {
+            KeyCode::Char('n') if self.actions_enabled() && !self.compose_parked() => {
+                self.begin_note_edit();
+            }
+            KeyCode::Char('a') if self.actions_enabled() && !self.compose_parked() => {
                 self.spawn_respond(AgentResponse::Approve);
             }
             KeyCode::Char('s') if self.actions_enabled() => {
                 self.spawn_respond(AgentResponse::Skip);
             }
-            KeyCode::Char('f') if self.actions_enabled() => {
+            KeyCode::Char('f') if self.actions_enabled() && !self.compose_parked() => {
                 self.spawn_fix(false);
             }
-            KeyCode::Char('y') if self.actions_enabled() => {
+            KeyCode::Char('y') if self.actions_enabled() && !self.compose_parked() => {
                 self.spawn_fix(true);
             }
             KeyCode::Char('x') if self.actions_enabled() => {
@@ -389,8 +405,9 @@ impl App {
         let area = frame.area();
         let detail_h = if self.show_detail { 8u16 } else { 0 };
         let note_h = if self.note_editing.is_some() { 3u16 } else { 0 };
+        let pipeline_h = if self.compose_parked() { 7u16 } else { 5u16 };
         let [pipeline, findings, detail, note_bar, activity, footer] = Layout::vertical([
-            Constraint::Length(5),
+            Constraint::Length(pipeline_h),
             Constraint::Percentage(if self.show_detail { 30 } else { 45 }),
             Constraint::Length(detail_h),
             Constraint::Length(note_h),
@@ -447,7 +464,17 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("  ");
-        let pipeline_text = format!("branch {branch}  status {status}\n{phase_line}");
+        let mut pipeline_text = format!("branch {branch}  status {status}\n{phase_line}");
+        if self.compose_parked() {
+            let packet =
+                run_artifact_dir(&self.home, &self.snapshot.run_id).join("compose-packet.json");
+            let pr = self.snapshot.pr_url.as_deref().unwrap_or("(no pr_url)");
+            let _ = write!(
+                pipeline_text,
+                "\ncompose parked  pr {pr}\npacket {}",
+                packet.display()
+            );
+        }
         frame.render_widget(
             Paragraph::new(pipeline_text).block(
                 Block::default()
@@ -509,6 +536,8 @@ impl App {
 fn footer_keys(app: &App) -> &'static str {
     if app.note_editing.is_some() {
         "Enter save  Esc cancel"
+    } else if app.actions_enabled() && app.compose_parked() {
+        "s skip  x abort  q detach  (compose: agent respond --body-file; see packet)"
     } else if app.actions_enabled() {
         "a approve  f fix  y fix--yes  s skip  x abort  d detail  n note  q detach"
     } else if app.working {
@@ -774,6 +803,40 @@ mod tests {
         }
     }
 
+    fn compose_parked_snapshot() -> RunSnapshot {
+        let mut snap = parked_snapshot();
+        snap.pr_url = Some("https://example.com/pull/1".into());
+        snap.findings = serde_json::json!([]);
+        snap.steps = vec![
+            porch_gate::StepSnapshot {
+                step: "intent".into(),
+                status: "completed".into(),
+                error: None,
+            },
+            porch_gate::StepSnapshot {
+                step: "rebase".into(),
+                status: "completed".into(),
+                error: None,
+            },
+            porch_gate::StepSnapshot {
+                step: "review".into(),
+                status: "completed".into(),
+                error: None,
+            },
+            porch_gate::StepSnapshot {
+                step: "certify".into(),
+                status: "completed".into(),
+                error: None,
+            },
+            porch_gate::StepSnapshot {
+                step: "compose".into(),
+                status: "parked".into(),
+                error: None,
+            },
+        ];
+        snap
+    }
+
     #[test]
     fn parked_enables_actions_running_does_not() {
         let home = PathBuf::from("/tmp");
@@ -834,6 +897,28 @@ mod tests {
         assert!(
             s.contains("a approve") && s.contains("y fix--yes") && s.contains("n note"),
             "footer keys missing: {s}"
+        );
+    }
+
+    #[test]
+    fn compose_park_shows_skip_abort_and_packet_hint() {
+        let home = PathBuf::from("/tmp/porch-home");
+        let mut app = App::from_snapshot(compose_parked_snapshot(), &home, &home);
+        assert!(app.compose_parked());
+        assert!(app.actions_enabled());
+        let _ = app.handle_key(KeyCode::Char('a'));
+        assert!(!app.working, "approve must not fire on compose park");
+        let s = render_to_string(&mut app, 120, 28);
+        assert!(s.contains("compose parked"), "buffer={s}");
+        assert!(s.contains("https://example.com/pull/1"), "buffer={s}");
+        assert!(s.contains("compose-packet.json"), "buffer={s}");
+        assert!(
+            s.contains("s skip") && s.contains("x abort") && s.contains("--body-file"),
+            "compose footer missing: {s}"
+        );
+        assert!(
+            !s.contains("a approve") && !s.contains("y fix--yes"),
+            "review keys must not appear on compose park: {s}"
         );
     }
 
