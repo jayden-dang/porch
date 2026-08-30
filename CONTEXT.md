@@ -35,6 +35,12 @@ coding-agent turn; `porch-quality` is the first-party engine; OCR is legacy
 (`--engine ocr`).
 _Avoid_: "lint" — lint is a certification check, not review.
 
+**Finding**:
+One reviewed issue, with a stable id (`f0`, `f1`, …), a path, a severity, and an
+action. A finding is **blocking** when its severity is error or warning, or its
+action is ask-user; blocking findings park the run, info findings do not.
+_Avoid_: "comment" — a comment is the raw reviewer output a finding is mapped from.
+
 **Fixer**:
 The agent turn that acts on review findings. May resume a session; the reviewer
 may not. A rereview must never certify its own prescription.
@@ -61,9 +67,18 @@ the agent turn (`porch agent run --intent`).
 _Avoid_: "prompt", "goal"
 
 **Park**:
-Setting aside hunks of a change so the rest can proceed through the gate;
-`eject` is the escape hatch that returns the operator to a plain checkout.
-_Avoid_: "stash" — parking is porch state, not git stash.
+A run halting mid-pipeline to wait for an **Operator** decision: at `rebase` on a
+conflict (`fix` | `abort` only), or at `review` when the round carries blocking
+findings (`approve` | `skip` | `abort` | `fix`). `parked` is the run status while
+it waits; the response resumes or ends the run.
+_Avoid_: "stash", "pause". Never "setting aside hunks" — porch has no hunk-level
+splitting; the TUI's hunk view only shows a finding's diff snippet.
+
+**Eject**:
+The escape hatch back to a plain checkout: removes the `porch` remote and
+neutralizes the bare hooks. `--purge` also deletes this repo's bare, worktrees,
+run artifacts, and DB row, leaving other repos under `$PORCH_HOME` untouched.
+_Avoid_: "uninstall" — that is the daemon-service verb (`porch daemon uninstall`).
 
 **Trusted SHA**:
 The default-branch commit that code-executing config is loaded from. Never the
@@ -71,9 +86,22 @@ pushed SHA. Fetch failure fails closed.
 _Avoid_: "HEAD", "current config"
 
 **Slice**:
-A crate in the workspace that owns a use case (`porch-gate`, `porch-run`,
-`porch-deliver`), not a technical layer.
+A crate that owns a use case, not a technical layer: `porch-gate`, `porch-run`,
+`porch-review`, `porch-quality`, `porch-deliver`, `porch-agent`, and the `porch`
+operator binary. `porch-git` is the one deliberate exception — shared plumbing,
+the only place the gate shells out to `git`, and not a slice.
 _Avoid_: "module", "layer"
+
+**Operator**:
+The person at the working checkout who pushes to `porch` and answers parks,
+through the TUI or the CLI. Holds the decision; never the Consumer repo itself.
+_Avoid_: "user", "developer"
+
+**Agent**:
+A coding agent driving a run headlessly through `porch agent`
+(run / status / respond / sync) — same authority as the Operator, no TUI.
+Not the reviewer or **Fixer** turns porch invokes inside a run.
+_Avoid_: "bot", "automation"
 
 **Consumer**:
 A repository that uses porch as its inner gate. First dogfood consumers are
@@ -83,7 +111,10 @@ _Avoid_: "client", "user" — a user is a person.
 ## Relationships
 
 - A **Run** executes in exactly one **Worktree** and is scoped to one pushed SHA
-- A **Run** passes through **Admit** → rebase → **Review** → **Certify** → **Deliver**
+- **Admit** gates entry; the run's phases are intent → rebase → **Review** →
+  **Certify** → **Deliver**
+- A **Park** interrupts a run at `rebase` or `review`; only an **Operator** or an
+  **Agent** response clears it
 - A **Review** produces findings; a **Fixer** consumes them
 - A **Run** holds **Custody** of a ref; custody is what makes a force-push refusable
 - A **Consumer** repo has one porch remote and keeps its own CI
@@ -93,5 +124,8 @@ _Avoid_: "client", "user" — a user is a person.
 - **review** vs **certify** — both were called "checks" early on. Review is
   judgment (findings, possibly agent-authored); certify is deterministic local
   commands. They are separate stages and separate crates.
+- **agent** is overloaded three ways in the code: the `porch agent` CLI (an
+  **Agent** driving a run), the `porch-agent` crate (the **Fixer** adapter), and
+  `--engine agent` (the reviewer turn). The glossary term means only the first.
 - **lease** vs **custody** — `lease` is reserved for the `--force-with-lease`
   git mechanism; **custody** is porch's own claim on the ref.
