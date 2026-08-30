@@ -12,15 +12,20 @@ Local implementation notes (gitignored): **`.research/`**. Read that directory b
 
 ## Non-negotiables
 
-- `origin` is never rewritten. Consent is `git push porch`.
-- Git operations for the gate **shell out to `git`**. Do not use `libgit2` / `git2` for worktrees, hooks, force-with-lease, or credentialed fetch/push.
-- Reviewer turns are **session-free**. The fixer may resume a session. A rereview must not certify its own prescription.
-- Code-executing config (`commands.*`, agent selection, review rules that change what runs) is loaded from the **trusted default-branch SHA**, never from the pushed SHA. Fail closed on fetch failure.
-- Force-push is `--force-with-lease=<ref>:<observed-sha>` and refuses when live remote commits were not incorporated. Unverifiable safety facts fail closed.
-- Review auto-fix default is **off**. Findings that would extend scope (schema, durable state, on-chain, new subsystem) are `ask-user`.
-- Deliver babysits **PR checks by allowlist only**. Never rerun deploy, on-chain publish, or spend-money E2E.
-- Reviewer turns are session-free; do not collapse reviewer and fixer. **M10+** default reviewer is a coding-agent turn (JSON findings), not the OCR product. Do **not** start a porch-owned grouping/relocation/language-rule engine until **M16** (explicit milestone, after the workflow). Do not vendor or wrap a third-party review CLI as that engine.
-- Day-1 forges: **GitHub only**. Day-1 agents: **ACP + one native CLI**. Do not add adapter surface because it is easy.
+The invariant spine lives in **[docs/architecture/INDEX.md](docs/architecture/INDEX.md)**
+as **ARCH-1 … ARCH-10** — `origin` never rewritten, git via the CLI only, session-free
+reviewer turns, config from the trusted default-branch SHA, fail-closed
+force-with-lease, auto-fix off, allowlisted check reruns, bounded adapter surface,
+first-party quality engine, use-case slices.
+
+They are **not to be silently reopened in a coding session.** A `design.md` that relies
+on one cites it as `Respects: ARCH-N`; `audit-trace` checks the citation resolves and
+`inspect-invariants` judges whether the diff conforms. Changing an invariant is a
+deliberate act with an ADR under `docs/adr/`.
+
+Engineering rules that are not invariants — English-only, no network in unit tests, no
+vendored third-party source — live in
+**[docs/product/guidelines.md](docs/product/guidelines.md)**.
 
 ## Layout
 
@@ -48,6 +53,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+Canonical, agent-read verify commands (with `--workspace`, which these omit) live in
+**[docs/agents/project.md](docs/agents/project.md)**. `default-members = ["crates/porch"]`,
+so a bare `cargo test` skips `porch-gate`, `porch-git`, and `porch-quality`.
+
 Do not run real LLM / review-CLI network / `gh` network in unit tests. Use PATH fakes and fixtures under `tests/fixtures/`.
 
 ## Dogfood
@@ -62,3 +71,28 @@ Consumers: **mailgate** (first) and **klynt** (second). Porch must help those mo
 ## Language
 
 Source, comments, commit messages, and docs in this repo are **English**.
+
+## Agent skills
+
+This repo is configured for a spec-driven skill set.
+
+- Feature flow: `frame-change` → `specify-behavior` → `design-solution` →
+  `plan-tasks` → `build-in-waves`
+- Vague ask you want turned into a prompt for a fresh session: `/forge-prompt` (user-run)
+- Bug on-ramp: `root-cause` (clear unexpected behavior first, then a guarded fix);
+  deployed env: `debug-remote` then `root-cause`; telemetry readiness:
+  `assess-observability`
+- Capture a conversation/spec/idea into tracker issues: `/publish-issues` (user-run)
+- Incoming issues and PRs: `/triage` (user-run)
+- Traceability check: the docs-only `audit-trace` skill — run by `prove-claim` and `cut-release`;
+  keep it clean
+- Project docs (layer enabled): `/define-project` maintains
+  `docs/product/vision.md`, the `docs/architecture/` invariant spine, and
+  `docs/product/guidelines.md`; the feature skills consult them
+
+Repo config the skills read:
+
+- verify commands, release steps, Remote environments: `docs/agents/project.md`
+- Team composition (roster, ownership notes, workflow band): `docs/agents/project.md` (`## Team`)
+- Issue tracker operations: `docs/agents/issue-tracker.md`
+- Triage label mapping: `docs/agents/triage-labels.md`
