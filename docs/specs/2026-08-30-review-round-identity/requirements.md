@@ -22,11 +22,9 @@ reviews it, so that every attempted judgment is on the record even when the atte
   as `running` and its assurance completion as `pending`.
 - **ROUND-1.5** THE SYSTEM SHALL record, as the round's input binding, the `from_sha` and
   `to_sha` actually passed to the producer together with the exact reviewed inventory.
-- **ROUND-1.6** THE SYSTEM SHALL record, as the round's review-context binding, the
-  intent, the path-instructions digest, the `trusted_config_sha`, the protocol schema
-  version, the fingerprint version, and the producer descriptor.
-- **ROUND-1.7** WHERE the producer's version cannot be observed THE SYSTEM SHALL record it
-  as unavailable with a reason, rather than omitting the field or substituting a value.
+- ~~**ROUND-1.6**~~ superseded by ROUND-1.25 and ROUND-1.26: the producer descriptor
+  belongs to a producer invocation, not to the round binding.
+- ~~**ROUND-1.7**~~ superseded by ROUND-1.27: restated per producer invocation.
 - **ROUND-1.8** THE SYSTEM SHALL record, for each text or file review-context element, its
   source state as `absent`, `present`, or `unreadable` with a reason, independently of that
   element's effective digest.
@@ -70,6 +68,24 @@ reviews it, so that every attempted judgment is on the record even when the atte
 - **ROUND-1.24** WHERE two invocations differ only in `selection_source` or
   `declared_engine_kind` THE SYSTEM SHALL NOT treat that difference as invalidating
   descriptor equivalence.
+- **ROUND-1.25** THE SYSTEM SHALL record, as the round's review-context binding, the
+  source states and per-producer-or-layer applicability digests of the intent and path
+  instructions, the `trusted_config_sha`, the protocol schema version, and the fingerprint
+  version.
+- **ROUND-1.26** THE SYSTEM SHALL record a producer descriptor for each producer invocation
+  within a round.
+- **ROUND-1.27** WHERE a producer invocation's version cannot be observed THE SYSTEM SHALL
+  record it as unavailable with a reason, rather than omitting the field or substituting a
+  value.
+- **ROUND-1.28** IF a content digest matches a stored blob whose byte length or bytes differ
+  THEN THE SYSTEM SHALL fail closed rather than reuse that blob.
+- **ROUND-1.29** WHEN retained round data is removed THE SYSTEM SHALL commit the database
+  deletion before removing the porch-owned git ref.
+- **ROUND-1.30** THE SYSTEM SHALL NOT finalize a round using reconciliation history that
+  changed after that history was read.
+- **ROUND-1.31** WHEN comparing a recorded round for applicability or reuse THE SYSTEM
+  SHALL require the current set of required producer invocations to have a one-to-one
+  descriptor-equivalent correspondence with the set recorded for that round.
 
 ## 2. A finalized round is all-or-nothing
 
