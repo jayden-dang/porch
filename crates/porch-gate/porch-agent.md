@@ -56,11 +56,16 @@ Default: latest **parked** run for the cwd repo (`porch.repo-id` / worktree matc
 }
 ```
 
+When `phase` is `"compose"`, status also includes `pr_url`, `compose_packet_path`
+(`$PORCH_HOME/runs/<run_id>/compose-packet.json`), and `allowed_actions`
+`["respond","skip","abort"]`.
+
 On error: `{"error":"…"}` or `{"error":"…","code":"usage"}`.
 
 ## Respond
 
 ```sh
+# review park
 porch agent respond approve
 porch agent respond skip
 porch agent respond abort
@@ -68,18 +73,32 @@ porch agent respond fix
 porch agent respond fix --findings f0,f1
 porch agent respond fix --yes
 porch agent respond fix --findings f0 --yes --run-id <ULID>
+
+# compose park (phase=compose) — Agent authors PR prose from the packet
+porch agent respond --body-file ./pr-body.md
+porch agent respond --body-file ./pr-body.md --title "ship the API drift fix"
+porch agent respond skip
+porch agent respond abort
 ```
 
-| Verb | Effect |
-|---|---|
-| `approve` | Accept current findings; continue certify → deliver. Writes `review_approved_head_sha`. |
-| `skip` | Skip remaining review gate for this run; does **not** write `review_approved_head_sha`. |
-| `abort` | Fail/cancel the run. |
-| `fix` | Spawn native fixer (`PORCH_FIXER_BIN`), then **session-free** rereview. |
+| Verb / form | Phase | Effect |
+|---|---|---|
+| `approve` | review | Accept current findings; continue certify → deliver. Writes `review_approved_head_sha`. |
+| `skip` | review | Skip remaining review gate for this run; does **not** write `review_approved_head_sha`. |
+| `skip` | compose | Accept the scaffold PR body; complete deliver (does **not** skip certify/deliver). |
+| `abort` | rebase / review / compose | Fail/cancel the run. Compose abort leaves the GitHub PR open (no `gh pr close`). |
+| `fix` | review / rebase | Spawn native fixer (`PORCH_FIXER_BIN`), then **session-free** rereview (or rebase retry). |
+| `--body-file` [+ `--title`] | compose | Merge Agent prose into porch-managed PR regions; complete deliver. |
 
-`--findings` and `--yes` are only valid with `fix`. `--findings` defaults to all blocking ids. `--yes` means **one** fix round then approve remaining (standing consent; never the default). There is **no** default yolo on the whole gate — review auto-fix stays off (D6). Unattended agents may use `respond fix --yes` for a single round only.
+`--findings` and `--yes` are only valid with `fix`. `--findings` defaults to all blocking ids. `--yes` means **one** fix round then approve remaining (standing consent; never the default). There is **no** default yolo on the whole gate — review auto-fix stays off (D6). Unattended agents may use `respond fix --yes` for a single round only. Do not combine `--body-file` with approve/skip/abort/fix.
 
 Stdout after respond is the same shape as `status` for the updated run.
+
+Phase rules (rebase/review verbs unchanged):
+
+- Rebase parks (`phase: "rebase"`) accept **`fix` \| `abort` only** (not approve/skip).
+- Review parks accept **`approve` \| `skip` \| `abort` \| `fix`** as above.
+- Compose parks (`phase: "compose"`) accept **`--body-file` \| `skip` \| `abort`** (not approve/fix). Read the packet at `compose_packet_path` before writing prose.
 
 ## Sync / custody
 
@@ -91,12 +110,13 @@ porch agent sync --recover
 
 JSON describes whether the author’s branch is behind / ahead / equal relative to the pipeline tip (and any `refs/porch/recover/<run>`). `fetch_hint` prefers `porch agent sync --recover` / the recovery ref when recoverable (`porch/{branch}` may still be the submit SHA); otherwise `git fetch porch && git merge --ff-only porch/<branch>`. `--recover` fast-forwards the local branch from a recorded recovery tip when the local HEAD is an ancestor — **never rewrites `origin`**. Divergent local history: refuse and keep the recovery ref.
 
-Rebase parks (`phase: "rebase"`) accept **`fix` \| `abort` only** (not approve/skip).
-
 ## Suggested loop
 
 1. `porch agent run --intent "…" --wait` (or `git push porch` then `porch agent run --wait`)
-2. If `status=parked`: inspect findings → `respond approve|fix|skip|abort` (optional `fix --yes` for one unattended round)
+2. If `status=parked`:
+   - `phase=review`: inspect findings → `respond approve|fix|skip|abort` (optional `fix --yes` for one unattended round)
+   - `phase=compose`: read `compose_packet_path` → `respond --body-file …` (or `skip` / `abort`)
+   - `phase=rebase`: `respond fix|abort`
 3. Re-`run --wait` / `status` until completed or failed
 4. `porch agent sync` if the author branch lags the pipeline tip
 5. **Stop.** Do not merge the PR. Do not babysit deploy workflows.
