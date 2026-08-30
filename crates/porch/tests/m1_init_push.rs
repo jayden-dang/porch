@@ -1,3 +1,5 @@
+//! M1: init + push into a dead gate.
+
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};

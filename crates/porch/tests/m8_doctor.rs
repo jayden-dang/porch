@@ -1,3 +1,5 @@
+//! M8: `porch doctor` PATH / home / daemon report.
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;

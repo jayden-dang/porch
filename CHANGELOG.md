@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2 — 2026-08-30
+
+`cargo install porch` ships **both** `porch` and `porch-quality`. Briefing docs in `docs/` removed except [install.md](docs/install.md) (rewrite pending).
+
 ## 0.2.1 — 2026-08-30
 
 Publish the slice graph to crates.io so `cargo install porch` works. Path+version workspace deps. Same operator loop as 0.2.0.
@@ -11,7 +15,7 @@ Tagged release of the M10–M16 operator loop. Git/tag install only (slices stay
 - **Review:** default is a session-free coding-agent turn; optional `porch-quality` engine; OCR is legacy (`--engine ocr`).
 - **Install:** `install.sh` installs `porch` and `porch-quality`; one-liner from the `v0.2.0` tag.
 - **Operator:** setup TUI, skill on `init`, park TUI hunks, `eject`, rebase-park, `rerun`, `agent sync`, `agent run --intent --wait`.
-- **Docs:** [docs/install.md](docs/install.md), [docs/10-operator-checklist.md](docs/10-operator-checklist.md).
+- **Docs:** [docs/install.md](docs/install.md).
 
 ## 0.1.0 — 2026-08-29
 

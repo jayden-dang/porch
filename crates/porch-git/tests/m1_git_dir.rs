@@ -1,3 +1,5 @@
+//! M1: git CLI wrapper (`--git-dir` absolute).
+
 use std::process::Command;
 
 use porch_git::{

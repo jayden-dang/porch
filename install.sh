@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Install porch + porch-quality onto PATH (macOS / Linux).
+# Install porch (and porch-quality) onto PATH (macOS / Linux).
 #
-# One-liner (tagged release):
-#   cargo install porch --locked && cargo install porch-quality --locked
-#   curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.1/install.sh | bash
+# Preferred:
+#   cargo install porch --locked
 #
-# From a clone of this repo:
+# One-liner from git:
+#   curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.2/install.sh | bash
+#
+# From a clone:
 #   ./install.sh
 #
 # Default bindir: $CARGO_HOME/bin (usually ~/.cargo/bin).
 # Override with PORCH_PREFIX=/path/to/bin.
-# Pin a git ref with PORCH_GIT_REF=v0.2.1 (used when not run from a clone).
-# Dry-run (no writes): PORCH_INSTALL_DRY_RUN=1 ./install.sh
-#
-# Prefer: cargo install porch --locked && cargo install porch-quality --locked
+# Pin a git ref with PORCH_GIT_REF=v0.2.2 (when not run from a clone).
+# Dry-run: PORCH_INSTALL_DRY_RUN=1 ./install.sh
 
 set -euo pipefail
 
 PORCH_GIT_URL="${PORCH_GIT_URL:-https://github.com/jayden-dang/porch}"
-PORCH_GIT_REF="${PORCH_GIT_REF:-v0.2.1}"
+PORCH_GIT_REF="${PORCH_GIT_REF:-v0.2.2}"
 
 script_dir=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -46,10 +46,8 @@ if dry_run; then
   log "dry-run: would install porch + porch-quality to ${PREFIX}"
   if [[ "${in_clone}" -eq 1 ]]; then
     log "dry-run: preferred: cargo install --path crates/porch --locked --root ${INSTALL_ROOT}"
-    log "dry-run: preferred: cargo install --path crates/porch-quality --locked --root ${INSTALL_ROOT}"
   else
     log "dry-run: cargo install --git ${PORCH_GIT_URL} --tag ${PORCH_GIT_REF} --locked --force --root ${INSTALL_ROOT} porch"
-    log "dry-run: cargo install --git ${PORCH_GIT_URL} --tag ${PORCH_GIT_REF} --locked --force --root ${INSTALL_ROOT} porch-quality"
   fi
   log "dry-run: fallback: copy target/{release,debug}/porch{,-quality} into ${PREFIX}"
   log "dry-run: ensure ${PREFIX} (typically ~/.cargo/bin) is on PATH"
@@ -71,12 +69,9 @@ if command -v cargo >/dev/null 2>&1; then
   if [[ "${in_clone}" -eq 1 ]]; then
     log "building with cargo install --path crates/porch --locked --root ${INSTALL_ROOT}"
     cargo install --path "${script_dir}/crates/porch" --locked --force --root "${INSTALL_ROOT}"
-    log "building with cargo install --path crates/porch-quality --locked --root ${INSTALL_ROOT}"
-    cargo install --path "${script_dir}/crates/porch-quality" --locked --force --root "${INSTALL_ROOT}"
   else
-    log "building with cargo install --git ${PORCH_GIT_URL} --tag ${PORCH_GIT_REF} --locked"
+    log "building with cargo install --git ${PORCH_GIT_URL} --tag ${PORCH_GIT_REF} --locked porch"
     cargo install --git "${PORCH_GIT_URL}" --tag "${PORCH_GIT_REF}" --locked --force --root "${INSTALL_ROOT}" porch
-    cargo install --git "${PORCH_GIT_URL}" --tag "${PORCH_GIT_REF}" --locked --force --root "${INSTALL_ROOT}" porch-quality
   fi
   installed="${PREFIX}/porch"
   quality_installed="${PREFIX}/porch-quality"
@@ -88,7 +83,7 @@ elif [[ "${in_clone}" -eq 1 && -x "${script_dir}/target/release/porch" ]]; then
     quality_installed="${PREFIX}/porch-quality"
   fi
 elif [[ "${in_clone}" -eq 1 && -x "${script_dir}/target/debug/porch" ]]; then
-  log "note: installing debug binary from target/debug/porch (prefer cargo install or target/release)"
+  log "note: installing debug binary from target/debug (prefer cargo install or target/release)"
   install -m 755 "${script_dir}/target/debug/porch" "${PREFIX}/porch"
   installed="${PREFIX}/porch"
   if [[ -x "${script_dir}/target/debug/porch-quality" ]]; then
@@ -110,7 +105,7 @@ case ":${PATH}:" in
 esac
 
 log "installed: ${installed}"
-if [[ -n "${quality_installed}" ]]; then
+if [[ -x "${quality_installed}" ]]; then
   log "installed: ${quality_installed}"
 fi
 if [[ -x "${installed}" ]]; then

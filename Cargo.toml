@@ -40,6 +40,7 @@ porch-review = { version = "0.2.1", path = "crates/porch-review" }
 porch-agent = { version = "0.2.1", path = "crates/porch-agent" }
 porch-deliver = { version = "0.2.1", path = "crates/porch-deliver" }
 porch-run = { version = "0.2.1", path = "crates/porch-run" }
+porch-quality = { version = "0.2.1", path = "crates/porch-quality" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
+use predicates::str as pred_str;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -202,4 +203,14 @@ fn porch_review_accepts_quality_json_shape() {
     assert_eq!(out.findings.len(), 1);
     porch_review::assert_coverage(&["a.rs".into(), "Cargo.lock".into()], &out.covered_files)
         .unwrap();
+}
+
+#[test]
+fn cargo_install_porch_package_includes_quality_bin() {
+    Command::cargo_bin("porch-quality")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(pred_str::contains("--from"));
 }

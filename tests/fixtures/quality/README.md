@@ -3,7 +3,7 @@
 Start of an eval corpus for the porch-owned quality engine. Unit tests under
 `crates/porch-quality` (and setup wiring in `crates/porch/tests/m16_quality.rs`)
 assert the same behaviors on synthetic git ranges — no live LLM. These dirs are
-the named corpus from [`docs/11-review-quality-brief.md`](../../../docs/11-review-quality-brief.md).
+the named corpus for the porch-owned quality engine.
 
 | Dir | Expectation |
 |---|---|

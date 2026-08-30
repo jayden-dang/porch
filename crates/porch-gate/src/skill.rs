@@ -1,7 +1,6 @@
 //! Best-effort install of the `/porch` agent skill into user skill dirs.
 //!
-//! Copies an embedded skill (`porch-agent.md` in this crate; keep in sync with
-//! `docs/porch-agent.md`) for coding agents already
+//! Copies an embedded skill (`porch-agent.md` in this crate) for coding agents already
 //! on PATH (`claude`, `codex`). Fail soft when agent home dirs are missing.
 
 use std::env;

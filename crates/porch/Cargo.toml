@@ -1,6 +1,6 @@
 [package]
 name = "porch"
-version.workspace = true
+version = "0.2.2"
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
@@ -17,11 +17,16 @@ exclude = ["/target/", "/.research/", "/.skills/", "/.remember/"]
 name = "porch"
 path = "src/main.rs"
 
+[[bin]]
+name = "porch-quality"
+path = "src/bin/porch_quality.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 porch-agent.workspace = true
 porch-gate.workspace = true
+porch-quality.workspace = true
 porch-review.workspace = true
 porch-run.workspace = true
 ratatui.workspace = true

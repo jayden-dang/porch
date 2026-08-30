@@ -1,3 +1,5 @@
+//! M1: init, hooks, notify-push run rows.
+
 use std::process::Command;
 
 use porch_gate::{Db, InitOptions, init, notify_push, repo_id_for};
