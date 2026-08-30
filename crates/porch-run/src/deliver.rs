@@ -475,6 +475,9 @@ fn apply_compose_respond(
     }
 
     let trusted = load_trusted_deliver(db, &run.id, bare, default_branch)?;
+    // Compose + deliver steps resolve before allowlist watch.
+    db.insert_step_result(&run.id, "compose", "completed", Some("compose=agent"))?;
+    db.insert_step_result(&run.id, "deliver", "completed", Some("compose=agent"))?;
     maybe_watch(
         &bin,
         timeout,
@@ -483,8 +486,6 @@ fn apply_compose_respond(
         &trusted.deliver_github.watch_checks,
         None,
     )?;
-    db.insert_step_result(&run.id, "compose", "completed", Some("compose=agent"))?;
-    db.insert_step_result(&run.id, "deliver", "completed", Some("compose=agent"))?;
     db.set_run_status(&run.id, "completed", None)?;
     if let Some(hub) = event_hub() {
         hub.publish_state(&run.id);
@@ -525,6 +526,9 @@ fn apply_compose_skip(
     edit_pr_body(&bin, timeout, wt, pr.number, &merged)?;
 
     let trusted = load_trusted_deliver(db, &run.id, bare, default_branch)?;
+    // Compose + deliver steps resolve before allowlist watch.
+    db.insert_step_result(&run.id, "compose", "skipped", Some("compose=scaffold"))?;
+    db.insert_step_result(&run.id, "deliver", "completed", Some("compose=scaffold"))?;
     maybe_watch(
         &bin,
         timeout,
@@ -533,8 +537,6 @@ fn apply_compose_skip(
         &trusted.deliver_github.watch_checks,
         None,
     )?;
-    db.insert_step_result(&run.id, "compose", "skipped", Some("compose=scaffold"))?;
-    db.insert_step_result(&run.id, "deliver", "completed", Some("compose=scaffold"))?;
     db.set_run_status(&run.id, "completed", None)?;
     if let Some(hub) = event_hub() {
         hub.publish_state(&run.id);

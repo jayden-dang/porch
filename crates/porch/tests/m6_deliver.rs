@@ -362,6 +362,23 @@ fn origin_branch_sha(origin: &Path, branch: &str) -> Option<String> {
     }
 }
 
+fn compose_skip(s: &Setup, run_id: &str, gh_mode: &str) -> std::process::Output {
+    Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&s.work)
+        .env("PORCH_HOME", &s.home)
+        .env(REVIEW_BIN_ENV, &s.fake_review)
+        .env(GH_BIN_ENV, &s.fake_gh)
+        .env("PORCH_FAKE_REVIEW_MODE", "clean")
+        .env("PORCH_FAKE_GH_MODE", gh_mode)
+        .env("PATH", &s.path)
+        .env("PORCH_DELIVER_CHECK_TIMEOUT_SECS", "3")
+        .env("PORCH_DELIVER_CHECK_POLL_SECS", "1")
+        .args(["agent", "respond", "skip", "--run-id", run_id])
+        .output()
+        .unwrap()
+}
+
 fn gh_argv_log(home: &Path) -> String {
     std::fs::read_to_string(home.join("gh-argv.log")).unwrap_or_default()
 }
@@ -494,7 +511,6 @@ fn find_existing_pr_edits_not_creates() {
 }
 
 #[test]
-#[ignore = "PRCMP Task 5/6: compose resolve required"]
 fn trusted_watch_checks_ignores_hostile_and_never_reruns() {
     let trusted = r"
 deliver:
@@ -522,12 +538,21 @@ deliver:
 
     let db = Db::open(&s.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&s.work);
-    let run = wait_status(
+    let parked = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(45),
     );
+    assert_eq!(parked.status, "parked", "err={:?}", parked.error);
+    let out = compose_skip(&s, &parked.id, "lint_ok");
+    assert!(
+        out.status.success(),
+        "compose skip failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run = db.run_by_id(&parked.id).unwrap().unwrap();
     assert_eq!(run.status, "completed", "err={:?}", run.error);
     let log = gh_argv_log(&s.home);
     assert!(log.contains("pr checks"), "expected checks poll: {log}");
@@ -539,7 +564,6 @@ deliver:
 }
 
 #[test]
-#[ignore = "PRCMP Task 5/6: compose resolve required"]
 fn non_empty_allowlist_lint_fail_after_push_and_pr() {
     let trusted = r"
 deliver:
@@ -553,17 +577,34 @@ deliver:
 
     let db = Db::open(&s.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&s.work);
-    let run = wait_status(
+    let parked = wait_status(
         &db,
         &repo_id,
-        &["failed", "completed"],
+        &["parked", "failed"],
         Duration::from_secs(45),
     );
+    assert_eq!(parked.status, "parked", "err={:?}", parked.error);
+    let out = compose_skip(&s, &parked.id, "lint_fail");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "watch fail should fail compose skip; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run = db.run_by_id(&parked.id).unwrap().unwrap();
     assert_eq!(run.status, "failed", "err={:?}", run.error);
     let steps = db.step_results_for_run(&run.id).unwrap();
+    // Compose resolves before watch; deliver step is completed then run fails on watch.
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("skipped"),
+        "steps={steps:?}"
+    );
     assert_eq!(
         last_step(&steps, "deliver").map(|s| s.status.as_str()),
-        Some("failed")
+        Some("completed"),
+        "steps={steps:?}"
     );
     // Push+PR then fail watch.
     assert!(
@@ -572,6 +613,7 @@ deliver:
     );
     assert!(run.pr_url.is_some(), "PR should exist before watch fail");
     let log = gh_argv_log(&s.home);
+    assert!(log.contains("pr checks"), "expected watch: {log}");
     assert!(!log.contains("run rerun"), "{log}");
 }
 
@@ -685,7 +727,7 @@ fn gh_missing_fails_before_push() {
 }
 
 #[test]
-#[ignore = "PRCMP Task 5/6: compose resolve required"]
+#[ignore = "watch runs in compose resume (agent CLI), not daemon inflight cancel"]
 fn supersede_during_check_watch_cancels_not_fails() {
     let trusted = r"
 deliver:

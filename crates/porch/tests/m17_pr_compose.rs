@@ -212,8 +212,16 @@ case "$CMD" in
     exit 0
     ;;
   checks)
-    printf '[{"name":"lint","state":"success","bucket":"pass"}]\n'
-    exit 0
+    case "$MODE" in
+      lint_fail)
+        printf '[{"name":"lint","state":"failure","bucket":"fail"}]\n'
+        exit 1
+        ;;
+      *)
+        printf '[{"name":"lint","state":"success","bucket":"pass"}]\n'
+        exit 0
+        ;;
+    esac
     ;;
   *)
     echo "fake-gh: unhandled args: $*" >&2
@@ -493,6 +501,96 @@ deliver:
         !log.contains("pr checks"),
         "watch must wait until compose resolves: {log}"
     );
+
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn compose_skip_with_watch_checks_babysits_allowlist() {
+    let trusted = r"
+deliver:
+  github:
+    watch_checks: [lint]
+    rerun_transient: 0
+";
+    let s = setup(Some(trusted));
+    let run = park_compose_run(&s, "feat-watch-skip", Some("watch after compose"));
+
+    let log_parked = gh_argv_log(&s.home);
+    assert!(
+        !log_parked.contains("pr checks"),
+        "no watch while parked: {log_parked}"
+    );
+
+    agent_cmd(&s)
+        .env("PORCH_DELIVER_CHECK_TIMEOUT_SECS", "3")
+        .env("PORCH_DELIVER_CHECK_POLL_SECS", "1")
+        .args(["agent", "respond", "skip", "--run-id", &run.id])
+        .assert()
+        .success();
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("skipped"),
+        "steps={steps:?}"
+    );
+    assert_eq!(
+        last_step(&steps, "deliver").map(|s| s.status.as_str()),
+        Some("completed"),
+        "steps={steps:?}"
+    );
+    let log = gh_argv_log(&s.home);
+    assert!(log.contains("pr checks"), "expected allowlist watch: {log}");
+    assert!(!log.contains("run rerun"), "must never gh run rerun: {log}");
+
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn compose_skip_watch_fail_leaves_compose_resolved() {
+    let trusted = r"
+deliver:
+  github:
+    watch_checks: [lint]
+";
+    let s = setup(Some(trusted));
+    let run = park_compose_run(&s, "feat-watch-fail", None);
+
+    let out = agent_cmd(&s)
+        .env("PORCH_FAKE_GH_MODE", "lint_fail")
+        .env("PORCH_DELIVER_CHECK_TIMEOUT_SECS", "3")
+        .env("PORCH_DELIVER_CHECK_POLL_SECS", "1")
+        .args(["agent", "respond", "skip", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "watch fail should fail agent respond; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "failed", "err={:?}", run.error);
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("skipped"),
+        "compose must resolve before watch fail; steps={steps:?}"
+    );
+    assert_eq!(
+        last_step(&steps, "deliver").map(|s| s.status.as_str()),
+        Some("completed"),
+        "deliver step resolves before watch; steps={steps:?}"
+    );
+    let log = gh_argv_log(&s.home);
+    assert!(log.contains("pr checks"), "expected watch attempt: {log}");
+    assert!(!log.contains("run rerun"), "{log}");
 
     kill_daemon(&s.home);
 }
