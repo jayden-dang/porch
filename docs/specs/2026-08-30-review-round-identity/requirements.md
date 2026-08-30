@@ -129,6 +129,13 @@ trail never has to be inferred and an unfinished judgment never speaks for a fin
   not finalized, or whose coverage fell short of the required states.
 - **ROUND-4.13** WHEN no applicable round exists for the current change THE SYSTEM SHALL
   require a new round before that change can be authorized.
+- **ROUND-4.14** WHERE a producer version is recorded as unavailable THE SYSTEM SHALL NOT
+  treat that producer descriptor as establishing equivalence with a descriptor from another
+  review invocation for applicability or reuse.
+
+_Note (non-normative): ROUND-4.14 governs equivalence only. An unavailable producer version
+does not by itself make the current round `incomplete` — that policy is a MILE-6 decision
+(see Out of Scope)._
 
 ## 5. Records written before this feature stay usable
 
