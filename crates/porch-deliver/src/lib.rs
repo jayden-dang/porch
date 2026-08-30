@@ -32,6 +32,46 @@ pub const MANAGED_BEGIN: &str = "<!-- porch-managed:begin -->";
 /// End of the porch-owned visible body region (attestation stays outside).
 pub const MANAGED_END: &str = "<!-- porch-managed:end -->";
 
+/// Fixed-path PR template candidates (trusted tree), in pick order.
+const PR_TEMPLATE_PATHS: &[&str] = &[
+    ".github/pull_request_template.md",
+    "pull_request_template.md",
+    "docs/pull_request_template.md",
+];
+
+/// Multi-template directory (lexicographic first `*.md` after fixed paths).
+const PR_TEMPLATE_DIR: &str = ".github/PULL_REQUEST_TEMPLATE";
+
+/// Which template source won when loading from the trusted SHA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateSource {
+    /// Consumer repo template blob at a trusted-tree path.
+    RepoTemplate,
+    /// No readable template at the trusted SHA — callers use porch default.
+    PorchDefault,
+}
+
+impl TemplateSource {
+    /// Packet / status string (`repo_template` | `porch_default`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RepoTemplate => "repo_template",
+            Self::PorchDefault => "porch_default",
+        }
+    }
+}
+
+/// Result of [`load_pr_template`]: bytes plus which path/source won.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateBytes {
+    /// Raw template file bytes when [`TemplateSource::RepoTemplate`].
+    pub bytes: Option<Vec<u8>>,
+    pub source: TemplateSource,
+    /// Trusted-tree path that won, or `None` for porch default.
+    pub path: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(
@@ -429,6 +469,68 @@ fn finish_body(visible: &str, attestation: &Attestation) -> String {
         body.push_str(&comment);
     }
     redact_home_paths(&body)
+}
+
+/// Load PR template bytes from the trusted default-branch SHA only.
+///
+/// Pick order: first existing among [`PR_TEMPLATE_PATHS`], then the lexicographically
+/// first `*.md` under [`PR_TEMPLATE_DIR`]. Never reads the feature tip alone.
+///
+/// # Errors
+///
+/// Returns [`Error::Msg`] when git cannot read the trusted commit or a chosen blob.
+pub fn load_pr_template(
+    bare: &porch_git::GitDir,
+    trusted_sha: &str,
+) -> Result<TemplateBytes, Error> {
+    for path in PR_TEMPLATE_PATHS {
+        if let Some(bytes) = porch_git::show_path_at(bare, trusted_sha, path)
+            .map_err(|e| Error::Msg(format!("read PR template {path} at {trusted_sha}: {e}")))?
+        {
+            return Ok(TemplateBytes {
+                bytes: Some(bytes),
+                source: TemplateSource::RepoTemplate,
+                path: Some((*path).to_string()),
+            });
+        }
+    }
+
+    let names = porch_git::list_tree_names_at(bare, trusted_sha, PR_TEMPLATE_DIR).map_err(|e| {
+        Error::Msg(format!(
+            "list PR templates under {PR_TEMPLATE_DIR} at {trusted_sha}: {e}"
+        ))
+    })?;
+    if let Some(names) = names {
+        let mut md: Vec<String> = names
+            .into_iter()
+            .filter(|name| {
+                !name.contains('/')
+                    && !name.contains('\\')
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            })
+            .collect();
+        md.sort();
+        if let Some(name) = md.first() {
+            let path = format!("{PR_TEMPLATE_DIR}/{name}");
+            if let Some(bytes) = porch_git::show_path_at(bare, trusted_sha, &path)
+                .map_err(|e| Error::Msg(format!("read PR template {path} at {trusted_sha}: {e}")))?
+            {
+                return Ok(TemplateBytes {
+                    bytes: Some(bytes),
+                    source: TemplateSource::RepoTemplate,
+                    path: Some(path),
+                });
+            }
+        }
+    }
+
+    Ok(TemplateBytes {
+        bytes: None,
+        source: TemplateSource::PorchDefault,
+        path: None,
+    })
 }
 
 /// Build scaffold PR body: managed markers + template or default skeleton + attestation.
@@ -1047,6 +1149,240 @@ mod tests {
         assert!(!body.contains("## Review"), "{body}");
         assert!(!body.contains("## Certify"), "{body}");
         assert!(!body.contains("## Pipeline"), "{body}");
+    }
+
+    fn bare_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, porch_git::GitDir, String) {
+        use std::process::Command;
+
+        use porch_git::{init_bare, run, stdout_trim};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["init"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["config", "user.email", "porch@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["config", "user.name", "Porch"])
+            .status()
+            .unwrap();
+        for (rel, content) in files {
+            let path = work.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, content).unwrap();
+        }
+        Command::new("git")
+            .current_dir(&work)
+            .args(["add", "-A"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["commit", "-m", "templates"])
+            .status()
+            .unwrap();
+        let bare_path = root.join("bare.git");
+        let bare = init_bare(&bare_path).unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["push", bare_path.to_str().unwrap(), "HEAD:refs/heads/main"])
+            .status()
+            .unwrap();
+        let sha = stdout_trim(&run(&bare, &["rev-parse", "refs/heads/main"]).unwrap());
+        (tmp, bare, sha)
+    }
+
+    #[test]
+    fn load_template_from_github_path_becomes_managed_interior() {
+        let (_tmp, bare, trusted) = bare_with_files(&[(
+            ".github/pull_request_template.md",
+            "## Repo checklist\n\n- [ ] done\n",
+        )]);
+        let loaded = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(loaded.source, TemplateSource::RepoTemplate);
+        assert_eq!(
+            loaded.path.as_deref(),
+            Some(".github/pull_request_template.md")
+        );
+        let text = std::str::from_utf8(loaded.bytes.as_ref().unwrap()).unwrap();
+        let body =
+            build_scaffold_body(Some(text), &ScaffoldFacts::default(), &sample_attestation());
+        assert!(body.contains("## Repo checklist"), "{body}");
+        assert!(body.contains("- [ ] done"), "{body}");
+        assert!(body.contains(MANAGED_BEGIN), "{body}");
+        assert!(!body.contains("## Summary"), "{body}");
+    }
+
+    #[test]
+    fn load_template_missing_uses_porch_default() {
+        let (_tmp, bare, trusted) = bare_with_files(&[("README", "hi\n")]);
+        let loaded = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(loaded.source, TemplateSource::PorchDefault);
+        assert!(loaded.path.is_none());
+        assert!(loaded.bytes.is_none());
+        let text = loaded
+            .bytes
+            .as_deref()
+            .and_then(|b| std::str::from_utf8(b).ok());
+        let body = build_scaffold_body(text, &ScaffoldFacts::default(), &sample_attestation());
+        assert!(body.contains("## Summary"), "{body}");
+        assert!(body.contains("## Why"), "{body}");
+    }
+
+    #[test]
+    fn load_template_ignores_feature_tip_alone() {
+        use std::process::Command;
+
+        use porch_git::{init_bare, stdout_trim};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["init"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["config", "user.email", "porch@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["config", "user.name", "Porch"])
+            .status()
+            .unwrap();
+        std::fs::write(work.join("README"), "base\n").unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["add", "README"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["commit", "-m", "trusted"])
+            .status()
+            .unwrap();
+        let trusted = stdout_trim(
+            &Command::new("git")
+                .current_dir(&work)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap(),
+        );
+        // Feature tip alone carries a template the trusted SHA does not.
+        std::fs::create_dir_all(work.join(".github")).unwrap();
+        std::fs::write(
+            work.join(".github/pull_request_template.md"),
+            "## Tip-only template\n",
+        )
+        .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["add", "-A"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["commit", "-m", "feature tip"])
+            .status()
+            .unwrap();
+        let tip = stdout_trim(
+            &Command::new("git")
+                .current_dir(&work)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap(),
+        );
+        let bare_path = root.join("bare.git");
+        let bare = init_bare(&bare_path).unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["push", bare_path.to_str().unwrap(), "HEAD:refs/heads/feat"])
+            .status()
+            .unwrap();
+        // Pin trusted commit on main without the tip-only template.
+        Command::new("git")
+            .current_dir(&work)
+            .args([
+                "push",
+                bare_path.to_str().unwrap(),
+                &format!("{trusted}:refs/heads/main"),
+            ])
+            .status()
+            .unwrap();
+
+        let from_trusted = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(from_trusted.source, TemplateSource::PorchDefault);
+        assert!(from_trusted.bytes.is_none());
+
+        // Control: tip blob exists; load still keyed off trusted SHA only.
+        let tip_blob =
+            porch_git::show_path_at(&bare, &tip, ".github/pull_request_template.md").unwrap();
+        assert!(tip_blob.is_some());
+    }
+
+    #[test]
+    fn load_template_pick_order_prefers_github_path() {
+        let (_tmp, bare, trusted) = bare_with_files(&[
+            (".github/pull_request_template.md", "## From .github\n"),
+            ("pull_request_template.md", "## From root\n"),
+            ("docs/pull_request_template.md", "## From docs\n"),
+            (
+                ".github/PULL_REQUEST_TEMPLATE/alpha.md",
+                "## From dir alpha\n",
+            ),
+        ]);
+        let loaded = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(
+            loaded.path.as_deref(),
+            Some(".github/pull_request_template.md")
+        );
+        let text = std::str::from_utf8(loaded.bytes.as_ref().unwrap()).unwrap();
+        assert!(text.contains("From .github"), "{text}");
+    }
+
+    #[test]
+    fn load_template_falls_through_fixed_paths() {
+        let (_tmp, bare, trusted) =
+            bare_with_files(&[("docs/pull_request_template.md", "## From docs only\n")]);
+        let loaded = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(
+            loaded.path.as_deref(),
+            Some("docs/pull_request_template.md")
+        );
+        let text = std::str::from_utf8(loaded.bytes.as_ref().unwrap()).unwrap();
+        assert!(text.contains("From docs only"), "{text}");
+    }
+
+    #[test]
+    fn load_template_dir_picks_lexicographic_first_md() {
+        let (_tmp, bare, trusted) = bare_with_files(&[
+            (".github/PULL_REQUEST_TEMPLATE/zebra.md", "## Zebra\n"),
+            (".github/PULL_REQUEST_TEMPLATE/alpha.md", "## Alpha\n"),
+            (".github/PULL_REQUEST_TEMPLATE/notes.txt", "ignore me\n"),
+        ]);
+        let loaded = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(
+            loaded.path.as_deref(),
+            Some(".github/PULL_REQUEST_TEMPLATE/alpha.md")
+        );
+        let text = std::str::from_utf8(loaded.bytes.as_ref().unwrap()).unwrap();
+        assert!(text.contains("Alpha"), "{text}");
+        assert!(!text.contains("Zebra"), "{text}");
     }
 
     #[test]

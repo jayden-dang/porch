@@ -263,6 +263,43 @@ pub fn show_path_at(git_dir: &GitDir, sha: &str, path: &str) -> Result<Option<Ve
     })
 }
 
+/// Immediate child names under `tree_path` at `sha` (`git ls-tree --name-only`).
+///
+/// Missing tree path in a readable commit returns `Ok(None)`.
+///
+/// # Errors
+///
+/// Returns [`Error::Command`] / [`Error::Spawn`] when the commit cannot be read
+/// or `git ls-tree` fails for a reason other than a missing path.
+pub fn list_tree_names_at(
+    git_dir: &GitDir,
+    sha: &str,
+    tree_path: &str,
+) -> Result<Option<Vec<String>>, Error> {
+    let commitish = format!("{sha}^{{commit}}");
+    run(git_dir, &["rev-parse", "--verify", &commitish])?;
+
+    let spec = format!("{sha}:{tree_path}");
+    match run(git_dir, &["ls-tree", "--name-only", &spec]) {
+        Ok(out) => {
+            let names = stdout_trim(&out)
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            Ok(Some(names))
+        }
+        Err(Error::Command { stderr, .. })
+            if stderr.contains("Not a valid object name")
+                || stderr.contains("does not exist")
+                || stderr.contains("not a tree object") =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Resolve a revision from a work tree (`git -C … rev-parse`).
 ///
 /// # Errors

@@ -3,9 +3,9 @@
 use std::process::Command;
 
 use porch_git::{
-    GitDir, PushDecision, RemoteTip, fetch_git_args, force_fetch_refspec, init_bare, ls_remote_sha,
-    push_exact_sha, remote_commits_incorporated, resolve_push_decision, run, run_c, show_path_at,
-    stdout_trim,
+    GitDir, PushDecision, RemoteTip, fetch_git_args, force_fetch_refspec, init_bare,
+    list_tree_names_at, ls_remote_sha, push_exact_sha, remote_commits_incorporated,
+    resolve_push_decision, run, run_c, show_path_at, stdout_trim,
 };
 use tempfile::TempDir;
 
@@ -131,6 +131,44 @@ fn show_path_at_fails_closed_on_unreadable_commit() {
         matches!(err, porch_git::Error::Command { .. }),
         "expected command error, got {err:?}"
     );
+}
+
+#[test]
+fn list_tree_names_at_returns_none_when_missing() {
+    let tmp = TempDir::new().unwrap();
+    let work = tmp.path().canonicalize().unwrap();
+    write_commit(&work);
+    let git_dir = GitDir::new(work.join(".git")).unwrap();
+    let sha = stdout_trim(&run(&git_dir, &["rev-parse", "HEAD"]).unwrap());
+    let got = list_tree_names_at(&git_dir, &sha, ".github/PULL_REQUEST_TEMPLATE").unwrap();
+    assert_eq!(got, None);
+}
+
+#[test]
+fn list_tree_names_at_lists_immediate_children() {
+    let tmp = TempDir::new().unwrap();
+    let work = tmp.path().canonicalize().unwrap();
+    write_commit(&work);
+    std::fs::create_dir_all(work.join(".github/PULL_REQUEST_TEMPLATE")).unwrap();
+    std::fs::write(work.join(".github/PULL_REQUEST_TEMPLATE/zebra.md"), "z\n").unwrap();
+    std::fs::write(work.join(".github/PULL_REQUEST_TEMPLATE/alpha.md"), "a\n").unwrap();
+    Command::new("git")
+        .current_dir(&work)
+        .args(["add", "-A"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(&work)
+        .args(["commit", "-m", "templates"])
+        .status()
+        .unwrap();
+    let git_dir = GitDir::new(work.join(".git")).unwrap();
+    let sha = stdout_trim(&run(&git_dir, &["rev-parse", "HEAD"]).unwrap());
+    let mut names = list_tree_names_at(&git_dir, &sha, ".github/PULL_REQUEST_TEMPLATE")
+        .unwrap()
+        .expect("tree present");
+    names.sort();
+    assert_eq!(names, vec!["alpha.md".to_string(), "zebra.md".to_string()]);
 }
 
 #[test]
