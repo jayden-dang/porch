@@ -175,12 +175,22 @@ fn create_or_update_scaffold_pr(
     scaffold: &ScaffoldAssembly,
 ) -> Result<WrittenPr, DeliverError> {
     if let Some(existing) = find_open_pr(bin, timeout, wt, &run.branch)? {
-        let viewed = view_pr(bin, timeout, wt, existing.number).unwrap_or(porch_deliver::PrView {
-            number: existing.number,
-            url: existing.url.clone(),
-            title: existing.title.clone(),
-            body: String::new(),
-        });
+        let viewed = match view_pr(bin, timeout, wt, existing.number) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    pr = existing.number,
+                    "view_pr failed during scaffold update; merging onto empty body"
+                );
+                porch_deliver::PrView {
+                    number: existing.number,
+                    url: existing.url.clone(),
+                    title: existing.title.clone(),
+                    body: String::new(),
+                }
+            }
+        };
         let body = merge_porch_managed(
             &viewed.body,
             &scaffold.managed_interior,
@@ -445,12 +455,22 @@ fn apply_compose_respond(
     let head_sha = porch_git::rev_parse_c(wt, "HEAD")?;
     let pr = find_open_pr(&bin, timeout, wt, &run.branch)?
         .ok_or_else(|| DeliverError::Msg("compose respond: no open PR for branch".into()))?;
-    let viewed = view_pr(&bin, timeout, wt, pr.number).unwrap_or(porch_deliver::PrView {
-        number: pr.number,
-        url: pr.url.clone(),
-        title: String::new(),
-        body: String::new(),
-    });
+    let viewed = match view_pr(&bin, timeout, wt, pr.number) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                pr = pr.number,
+                "view_pr failed during compose respond; merging onto empty body"
+            );
+            porch_deliver::PrView {
+                number: pr.number,
+                url: pr.url.clone(),
+                title: String::new(),
+                body: String::new(),
+            }
+        }
+    };
 
     let interior = compose_managed_interior(body);
     let attestation = attestation_post_compose(db, &run.id, &head_sha, "completed")?;
@@ -506,12 +526,22 @@ fn apply_compose_skip(
     let head_sha = porch_git::rev_parse_c(wt, "HEAD")?;
     let pr = find_open_pr(&bin, timeout, wt, &run.branch)?
         .ok_or_else(|| DeliverError::Msg("compose skip: no open PR for branch".into()))?;
-    let viewed = view_pr(&bin, timeout, wt, pr.number).unwrap_or(porch_deliver::PrView {
-        number: pr.number,
-        url: pr.url.clone(),
-        title: String::new(),
-        body: String::new(),
-    });
+    let viewed = match view_pr(&bin, timeout, wt, pr.number) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                pr = pr.number,
+                "view_pr failed during compose skip; merging onto empty body"
+            );
+            porch_deliver::PrView {
+                number: pr.number,
+                url: pr.url.clone(),
+                title: String::new(),
+                body: String::new(),
+            }
+        }
+    };
 
     let attestation = attestation_post_compose(db, &run.id, &head_sha, "skipped")?;
     // Keep scaffold managed interior; refresh attestation only.
