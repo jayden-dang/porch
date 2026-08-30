@@ -57,10 +57,10 @@ that I never read a round that is half-written.
 **Story:** As an operator, I want every finding recorded with porch's own identity and a
 complete contract, so that my audit trail means the same thing no matter which producer ran.
 
-- **ROUND-3.1** WHEN findings are normalized THE SYSTEM SHALL compute a canonical
-  fingerprint for each finding and record the fingerprint version in force.
-- **ROUND-3.2** THE SYSTEM SHALL compute that fingerprint for findings from both
-  first-party producers without either producer supplying one.
+- ~~**ROUND-3.1**~~ superseded by ROUND-3.16 and ROUND-3.17: the canonical fingerprint is
+  assigned during finalization, not during normalization.
+- ~~**ROUND-3.2**~~ superseded by ROUND-3.18: restated against the candidate key and the
+  canonical fingerprint separately.
 - **ROUND-3.3** WHERE a producer supplies its own finding key THE SYSTEM SHALL retain that
   key as provenance.
 - **ROUND-3.4** WHERE a producer supplies its own finding key THE SYSTEM SHALL NOT use it
@@ -88,6 +88,27 @@ complete contract, so that my audit trail means the same thing no matter which p
   produced by a deterministic producer.
 - **ROUND-3.15** WHERE a producer supplies no confidence THE SYSTEM SHALL record the
   finding instance without one.
+- **ROUND-3.16** WHEN findings are normalized THE SYSTEM SHALL compute a
+  producer-independent candidate key for each finding from the fingerprint version, the
+  canonical path identity, the porch-normalized criterion, and the structural anchor
+  candidates.
+- **ROUND-3.17** WHEN a round is finalized THE SYSTEM SHALL assign each finding instance a
+  canonical fingerprint, reusing a prior round's fingerprint only where reconciliation
+  establishes exactly one match under the approved rules.
+- **ROUND-3.18** THE SYSTEM SHALL derive both the candidate key and the canonical
+  fingerprint for findings from both first-party producers without either producer
+  supplying one.
+- **ROUND-3.19** IF correspondence to a prior finding is ambiguous THEN THE SYSTEM SHALL
+  assign a distinct new fingerprint rather than merging or inheriting identity.
+- **ROUND-3.20** WHEN a round containing findings from more than one producer is finalized
+  THE SYSTEM SHALL reconcile those findings within that round under the approved rules.
+- **ROUND-3.21** WHERE a first-party producer supplies a rule identity with a registered
+  porch mapping THE SYSTEM SHALL derive the finding's porch-normalized criterion from that
+  mapping.
+- **ROUND-3.22** THE SYSTEM SHALL record the `fingerprint_version` in force with every
+  finding instance as well as with the round binding.
+- **ROUND-3.23** WHEN a round is finalized THE SYSTEM SHALL reconcile its findings against
+  finding instances from prior rounds of the same run under the approved rules.
 
 ## 4. Every round ends in a state that says what happened
 
