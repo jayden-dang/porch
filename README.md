@@ -14,24 +14,16 @@ Porch is the missing **inner gate**: opt-in, local, isolated. You push to a remo
 
 ## Install
 
-Slice crates stay unpublished (`publish = false`), so **0.1.0 is git/path install only** — not crates.io yet.
-
-From a clone (macOS/Linux), prefer the small installer — it puts the binary in `~/.cargo/bin` (or `$CARGO_HOME/bin` / `$PORCH_PREFIX`):
+**0.2.0** is git/tag install only (slice crates stay `publish = false`). Full guide: **[docs/install.md](docs/install.md)**.
 
 ```sh
-./install.sh
-# dry-run: PORCH_INSTALL_DRY_RUN=1 ./install.sh
+curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.0/install.sh | bash
+export PATH="$HOME/.cargo/bin:$PATH"
+porch setup
+porch doctor
 ```
 
-Or with Cargo directly:
-
-```sh
-cargo install --path crates/porch --locked
-# or:
-cargo install --git https://github.com/jayden-dang/porch --locked
-```
-
-Ensure `~/.cargo/bin` is on `PATH` (`porch doctor` warns when the binary is installed there but the dir is missing from `PATH`). crates.io (`cargo install porch`) is a **future** option if/when the slice graph is published. Needs `git` and Rust 1.85+ (stable).
+Needs Rust 1.85+ and git. Installs `porch` and `porch-quality` into `~/.cargo/bin`. crates.io is not available yet.
 
 ## Loop
 

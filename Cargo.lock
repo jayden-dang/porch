@@ -758,7 +758,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "porch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "porch-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nix",
  "serde",
@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "porch-deliver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nix",
  "serde",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "porch-gate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fs4",
  "hex",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "porch-git"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "porch-quality"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "porch-review"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nix",
  "serde",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "porch-run"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nix",
  "porch-agent",

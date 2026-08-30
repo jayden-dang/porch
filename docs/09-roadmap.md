@@ -213,7 +213,7 @@ Work:
 - [x] Papercuts only (init tip agent-aware; certify default timeout 600s; deliver `--no-verify`; certify stderr head+tail truncate; biome pin note)
 - [ ] Mailgate second — **skipped**: no `.porch.yaml` on mailgate default branch; land canonical example via a normal mailgate change first (see checklist)
 
-Work: operator checklist, fix only papercuts found in dogfood, no new subsystems. 0.2-class readiness noted in checklist; no `git tag` without human ask.
+Work: operator checklist, fix only papercuts found in dogfood, no new subsystems. Tagged **0.2.0** (git/tag install; see [install.md](install.md)).
 
 **Then stop adding workflow features.**
 
