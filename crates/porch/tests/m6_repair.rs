@@ -490,6 +490,22 @@ fn origin_branch_sha(origin: &Path, branch: &str) -> Option<String> {
     }
 }
 
+fn compose_skip(s: &Setup, run_id: &str, gh_mode: &str) -> std::process::Output {
+    let mut cmd = Command::cargo_bin("porch").unwrap();
+    cmd.current_dir(&s.work)
+        .env("PORCH_HOME", &s.home)
+        .env(REVIEW_BIN_ENV, &s.fake_review)
+        .env(GH_BIN_ENV, &s.fake_gh)
+        .env(FIXER_BIN_ENV, &s.fake_fixer)
+        .env("PORCH_FAKE_REVIEW_MODE", "clean")
+        .env("PORCH_FAKE_GH_MODE", gh_mode)
+        .env("PATH", &s.path)
+        .env("PORCH_DELIVER_CHECK_TIMEOUT_SECS", "3")
+        .env("PORCH_DELIVER_CHECK_POLL_SECS", "1")
+        .args(["agent", "respond", "skip", "--run-id", run_id]);
+    cmd.output().unwrap()
+}
+
 fn gh_argv_log(home: &Path) -> String {
     std::fs::read_to_string(home.join("gh-argv.log")).unwrap_or_default()
 }
@@ -562,7 +578,7 @@ deliver:
 ";
 
 #[test]
-#[ignore = "PRCMP Task 5/6: compose resolve required"]
+#[ignore = "allowlist repair still outside compose-resume watch path"]
 fn red_lint_fixer_rereview_certify_second_lease_push() {
     let s = setup(
         Some(WATCH_LINT),
@@ -643,7 +659,7 @@ fn red_lint_fixer_rereview_certify_second_lease_push() {
 }
 
 #[test]
-#[ignore = "PRCMP Task 5/6: compose resolve required"]
+#[ignore = "allowlist repair still outside compose-resume watch path"]
 fn budget_exhaust_no_fourth_fixer_spawn() {
     let s = setup(Some(WATCH_LINT), "clean", "lint_fail", Some("noop"));
     git(&s.work, &["checkout", "-b", "feat-budget"]);
@@ -671,7 +687,7 @@ fn budget_exhaust_no_fourth_fixer_spawn() {
 }
 
 #[test]
-#[ignore = "PRCMP Task 5/6: compose resolve required"]
+#[ignore = "allowlist repair still outside compose-resume watch path"]
 fn missing_fixer_bin_fails_closed() {
     let s = setup(Some(WATCH_LINT), "clean", "lint_fail", None);
     git(&s.work, &["checkout", "-b", "feat-no-fixer"]);
@@ -693,7 +709,6 @@ fn missing_fixer_bin_fails_closed() {
 }
 
 #[test]
-#[ignore = "PRCMP Task 5/6: compose resolve required"]
 fn cancelled_allowlisted_check_no_fixer() {
     let s = setup(Some(WATCH_LINT), "clean", "lint_cancelled", Some("apply"));
     git(&s.work, &["checkout", "-b", "feat-cancel-check"]);
@@ -702,12 +717,17 @@ fn cancelled_allowlisted_check_no_fixer() {
 
     let db = Db::open(&s.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&s.work);
-    let run = wait_status(
+    let parked = wait_status(
         &db,
         &repo_id,
-        &["failed", "completed"],
+        &["parked", "failed"],
         Duration::from_secs(45),
     );
+    assert_eq!(parked.status, "parked", "err={:?}", parked.error);
+    let out = compose_skip(&s, &parked.id, "lint_cancelled");
+    assert_eq!(out.status.code(), Some(1));
+
+    let run = db.run_by_id(&parked.id).unwrap().unwrap();
     assert_eq!(run.status, "failed", "err={:?}", run.error);
     assert_eq!(fixer_spawn_count(&s.home), 0);
     assert_eq!(run.deliver_repair_attempts, 0);
@@ -721,7 +741,6 @@ fn cancelled_allowlisted_check_no_fixer() {
 }
 
 #[test]
-#[ignore = "PRCMP Task 5/6: compose resolve required"]
 fn timed_out_allowlisted_check_no_fixer() {
     let s = setup(Some(WATCH_LINT), "clean", "lint_timed_out", Some("apply"));
     git(&s.work, &["checkout", "-b", "feat-timeout-check"]);
@@ -730,19 +749,23 @@ fn timed_out_allowlisted_check_no_fixer() {
 
     let db = Db::open(&s.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&s.work);
-    let run = wait_status(
+    let parked = wait_status(
         &db,
         &repo_id,
-        &["failed", "completed"],
+        &["parked", "failed"],
         Duration::from_secs(45),
     );
+    assert_eq!(parked.status, "parked", "err={:?}", parked.error);
+    let out = compose_skip(&s, &parked.id, "lint_timed_out");
+    assert_eq!(out.status.code(), Some(1));
+
+    let run = db.run_by_id(&parked.id).unwrap().unwrap();
     assert_eq!(run.status, "failed", "err={:?}", run.error);
     assert_eq!(fixer_spawn_count(&s.home), 0);
     assert_eq!(run.deliver_repair_attempts, 0);
 }
 
 #[test]
-#[ignore = "PRCMP Task 5/6: compose resolve required"]
 fn unlisted_e2e_failure_with_lint_green_completes_no_fixer() {
     let s = setup(Some(WATCH_LINT), "clean", "lint_ok", Some("apply"));
     git(&s.work, &["checkout", "-b", "feat-unlisted"]);
@@ -751,19 +774,28 @@ fn unlisted_e2e_failure_with_lint_green_completes_no_fixer() {
 
     let db = Db::open(&s.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&s.work);
-    let run = wait_status(
+    let parked = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(45),
     );
+    assert_eq!(parked.status, "parked", "err={:?}", parked.error);
+    let out = compose_skip(&s, &parked.id, "lint_ok");
+    assert!(
+        out.status.success(),
+        "compose skip failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run = db.run_by_id(&parked.id).unwrap().unwrap();
     assert_eq!(run.status, "completed", "err={:?}", run.error);
     assert_eq!(fixer_spawn_count(&s.home), 0);
     assert_eq!(run.deliver_repair_attempts, 0);
 }
 
 #[test]
-#[ignore = "PRCMP Task 5/6: compose resolve required"]
+#[ignore = "allowlist repair still outside compose-resume watch path"]
 fn rereview_parks_no_second_lease_push_of_unreviewed_sha() {
     let s = setup(
         Some(WATCH_LINT),
