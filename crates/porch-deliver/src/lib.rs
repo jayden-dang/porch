@@ -26,6 +26,12 @@ const DEFAULT_CHECK_POLL_SECS: u64 = 2;
 
 const ATTESTATION_MARKER: &str = "porch-attestation";
 
+/// Start of the porch-owned visible body region.
+pub const MANAGED_BEGIN: &str = "<!-- porch-managed:begin -->";
+
+/// End of the porch-owned visible body region (attestation stays outside).
+pub const MANAGED_END: &str = "<!-- porch-managed:end -->";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(
@@ -356,36 +362,143 @@ pub struct Attestation {
     pub steps: Vec<StepSnapshot>,
 }
 
-/// Build porch PR body sections + HTML attestation, then redact homes.
+/// Placeholder facts for the default scaffold (not a path-list dump).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScaffoldFacts {
+    /// Short prose for Summary (commit subjects / intent — not raw paths alone).
+    pub summary: String,
+    pub why: String,
+    pub how_tested: String,
+    pub links: String,
+}
+
+fn placeholder(s: &str) -> &str {
+    let t = s.trim();
+    if t.is_empty() { "…" } else { t }
+}
+
+/// Default visible interior when no consumer PR template is present.
+#[must_use]
+pub fn default_scaffold_interior(facts: &ScaffoldFacts) -> String {
+    format!(
+        "## Summary\n\n{}\n\n## Why\n\n{}\n\n## How tested\n\n{}\n\n## Links\n\n{}\n",
+        placeholder(&facts.summary),
+        placeholder(&facts.why),
+        placeholder(&facts.how_tested),
+        placeholder(&facts.links),
+    )
+}
+
+fn wrap_managed(interior: &str) -> String {
+    let trimmed = interior.trim_end_matches('\n');
+    format!("{MANAGED_BEGIN}\n{trimmed}\n{MANAGED_END}\n")
+}
+
+fn format_attestation_comment(attestation: &Attestation) -> String {
+    match serde_json::to_string(attestation) {
+        Ok(json) => format!("<!-- {ATTESTATION_MARKER} {json} -->\n"),
+        Err(_) => String::new(),
+    }
+}
+
+fn strip_attestation_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    let open = format!("<!-- {ATTESTATION_MARKER}");
+    while let Some(idx) = rest.find(&open) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + open.len()..];
+        match after.find("-->") {
+            Some(end) => rest = after[end + 3..].trim_start_matches('\n'),
+            None => {
+                // Unclosed marker — drop the rest of the comment opener.
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn finish_body(visible: &str, attestation: &Attestation) -> String {
+    let mut body = visible.trim_end().to_string();
+    body.push('\n');
+    let comment = format_attestation_comment(attestation);
+    if !comment.is_empty() {
+        body.push('\n');
+        body.push_str(&comment);
+    }
+    redact_home_paths(&body)
+}
+
+/// Build scaffold PR body: managed markers + template or default skeleton + attestation.
+///
+/// `template_or_default`: `Some(template_bytes)` uses those as the managed interior;
+/// `None` uses [`default_scaffold_interior`].
+#[must_use]
+pub fn build_scaffold_body(
+    template_or_default: Option<&str>,
+    facts: &ScaffoldFacts,
+    attestation: &Attestation,
+) -> String {
+    let interior = match template_or_default {
+        Some(template) => {
+            let mut t = template.to_string();
+            if !t.ends_with('\n') {
+                t.push('\n');
+            }
+            t
+        }
+        None => default_scaffold_interior(facts),
+    };
+    finish_body(&wrap_managed(&interior), attestation)
+}
+
+/// Replace porch-managed region + refresh attestation; preserve human regions outside markers.
+///
+/// `new_visible` is the new managed **interior** (without begin/end markers).
+/// When existing body has no managed pair, the whole body is replaced by a fresh scaffold wrap.
+#[must_use]
+pub fn merge_porch_managed(
+    existing_body: &str,
+    new_visible: &str,
+    attestation: &Attestation,
+) -> String {
+    let cleaned = strip_attestation_comments(existing_body);
+    let wrapped = wrap_managed(new_visible);
+    let merged = match (cleaned.find(MANAGED_BEGIN), cleaned.find(MANAGED_END)) {
+        (Some(begin), Some(end)) if begin < end => {
+            let after_end = end + MANAGED_END.len();
+            let mut out = String::with_capacity(cleaned.len() + wrapped.len());
+            out.push_str(&cleaned[..begin]);
+            out.push_str(wrapped.trim_end());
+            out.push('\n');
+            out.push_str(cleaned[after_end..].trim_start_matches('\n'));
+            out
+        }
+        _ => wrapped,
+    };
+    finish_body(&merged, attestation)
+}
+
+/// Compatibility shim: builds the default scaffold (ignores theater section inputs).
+///
+/// Prefer [`build_scaffold_body`] / [`merge_porch_managed`]. Intent maps into Summary when present.
 #[must_use]
 pub fn build_pr_body(
     intent: Option<&str>,
-    what_changed: &str,
-    risk: &str,
-    review: &str,
-    certify: &str,
-    pipeline: &str,
+    _what_changed: &str,
+    _risk: &str,
+    _review: &str,
+    _certify: &str,
+    _pipeline: &str,
     attestation: &Attestation,
 ) -> String {
-    let mut body = String::new();
-    body.push_str("## Intent\n\n");
-    body.push_str(intent.unwrap_or("_none_"));
-    body.push_str("\n\n## What Changed\n\n");
-    body.push_str(what_changed);
-    body.push_str("\n\n## Risk\n\n");
-    body.push_str(risk);
-    body.push_str("\n\n## Review\n\n");
-    body.push_str(review);
-    body.push_str("\n\n## Certify\n\n");
-    body.push_str(certify);
-    body.push_str("\n\n## Pipeline\n\n");
-    body.push_str(pipeline);
-    body.push('\n');
-    if let Ok(json) = serde_json::to_string(attestation) {
-        use std::fmt::Write as _;
-        let _ = write!(body, "\n<!-- {ATTESTATION_MARKER} {json} -->\n");
-    }
-    redact_home_paths(&body)
+    let facts = ScaffoldFacts {
+        summary: intent.unwrap_or("").to_string(),
+        ..ScaffoldFacts::default()
+    };
+    build_scaffold_body(None, &facts, attestation)
 }
 
 /// Deterministic PR title (no agent).
@@ -778,8 +891,147 @@ mod tests {
         assert!(!s.contains(r"C:\Users\bob"), "{s}");
     }
 
+    fn sample_attestation() -> Attestation {
+        Attestation {
+            head_sha: "abc123deadbeef".into(),
+            steps: vec![StepSnapshot {
+                step: "review".into(),
+                status: "completed".into(),
+            }],
+        }
+    }
+
     #[test]
-    fn attestation_binds_head_sha() {
+    fn default_scaffold_has_summary_why_how_tested_links() {
+        let body = build_scaffold_body(None, &ScaffoldFacts::default(), &sample_attestation());
+        assert!(body.contains("## Summary"), "{body}");
+        assert!(body.contains("## Why"), "{body}");
+        assert!(body.contains("## How tested"), "{body}");
+        assert!(body.contains("## Links"), "{body}");
+    }
+
+    #[test]
+    fn default_scaffold_omits_gate_theater_headings() {
+        let body = build_scaffold_body(
+            None,
+            &ScaffoldFacts {
+                summary: "short prose about the change".into(),
+                ..ScaffoldFacts::default()
+            },
+            &sample_attestation(),
+        );
+        assert!(!body.contains("## Review"), "{body}");
+        assert!(!body.contains("## Certify"), "{body}");
+        assert!(!body.contains("## Pipeline"), "{body}");
+        assert!(!body.contains("## Intent"), "{body}");
+        assert!(!body.contains("## What Changed"), "{body}");
+        assert!(!body.contains("approved at"), "{body}");
+    }
+
+    #[test]
+    fn scaffold_wraps_visible_body_in_managed_markers() {
+        let body = build_scaffold_body(None, &ScaffoldFacts::default(), &sample_attestation());
+        let begin = body.find(MANAGED_BEGIN).expect("managed begin");
+        let end = body.find(MANAGED_END).expect("managed end");
+        assert!(begin < end, "{body}");
+        let attest = body.find("<!-- porch-attestation").expect("attestation");
+        assert!(end < attest, "attestation must follow managed end: {body}");
+    }
+
+    #[test]
+    fn scaffold_attestation_binds_head_sha_outside_managed() {
+        let body = build_scaffold_body(None, &ScaffoldFacts::default(), &sample_attestation());
+        assert!(body.contains("<!-- porch-attestation"), "{body}");
+        assert!(body.contains("\"head_sha\":\"abc123deadbeef\""), "{body}");
+        let managed_end = body.find(MANAGED_END).unwrap();
+        let attest_at = body.find("<!-- porch-attestation").unwrap();
+        assert!(managed_end < attest_at, "{body}");
+    }
+
+    #[test]
+    fn scaffold_uses_template_bytes_as_managed_interior() {
+        let template = "## Custom checklist\n\n- [ ] item\n";
+        let body = build_scaffold_body(
+            Some(template),
+            &ScaffoldFacts::default(),
+            &sample_attestation(),
+        );
+        assert!(body.contains("## Custom checklist"), "{body}");
+        assert!(body.contains("- [ ] item"), "{body}");
+        assert!(!body.contains("## Summary"), "{body}");
+        assert!(body.contains(MANAGED_BEGIN), "{body}");
+        assert!(body.contains("<!-- porch-attestation"), "{body}");
+    }
+
+    #[test]
+    fn scaffold_redacts_home_paths_in_visible_and_facts() {
+        let body = build_scaffold_body(
+            None,
+            &ScaffoldFacts {
+                summary: "touched /Users/jayden/secret/file".into(),
+                why: "see /home/alice/notes".into(),
+                ..ScaffoldFacts::default()
+            },
+            &sample_attestation(),
+        );
+        assert!(!body.contains("/Users/jayden"), "{body}");
+        assert!(!body.contains("/home/alice"), "{body}");
+        assert!(body.contains("~/secret/file"), "{body}");
+        assert!(body.contains("~/notes"), "{body}");
+    }
+
+    #[test]
+    fn merge_replaces_managed_region_and_refreshes_attestation() {
+        let existing = format!(
+            "operator note\n{MANAGED_BEGIN}\n## Summary\n\nold\n{MANAGED_END}\n\n<!-- porch-attestation {{\"head_sha\":\"oldsha\",\"steps\":[]}} -->\n"
+        );
+        let merged = merge_porch_managed(
+            &existing,
+            "## Summary\n\nnew prose\n",
+            &Attestation {
+                head_sha: "newsha".into(),
+                steps: vec![],
+            },
+        );
+        assert!(merged.contains("operator note"), "{merged}");
+        assert!(merged.contains("new prose"), "{merged}");
+        assert!(!merged.contains("oldsha"), "{merged}");
+        assert!(merged.contains("\"head_sha\":\"newsha\""), "{merged}");
+        assert!(!merged.contains("\nold\n"), "{merged}");
+        assert!(
+            merged.contains(MANAGED_BEGIN) && merged.contains(MANAGED_END),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn merge_preserves_human_regions_outside_markers() {
+        let existing = format!(
+            "## Human preface\n\nkeep me\n{MANAGED_BEGIN}\ninterior\n{MANAGED_END}\n## Human footer\n\nalso keep\n"
+        );
+        let merged = merge_porch_managed(&existing, "replaced interior\n", &sample_attestation());
+        assert!(merged.contains("## Human preface"), "{merged}");
+        assert!(merged.contains("keep me"), "{merged}");
+        assert!(merged.contains("## Human footer"), "{merged}");
+        assert!(merged.contains("also keep"), "{merged}");
+        assert!(merged.contains("replaced interior"), "{merged}");
+        assert!(!merged.contains("\ninterior\n"), "{merged}");
+    }
+
+    #[test]
+    fn merge_redacts_home_paths() {
+        let existing = format!("{MANAGED_BEGIN}\nold\n{MANAGED_END}\n");
+        let merged = merge_porch_managed(
+            &existing,
+            "path /Users/jayden/proj\n",
+            &sample_attestation(),
+        );
+        assert!(!merged.contains("/Users/jayden"), "{merged}");
+        assert!(merged.contains("~/proj"), "{merged}");
+    }
+
+    #[test]
+    fn compatibility_build_pr_body_uses_scaffold_not_theater() {
         let body = build_pr_body(
             Some("fix it"),
             "one file",
@@ -787,22 +1039,14 @@ mod tests {
             "clean",
             "ok",
             "intent→deliver",
-            &Attestation {
-                head_sha: "abc123deadbeef".into(),
-                steps: vec![StepSnapshot {
-                    step: "review".into(),
-                    status: "completed".into(),
-                }],
-            },
+            &sample_attestation(),
         );
+        assert!(body.contains("## Summary"), "{body}");
         assert!(body.contains("<!-- porch-attestation"), "{body}");
         assert!(body.contains("\"head_sha\":\"abc123deadbeef\""), "{body}");
-        assert!(body.contains("## Intent"), "{body}");
-        assert!(body.contains("fix it"), "{body}");
-        assert!(body.contains("## What Changed"), "{body}");
-        assert!(body.contains("one file"), "{body}");
-        assert!(body.contains("## Review"), "{body}");
-        assert!(body.contains("## Certify"), "{body}");
+        assert!(!body.contains("## Review"), "{body}");
+        assert!(!body.contains("## Certify"), "{body}");
+        assert!(!body.contains("## Pipeline"), "{body}");
     }
 
     #[test]
