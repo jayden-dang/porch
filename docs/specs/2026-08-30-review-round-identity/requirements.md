@@ -27,6 +27,31 @@ reviews it, so that every attempted judgment is on the record even when the atte
   version, the fingerprint version, and the producer descriptor.
 - **ROUND-1.7** WHERE the producer's version cannot be observed THE SYSTEM SHALL record it
   as unavailable with a reason, rather than omitting the field or substituting a value.
+- **ROUND-1.8** THE SYSTEM SHALL record, for each text or file review-context element, its
+  source state as `absent`, `present`, or `unreadable` with a reason, independently of that
+  element's effective digest.
+- **ROUND-1.9** WHERE a review-context element is supplied to a producer or protocol layer
+  THE SYSTEM SHALL compute its applicability digest from the exact effective bytes supplied
+  after the transformation used to build that producer or layer's input.
+- **ROUND-1.10** THE SYSTEM SHALL record which producer or protocol layer received each
+  review-context element.
+- **ROUND-1.11** WHERE a review-context element's readable content exceeds the snapshot
+  ceiling THE SYSTEM SHALL retain its digest and record its snapshot as omitted for size,
+  without marking the element's source state unreadable.
+- **ROUND-1.12** WHEN a round records a `trusted_config_sha` THE SYSTEM SHALL keep that
+  commit reachable through a porch-owned git ref for at least as long as the round is
+  retained.
+- **ROUND-1.13** WHEN a readable text or file review-context element does not exceed the
+  snapshot ceiling THE SYSTEM SHALL retain a snapshot of its canonical effective
+  representation.
+- **ROUND-1.14** WHERE a review-context element is not supplied to a producer or protocol
+  layer THE SYSTEM SHALL record it as not applied for that producer or layer, rather than
+  treating its source bytes as applied review context.
+- **ROUND-1.15** THE SYSTEM SHALL record `intent_source` as audit metadata outside the
+  review-context applicability binding.
+- **ROUND-1.16** WHEN permanent removal of retained round data leaves no round referencing
+  a `trusted_config_sha` THE SYSTEM SHALL remove the porch-owned ref retained solely for
+  that commit.
 
 ## 2. A finalized round is all-or-nothing
 
