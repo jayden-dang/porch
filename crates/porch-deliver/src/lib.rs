@@ -603,10 +603,57 @@ pub fn build_pr_body(
     build_scaffold_body(None, &facts, attestation)
 }
 
-/// Deterministic PR title (no agent).
+/// Deterministic scaffold PR title (no agent).
+///
+/// Preference: first non-empty intent line, else commit subject, else
+/// `porch: {branch}` (legacy-compatible fallback).
+#[must_use]
+pub fn deterministic_pr_title(
+    branch: &str,
+    intent: Option<&str>,
+    commit_subject: Option<&str>,
+) -> String {
+    if let Some(line) = first_nonempty_line(intent) {
+        return line;
+    }
+    if let Some(line) = first_nonempty_line(commit_subject) {
+        return line;
+    }
+    format!("porch: {branch}")
+}
+
+/// Thin wrapper for the branch-only fallback. Prefer [`deterministic_pr_title`].
 #[must_use]
 pub fn pr_title(branch: &str) -> String {
-    format!("porch: {branch}")
+    deterministic_pr_title(branch, None, None)
+}
+
+/// Whether `current` is still porch-owned (design §8 title heuristic).
+///
+/// True when equal to `last_written`, matches `^porch: `, or equals the current
+/// scaffold deterministic title.
+#[must_use]
+pub fn is_porch_managed_title(
+    current: &str,
+    last_written: Option<&str>,
+    scaffold_title: &str,
+) -> bool {
+    if last_written.is_some_and(|last| current == last) {
+        return true;
+    }
+    if current.starts_with("porch: ") {
+        return true;
+    }
+    current == scaffold_title
+}
+
+fn first_nonempty_line(raw: Option<&str>) -> Option<String> {
+    raw.and_then(|text| {
+        text.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// Options for finding / creating / updating a PR.
@@ -701,6 +748,28 @@ pub fn edit_pr_body(
         work_tree,
         &["pr", "edit", &num, "--body-file", "-"],
         body.as_bytes(),
+    )?;
+    Ok(())
+}
+
+/// Update an existing PR title via `gh pr edit --title`.
+///
+/// # Errors
+///
+/// Returns spawn / exit errors.
+pub fn edit_pr_title(
+    bin: &str,
+    timeout: Duration,
+    work_tree: &Path,
+    number: u64,
+    title: &str,
+) -> Result<(), Error> {
+    let num = number.to_string();
+    let _ = run_gh(
+        bin,
+        timeout,
+        work_tree,
+        &["pr", "edit", &num, "--title", title],
     )?;
     Ok(())
 }
@@ -1386,8 +1455,119 @@ mod tests {
     }
 
     #[test]
-    fn pr_title_deterministic() {
+    fn deterministic_pr_title_falls_back_to_porch_branch() {
+        assert_eq!(
+            deterministic_pr_title("feat/x", None, None),
+            "porch: feat/x"
+        );
+        assert_eq!(
+            deterministic_pr_title("feat/x", Some("  \n  "), Some("")),
+            "porch: feat/x"
+        );
+        // Thin wrapper keeps the branch-only fallback.
         assert_eq!(pr_title("feat/x"), "porch: feat/x");
+    }
+
+    #[test]
+    fn deterministic_pr_title_prefers_intent_over_branch() {
+        let title = deterministic_pr_title(
+            "feat/x",
+            Some("ship the compose packet\n\nmore detail"),
+            Some("feat: unrelated commit subject"),
+        );
+        assert_eq!(title, "ship the compose packet");
+        assert_ne!(title, "porch: feat/x");
+        assert!(!title.starts_with("porch: "), "{title}");
+    }
+
+    #[test]
+    fn deterministic_pr_title_uses_commit_subject_when_intent_absent() {
+        let title = deterministic_pr_title(
+            "feat/x",
+            None,
+            Some("feat(deliver): improve PR scaffold title"),
+        );
+        assert_eq!(title, "feat(deliver): improve PR scaffold title");
+        assert_ne!(title, "porch: feat/x");
+    }
+
+    #[test]
+    fn is_porch_managed_title_matches_design_heuristic() {
+        let scaffold = deterministic_pr_title("feat/x", Some("ship it"), None);
+        assert!(is_porch_managed_title("porch: feat/x", None, &scaffold));
+        assert!(is_porch_managed_title(
+            "porch: legacy leftover",
+            None,
+            &scaffold
+        ));
+        assert!(is_porch_managed_title(&scaffold, None, &scaffold));
+        assert!(is_porch_managed_title(
+            "agent wrote this earlier",
+            Some("agent wrote this earlier"),
+            &scaffold
+        ));
+        assert!(!is_porch_managed_title(
+            "Human: please review carefully",
+            Some("agent wrote this earlier"),
+            &scaffold
+        ));
+        assert!(!is_porch_managed_title(
+            "Human: please review carefully",
+            None,
+            &scaffold
+        ));
+    }
+
+    #[test]
+    fn edit_pr_title_invokes_gh_pr_edit_title() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt = wt.canonicalize().unwrap();
+
+        let bin = tmp.path().join("fake-gh");
+        let log = fake_gh_log_path(&home);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &bin,
+                format!(
+                    r#"#!/bin/sh
+LOG="{}"
+{{
+  printf '+'
+  for a in "$@"; do
+    printf ' %s' "$a"
+  done
+  printf '\n'
+}} >> "$LOG"
+exit 0
+"#,
+                    log.display()
+                ),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+        }
+
+        edit_pr_title(
+            bin.to_str().unwrap(),
+            Duration::from_secs(5),
+            &wt,
+            42,
+            "ship the compose packet",
+        )
+        .unwrap();
+
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains("pr edit 42 --title ship the compose packet"),
+            "expected gh pr edit --title in log, got: {logged}"
+        );
     }
 
     #[test]

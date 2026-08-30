@@ -5,8 +5,9 @@ use std::sync::atomic::AtomicBool;
 
 use porch_deliver::{
     Attestation, CheckRow, MergeableState, PrOpts, StepSnapshot, WatchChecksOpts, WatchOutcome,
-    build_pr_body, check_poll_interval, check_timeout, create_pr, edit_pr_body, ensure_gh_runnable,
-    find_open_pr, gh_bin, gh_timeout, pr_mergeable, pr_title, watch_allowlisted_checks,
+    build_pr_body, check_poll_interval, check_timeout, create_pr, deterministic_pr_title,
+    edit_pr_body, ensure_gh_runnable, find_open_pr, gh_bin, gh_timeout, pr_mergeable,
+    watch_allowlisted_checks,
 };
 use porch_gate::Db;
 use porch_git::{
@@ -88,7 +89,7 @@ pub(crate) fn run_deliver_phase(
     }
 
     let timeout = gh_timeout();
-    let title = pr_title(&run.branch);
+    let title = deterministic_pr_title(&run.branch, run.intent.as_deref(), None);
     let body = assemble_body(db, &run, &head_sha, wt)?;
 
     let (pr_url, pr_number) = if let Some(existing) = find_open_pr(&bin, timeout, wt, &run.branch)?
