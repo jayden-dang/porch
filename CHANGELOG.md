@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 — 2026-08-30
+
+Publish the slice graph to crates.io so `cargo install porch` works. Path+version workspace deps. Same operator loop as 0.2.0.
+
 ## 0.2.0 — 2026-08-30
 
 Tagged release of the M10–M16 operator loop. Git/tag install only (slices stay `publish = false`).

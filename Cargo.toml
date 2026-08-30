@@ -4,11 +4,13 @@ members = ["crates/*"]
 default-members = ["crates/porch"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-publish = false
+publish = true
+repository = "https://github.com/jayden-dang/porch"
+homepage = "https://github.com/jayden-dang/porch"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -19,6 +21,7 @@ hex = "0.4"
 nix = { version = "0.30", features = ["process", "signal"] }
 predicates = "3"
 ratatui = "0.29"
+regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,6 +33,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
+# Internal slices: path for the workspace, version so `cargo publish` works.
+porch-git = { version = "0.2.1", path = "crates/porch-git" }
+porch-gate = { version = "0.2.1", path = "crates/porch-gate" }
+porch-review = { version = "0.2.1", path = "crates/porch-review" }
+porch-agent = { version = "0.2.1", path = "crates/porch-agent" }
+porch-deliver = { version = "0.2.1", path = "crates/porch-deliver" }
+porch-run = { version = "0.2.1", path = "crates/porch-run" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

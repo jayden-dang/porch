@@ -26,7 +26,7 @@ Reopen only with an explicit written change. Coding sessions do not get to “ju
 
 | ID | Decision |
 |---|---|
-| E1 | Implementation language is **Rust** (edition 2024). Virtual Cargo workspace: one published binary (`porch`) plus slice library crates (`porch-git`, `porch-gate`, later phase crates). Slices are use cases, not technical layers. Internal libs `publish = false`. Do not add a crate per layer (`daemon`/`db`/`ipc`). |
+| E1 | Implementation language is **Rust** (edition 2024). Virtual Cargo workspace: published binary **`porch`** plus slice crates (`porch-git`, `porch-gate`, …). Slices are use cases, not technical layers. Slice crates **are published** so `cargo install porch` works (path+version deps). They are not a public API and not a crate-per-layer (`daemon`/`db`/`ipc`). Also publish **`porch-quality`**. |
 | E2 | Git is **always the `git` CLI** with absolute `--git-dir` / `-C`. Never libgit2 for gate operations. |
 | E3 | SQLite via **`rusqlite`**, single writer (mutex or actor). No async connection pool. |
 | E4 | Async runtime **Tokio** for daemon, IPC, process spawn. Git and rusqlite stay blocking (`spawn_blocking` or dedicated threads). |

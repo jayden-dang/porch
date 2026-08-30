@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
-description = "M4 slice: native fixer CLI adapter"
+publish = true
+description = "Porch native fixer CLI adapter"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 serde.workspace = true

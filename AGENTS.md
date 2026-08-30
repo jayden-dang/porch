@@ -27,7 +27,7 @@ Local implementation notes (gitignored): **`.research/`**. Read that directory b
 Virtual Cargo workspace. Slices are use cases, not layers. Do not add a crate per technical layer.
 
 ```
-Cargo.toml                 # workspace; resolver = "3"; members = ["crates/*"]
+Cargo.toml                 # workspace; resolver = "3"; members = ["crates/*"] (slices published for cargo install)
 crates/porch/              # binary; clap; `porch daemon run` is a fast path
 crates/porch-git/          # git CLI wrapper, --git-dir absolute; publish = false
 crates/porch-gate/         # init, hooks, admit, notify, sqlite, daemon (+ RunExecutor inject)

@@ -1,6 +1,6 @@
 # Operator checklist (M15 workflow freeze)
 
-End-to-end loop **without OCR**: setup → init → push porch → review → park (TUI or JSON) → cheap certify → PR. Tagged **0.2.0** (git/tag install, not crates.io). Install: [install.md](install.md). **M16** `porch setup --engine quality` (`porch-quality`); see [11-review-quality-brief.md](11-review-quality-brief.md).
+End-to-end loop **without OCR**: setup → init → push porch → review → park (TUI or JSON) → cheap certify → PR. Tagged **0.2.1** (crates.io). Install: [install.md](install.md). **M16** `porch setup --engine quality` (`porch-quality`); see [11-review-quality-brief.md](11-review-quality-brief.md).
 
 Dogfood proven on a toy repo and **klynt** (M15). Mailgate is second (see blockers below).
 

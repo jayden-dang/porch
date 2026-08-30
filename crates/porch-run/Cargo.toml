@@ -4,15 +4,17 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
-description = "Execute a run: worktree, intent, rebase, review, certify, deliver"
+publish = true
+description = "Execute a porch run: worktree, intent, rebase, review, certify, deliver"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
-porch-agent = { path = "../porch-agent" }
-porch-deliver = { path = "../porch-deliver" }
-porch-gate = { path = "../porch-gate" }
-porch-git = { path = "../porch-git" }
-porch-review = { path = "../porch-review" }
+porch-agent.workspace = true
+porch-deliver.workspace = true
+porch-gate.workspace = true
+porch-git.workspace = true
+porch-review.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -24,7 +26,7 @@ nix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-porch-git = { path = "../porch-git" }
+porch-git.workspace = true
 
 [lints]
 workspace = true

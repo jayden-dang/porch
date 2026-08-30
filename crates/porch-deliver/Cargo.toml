@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
-description = "M6 slice: GitHub deliver via gh CLI"
+publish = true
+description = "Porch GitHub deliver via the gh CLI"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 serde.workspace = true

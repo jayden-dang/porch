@@ -1,6 +1,6 @@
-# Install porch 0.2.0
+# Install porch 0.2.1
 
-Porch is a local git gate. Consent is `git push porch`. Slice crates stay unpublished (`publish = false`), so **this release is git/tag install only** — not `cargo install porch` from crates.io.
+Porch is a local git gate. Consent is `git push porch`. **Preferred install is crates.io.** Git/tag remains supported.
 
 You need **Rust 1.85+** ([rustup](https://rustup.rs)) and **git**. The installer builds two binaries:
 
@@ -13,27 +13,31 @@ Both land in `~/.cargo/bin` by default. That directory is often **missing from P
 
 ## Fastest (recommended)
 
+crates.io (Rust 1.85+):
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.0/install.sh | bash
-export PATH="$HOME/.cargo/bin:$PATH"   # add to ~/.zshrc or ~/.bashrc if doctor warns
+cargo install porch --locked
+cargo install porch-quality --locked
+export PATH="$HOME/.cargo/bin:$PATH"   # add to ~/.zshrc / ~/.bashrc if doctor warns
 porch setup
 porch doctor
 ```
 
-Pin a different tag with `PORCH_GIT_REF`:
+From GitHub without crates.io (same binaries, tagged source):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.0/install.sh | PORCH_GIT_REF=v0.2.0 bash
+curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.1/install.sh | bash
+export PATH="$HOME/.cargo/bin:$PATH"
+porch setup
+porch doctor
 ```
-
-First run compiles from source (a few minutes). Later upgrades are the same command.
 
 ## From a clone
 
 ```sh
 git clone https://github.com/jayden-dang/porch.git
 cd porch
-git checkout v0.2.0
+git checkout v0.2.1
 ./install.sh
 ```
 
@@ -44,8 +48,15 @@ Bindir override: `PORCH_PREFIX=/usr/local/bin ./install.sh`.
 ## Cargo only
 
 ```sh
-cargo install --git https://github.com/jayden-dang/porch --tag v0.2.0 --locked --force porch
-cargo install --git https://github.com/jayden-dang/porch --tag v0.2.0 --locked --force porch-quality
+cargo install porch --locked --force
+cargo install porch-quality --locked --force
+```
+
+Git pin:
+
+```sh
+cargo install --git https://github.com/jayden-dang/porch --tag v0.2.1 --locked --force porch
+cargo install --git https://github.com/jayden-dang/porch --tag v0.2.1 --locked --force porch-quality
 ```
 
 From a checkout: `cargo install --path crates/porch --locked --force` and the same for `crates/porch-quality`.
@@ -59,7 +70,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # persist: echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
 ```
 
-`porch doctor` prints `[ok] porch: … (version 0.2.0)` when the binary and `git` are visible.
+`porch doctor` prints `[ok] porch: … (version 0.2.1)` when the binary and `git` are visible.
 
 ## After install
 
@@ -76,4 +87,4 @@ Full loop: [10-operator-checklist.md](10-operator-checklist.md). Review default 
 
 ## What this release is not
 
-Not crates.io. Not a prebuilt GitHub Actions matrix of `.tar.gz` yet (source build via Cargo). Not Windows-first (`install.sh` is macOS/Linux).
+Not a prebuilt GitHub Actions matrix of `.tar.gz` (Cargo compiles from crates.io or git). `install.sh` is macOS/Linux.

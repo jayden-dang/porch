@@ -14,16 +14,17 @@ Porch is the missing **inner gate**: opt-in, local, isolated. You push to a remo
 
 ## Install
 
-**0.2.0** is git/tag install only (slice crates stay `publish = false`). Full guide: **[docs/install.md](docs/install.md)**.
+**0.2.1** is on crates.io. Full guide: **[docs/install.md](docs/install.md)**.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.0/install.sh | bash
+cargo install porch --locked
+cargo install porch-quality --locked
 export PATH="$HOME/.cargo/bin:$PATH"
 porch setup
 porch doctor
 ```
 
-Needs Rust 1.85+ and git. Installs `porch` and `porch-quality` into `~/.cargo/bin`. crates.io is not available yet.
+Needs Rust 1.85+ and git. `~/.cargo/bin` must be on `PATH`.
 
 ## Loop
 

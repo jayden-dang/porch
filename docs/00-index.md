@@ -1,6 +1,6 @@
 # Porch briefing index
 
-This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Tagged release **0.2.0** (M10–M16). Install: [install.md](install.md). Operator loop: [10-operator-checklist.md](10-operator-checklist.md). OCR wrapper is optional/legacy. See [09-roadmap.md](09-roadmap.md), [11-review-quality-brief.md](11-review-quality-brief.md), and D9/D13/D15.
+This directory is the product briefing. Treat these files as the current spec until a decision in `decisions.md` is superseded in writing. Release **0.2.1** (crates.io). Install: [install.md](install.md). Operator loop: [10-operator-checklist.md](10-operator-checklist.md). OCR wrapper is optional/legacy. See [09-roadmap.md](09-roadmap.md), [11-review-quality-brief.md](11-review-quality-brief.md), and D9/D13/D15.
 
 ## Read order
 

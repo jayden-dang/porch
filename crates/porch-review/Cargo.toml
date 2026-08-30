@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
-description = "M3 slice: external review CLI adapter"
+publish = true
+description = "Porch review adapter (coding agent, quality engine, or generic CLI)"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 serde.workspace = true

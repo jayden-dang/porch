@@ -2,22 +2,23 @@
 # Install porch + porch-quality onto PATH (macOS / Linux).
 #
 # One-liner (tagged release):
-#   curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.0/install.sh | bash
+#   cargo install porch --locked && cargo install porch-quality --locked
+#   curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.1/install.sh | bash
 #
 # From a clone of this repo:
 #   ./install.sh
 #
 # Default bindir: $CARGO_HOME/bin (usually ~/.cargo/bin).
 # Override with PORCH_PREFIX=/path/to/bin.
-# Pin a git ref with PORCH_GIT_REF=v0.2.0 (used when not run from a clone).
+# Pin a git ref with PORCH_GIT_REF=v0.2.1 (used when not run from a clone).
 # Dry-run (no writes): PORCH_INSTALL_DRY_RUN=1 ./install.sh
 #
-# Not on crates.io yet (workspace slices stay publish = false).
+# Prefer: cargo install porch --locked && cargo install porch-quality --locked
 
 set -euo pipefail
 
 PORCH_GIT_URL="${PORCH_GIT_URL:-https://github.com/jayden-dang/porch}"
-PORCH_GIT_REF="${PORCH_GIT_REF:-v0.2.0}"
+PORCH_GIT_REF="${PORCH_GIT_REF:-v0.2.1}"
 
 script_dir=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then

@@ -4,13 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
-description = "M1 gate slice: init, hooks, admit, notify, daemon"
+publish = true
+description = "Porch gate: init, hooks, admit, notify, daemon"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 fs4.workspace = true
 hex.workspace = true
-porch-git = { path = "../porch-git" }
+porch-git.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

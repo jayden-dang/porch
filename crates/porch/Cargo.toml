@@ -4,12 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
-# false until path-dep slices are publishable (E1); metadata kept for a later crates.io cut
-publish = false
+publish = true
 description = "Local git gate: push to porch, review and certify before origin"
-repository = "https://github.com/jayden-dang/porch"
-homepage = "https://github.com/jayden-dang/porch"
-readme = "../../README.md"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
 keywords = ["git", "cli", "review", "gate"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["/target/", "/.research/", "/.skills/", "/.remember/"]
@@ -21,10 +20,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-porch-agent = { path = "../porch-agent" }
-porch-gate = { path = "../porch-gate" }
-porch-review = { path = "../porch-review" }
-porch-run = { path = "../porch-run" }
+porch-agent.workspace = true
+porch-gate.workspace = true
+porch-review.workspace = true
+porch-run.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -32,11 +31,11 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
-porch-agent = { path = "../porch-agent" }
-porch-deliver = { path = "../porch-deliver" }
-porch-gate = { path = "../porch-gate" }
-porch-git = { path = "../porch-git" }
-porch-review = { path = "../porch-review" }
+porch-agent.workspace = true
+porch-deliver.workspace = true
+porch-gate.workspace = true
+porch-git.workspace = true
+porch-review.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

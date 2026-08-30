@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+publish = true
 description = "Typed git CLI wrapper with absolute --git-dir"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 thiserror.workspace = true

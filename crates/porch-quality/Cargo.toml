@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
-description = "M16 porch-owned review quality engine"
+publish = true
+description = "Porch-owned review quality engine (coverage, relocate, rule packs)"
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "porch-quality"
@@ -13,7 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-regex = "1"
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
