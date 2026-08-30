@@ -917,7 +917,7 @@ pub fn compose_managed_interior(body: &str) -> String {
     }
 }
 
-/// Validate Agent compose body before merge (PRCMP-4.4).
+/// Validate Agent compose body before merge.
 ///
 /// # Errors
 ///
