@@ -121,9 +121,9 @@ Fixed order: **intent → rebase → review → certify → deliver**.
 | rebase | Onto `pr.base_branch` or `origin/HEAD`. Conflict → **park** (`fix` or `abort`) |
 | review | Session-free engine. Blocking findings → **park** |
 | certify | Trusted `commands.format` / `lint` in the disposable worktree |
-| deliver | `--force-with-lease=<ref>:<observed-sha>`, `gh pr create/update`, watch **allowlisted** checks only |
+| deliver | Lease-push (`--force-with-lease`), scaffold PR (no self-review theater on the visible body), **park** at `compose`, then after respond/skip babysit **allowlisted** checks only |
 
-Reviewer turns never resume the fixer session. Review auto-fix stays **off**.
+A **Park** can halt at `rebase`, `review`, or `compose`. Reviewer turns never resume the fixer session. Review auto-fix stays **off**.
 
 ## H. Watch a run
 
@@ -137,6 +137,8 @@ porch runs            # JSON list
 ```
 
 Non-TTY `porch` / `attach` prints a snapshot (never raw mode).
+
+When `phase=compose`, `porch agent status` also shows `pr_url`, `compose_packet_path` (`$PORCH_HOME/runs/<run_id>/compose-packet.json`), and `allowed_actions` `respond` | `skip` | `abort`.
 
 ## I. Parked review (TUI)
 
@@ -157,34 +159,58 @@ When `status=parked` and `phase=review`:
 
 Rebase parks accept **`f` / `x` only** (not approve/skip).
 
-## J. Parked review (JSON / agents)
+## J. Parked compose (TUI)
+
+When `status=parked` and `phase=compose`, deliver has already lease-pushed and opened or updated a **scaffold** PR. The visible body is template/placeholders plus a hidden `porch-attestation` comment — **not** Review/Certify/Pipeline self-review theater. The Agent authors the public prose.
+
+| Key | Action |
+|---|---|
+| `s` | Skip compose: keep the scaffold body; complete deliver; then watch allowlisted checks |
+| `x` then `x` | Abort the run (GitHub PR stays open; porch does not `gh pr close`) |
+| `q` / `Esc` | Detach |
+
+Compose does **not** accept approve/fix in the TUI. Write prose with `porch agent respond --body-file` (see below). The status panel shows `pr_url` and the compose packet path.
+
+Compose `skip` ≠ review `skip`: it accepts the scaffold and **continues** deliver (certify already ran).
+
+## K. Parked review / compose (JSON / agents)
 
 ```sh
 porch agent status
+# review park
 porch agent respond approve
 porch agent respond skip
 porch agent respond abort
 porch agent respond fix --findings f0,f1
 porch agent respond fix --yes
+# compose park (phase=compose)
+porch agent respond --body-file ./pr-body.md
+porch agent respond --body-file ./pr-body.md --title "short PR title"
+porch agent respond skip
+porch agent respond abort
 porch agent run --wait
 ```
 
 Stdout is JSON (JSONL with `agent run --wait`). Exit `0` ok/parked/completed, `1` failed/cancelled, `2` usage.
 
-| Verb | Effect |
-|---|---|
-| `approve` | Continue; writes `review_approved_head_sha` |
-| `skip` | Skip remaining review; **no** approved SHA |
-| `abort` | Cancel the run |
-| `fix` | Native fixer, then **session-free** rereview |
+| Verb / form | Phase | Effect |
+|---|---|---|
+| `approve` | review | Continue; writes `review_approved_head_sha` |
+| `skip` | review | Skip remaining review; **no** approved SHA |
+| `skip` | compose | Accept scaffold PR body; complete deliver (does **not** skip certify/deliver) |
+| `abort` | rebase / review / compose | Cancel the run. Compose abort leaves the GitHub PR open |
+| `fix` | review / rebase | Native fixer, then **session-free** rereview (or rebase retry) |
+| `--body-file` [+ `--title`] | compose | Merge Agent prose into porch-managed PR regions; complete deliver |
+
+Read the packet at `compose_packet_path` before writing `--body-file`. Empty or theater-shaped bodies (gate Review/Certify/Pipeline boards) are rejected; the run stays parked. Do not combine `--body-file` with approve/skip/abort/fix.
 
 `--yes` is **one** fix round then approve remaining — never the default, never the whole gate.
 
 **Never merge the PR from the skill.** **Never babysit deploy / spend-money E2E.**
 
-## K. After certify / deliver
+## L. After compose / deliver
 
-On **completed**, porch has lease-pushed and opened or updated a GitHub PR (base from trusted yaml). Allowlist empty → no CI babysit.
+Deliver parks at **compose** until respond or skip. On **completed**, porch has lease-pushed, resolved compose (Agent prose or scaffold), and babysat allowlisted checks if configured. Allowlist empty → no CI babysit.
 
 If pipeline commits moved HEAD:
 
@@ -202,7 +228,7 @@ porch rerun                 # new run id, fresh worktree; default = latest on th
 porch rerun --run-id <ULID>
 ```
 
-## L. Daemon
+## M. Daemon
 
 `init` starts a detached daemon. Optional login service:
 
@@ -214,7 +240,7 @@ porch daemon stop           # refuses if runs are active unless --force
 porch daemon uninstall
 ```
 
-## M. Leave a clone
+## N. Leave a clone
 
 ```sh
 porch eject                 # drop remote `porch` + neutralize hooks
@@ -223,7 +249,7 @@ porch eject --purge         # also delete this repo’s bare, worktrees, run row
 
 `--purge` does not delete other repos under `$PORCH_HOME` or global `config.yaml`.
 
-## N. Typical day
+## O. Typical day
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -231,12 +257,14 @@ cd /path/to/clone
 git switch -c feat/x origin/dev     # or origin/main — match your PR base
 # … commit …
 porch agent run --intent "…" --wait
-# if parked: porch   or   porch agent respond approve
+# if phase=review parked: porch   or   porch agent respond approve
+# if phase=compose parked: read compose_packet_path →
+#   porch agent respond --body-file ./pr-body.md   (or skip / abort)
 porch agent sync                    # if local branch lags pipeline
 # stop. You merge the PR, not porch.
 ```
 
-## O. Troubleshooting
+## P. Troubleshooting
 
 | Symptom | What to try |
 |---|---|
@@ -245,9 +273,11 @@ porch agent sync                    # if local branch lags pipeline
 | certify `biome: not found` | Put biome on `PATH`; `porch daemon stop --force && porch daemon start` so the daemon inherits it |
 | lefthook/e2e on every push | `git push --no-verify porch …` |
 | rebase conflict | TUI/`respond` **fix** or **abort** |
+| parked at `compose` | `porch agent status` → packet at `compose_packet_path` → `--body-file` / `skip` / `abort` |
+| compose respond rejected | Drop gate theater headings from the body; do not paste Review/Certify/Pipeline boards |
 | deliver no PR | `gh auth status`; doctor `gh` ok |
 | old `~/.porch` still OCR | `porch setup --yes` again |
 
-## P. What porch is not
+## Q. What porch is not
 
 Not CI. Not deploy. Not a merge bot. Not team governance. It sits **in front of** production rings; it does not swallow them.
