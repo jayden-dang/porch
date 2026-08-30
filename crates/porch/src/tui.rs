@@ -350,6 +350,7 @@ impl App {
             AgentResponse::Abort => "abort",
             AgentResponse::Fix { yes: true, .. } => "fix --yes",
             AgentResponse::Fix { yes: false, .. } => "fix",
+            AgentResponse::Compose { .. } => "compose respond",
         }
         .to_string();
         self.spawn_respond_job(move || {

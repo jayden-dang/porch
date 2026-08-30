@@ -159,10 +159,10 @@ enum AgentCommand {
         #[arg(long)]
         run_id: Option<String>,
     },
-    /// Respond to a parked review: approve | skip | abort | fix.
+    /// Respond to a parked review/compose: approve | skip | abort | fix, or `--body-file` for compose.
     Respond {
-        /// `approve`, `skip`, `abort`, or `fix`.
-        response: String,
+        /// `approve`, `skip`, `abort`, or `fix`. Omit when using `--body-file` (compose).
+        response: Option<String>,
         /// Run id (ULID). Defaults to latest parked run for the cwd repo.
         #[arg(long)]
         run_id: Option<String>,
@@ -172,6 +172,12 @@ enum AgentCommand {
         /// After one fix round, approve remaining findings (only with `fix`).
         #[arg(long)]
         yes: bool,
+        /// Compose park: path to Agent-authored PR body markdown.
+        #[arg(long)]
+        body_file: Option<PathBuf>,
+        /// Compose park: optional PR title (applied only when still porch-managed).
+        #[arg(long)]
+        title: Option<String>,
     },
     /// Custody / sync JSON: author branch vs pipeline HEAD (`--recover` optional).
     Sync {
@@ -193,6 +199,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(clippy::too_many_lines)] // clap dispatch table
 fn main_inner() -> Result<ExitCode> {
     let argv: Vec<String> = env::args().collect();
     // Fast path: do not attach a stderr logger that would steal daemon logs.
@@ -274,12 +281,16 @@ fn main_inner() -> Result<ExitCode> {
                     run_id,
                     findings,
                     yes,
+                    body_file,
+                    title,
                 },
         }) => Ok(run_agent_respond(
-            &response,
+            response.as_deref(),
             run_id.as_deref(),
             findings.as_deref(),
             yes,
+            body_file.as_deref(),
+            title.as_deref(),
         )?),
         Some(Command::Agent {
             command: AgentCommand::Sync { run_id, recover },
@@ -691,12 +702,36 @@ fn run_agent_run(
 }
 
 fn run_agent_respond(
-    response: &str,
+    response: Option<&str>,
     run_id: Option<&str>,
     findings: Option<&str>,
     yes: bool,
+    body_file: Option<&Path>,
+    title: Option<&str>,
 ) -> Result<ExitCode> {
-    if (findings.is_some() || yes) && response != "fix" {
+    if title.is_some() && body_file.is_none() {
+        let _ = writeln!(
+            io::stdout(),
+            "{}",
+            serde_json::json!({
+                "error": "--title requires --body-file",
+                "code": "usage"
+            })
+        );
+        return Ok(ExitCode::from(2));
+    }
+    if body_file.is_some() && response.is_some() {
+        let _ = writeln!(
+            io::stdout(),
+            "{}",
+            serde_json::json!({
+                "error": "compose --body-file cannot be combined with approve|skip|abort|fix",
+                "code": "usage"
+            })
+        );
+        return Ok(ExitCode::from(2));
+    }
+    if (findings.is_some() || yes) && response != Some("fix") {
         let _ = writeln!(
             io::stdout(),
             "{}",
@@ -707,7 +742,7 @@ fn run_agent_respond(
         );
         return Ok(ExitCode::from(2));
     }
-    let parsed = match parse_agent_response(response, findings, yes) {
+    let parsed = match parse_agent_response(response, findings, yes, body_file, title) {
         Ok(r) => r,
         Err(msg) => {
             let _ = writeln!(
@@ -724,10 +759,24 @@ fn run_agent_respond(
 }
 
 fn parse_agent_response(
-    response: &str,
+    response: Option<&str>,
     findings: Option<&str>,
     yes: bool,
+    body_file: Option<&Path>,
+    title: Option<&str>,
 ) -> std::result::Result<AgentResponse, String> {
+    if let Some(path) = body_file {
+        let body = std::fs::read_to_string(path).map_err(|e| format!("read --body-file: {e}"))?;
+        return Ok(AgentResponse::Compose {
+            body,
+            title: title.map(str::to_string),
+        });
+    }
+    let Some(response) = response else {
+        return Err(
+            "missing response; expected approve|skip|abort|fix or --body-file for compose".into(),
+        );
+    };
     match response {
         "approve" => Ok(AgentResponse::Approve),
         "skip" => Ok(AgentResponse::Skip),

@@ -6,10 +6,11 @@ use std::sync::atomic::AtomicBool;
 use porch_deliver::{
     Attestation, CheckRow, MANAGED_BEGIN, MANAGED_END, MergeableState, PrOpts, ScaffoldFacts,
     StepSnapshot, TemplateSource, WatchChecksOpts, WatchOutcome, build_scaffold_body,
-    check_poll_interval, check_timeout, create_pr, default_scaffold_interior,
-    deterministic_pr_title, edit_pr_body, edit_pr_title, ensure_gh_runnable, find_open_pr, gh_bin,
-    gh_timeout, is_porch_managed_title, load_pr_template, merge_porch_managed, pr_mergeable,
-    theater_reject_rules, view_pr, watch_allowlisted_checks,
+    check_poll_interval, check_timeout, compose_managed_interior, create_pr,
+    default_scaffold_interior, deterministic_pr_title, edit_pr_body, edit_pr_title,
+    ensure_gh_runnable, find_open_pr, gh_bin, gh_timeout, is_porch_managed_title, load_pr_template,
+    merge_porch_managed, pr_mergeable, theater_reject_rules, validate_compose_body, view_pr,
+    watch_allowlisted_checks,
 };
 
 #[cfg(test)]
@@ -58,6 +59,9 @@ pub(crate) enum DeliverError {
     MergeConflicting,
     #[error("allowlisted checks not green before poll timeout")]
     WatchTimeout,
+    /// Agent compose body failed validation; run stays parked.
+    #[error("{0}")]
+    ComposeRejected(String),
     #[error("{0}")]
     Msg(String),
 }
@@ -377,6 +381,196 @@ fn compose_already_resolved(db: &Db, run_id: &str) -> Result<bool, DeliverError>
     Ok(db
         .latest_step_for_run(run_id, "compose")?
         .is_some_and(|s| s.status == "completed" || s.status == "skipped"))
+}
+
+/// How compose park was resolved by the Agent / Operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ComposeResolution {
+    /// Merge Agent body (+ optional title) into the scaffold PR.
+    Respond { body: String, title: Option<String> },
+    /// Accept scaffold prose and finish deliver.
+    Skip,
+    /// Fail/cancel the run; leave the GitHub PR open.
+    Abort,
+}
+
+/// Apply compose respond/skip/abort and finish deliver (watch when configured).
+///
+/// # Errors
+///
+/// Validation failures stay parked (caller maps [`DeliverError::ComposeRejected`]).
+/// Watch / `gh` failures fail the run after compose is marked resolved when applicable.
+pub(crate) fn resume_deliver_after_compose(
+    db: &Db,
+    _home: &Path,
+    run_id: &str,
+    bare: &GitDir,
+    wt: &Path,
+    default_branch: &str,
+    resolution: ComposeResolution,
+) -> Result<(), DeliverError> {
+    let run = db
+        .run_by_id(run_id)?
+        .ok_or_else(|| DeliverError::Msg(format!("unknown run {run_id}")))?;
+
+    match resolution {
+        ComposeResolution::Abort => {
+            db.insert_step_result(run_id, "compose", "cancelled", Some("agent abort"))?;
+            db.set_run_status(run_id, "cancelled", Some("agent abort"))?;
+            if let Some(hub) = event_hub() {
+                hub.publish_state(run_id);
+                hub.publish_activity(run_id, "step=compose status=cancelled");
+            }
+            Ok(())
+        }
+        ComposeResolution::Respond { body, title } => {
+            validate_compose_body(&body).map_err(DeliverError::ComposeRejected)?;
+            apply_compose_respond(db, &run, bare, wt, default_branch, &body, title.as_deref())
+        }
+        ComposeResolution::Skip => apply_compose_skip(db, &run, bare, wt, default_branch),
+    }
+}
+
+fn apply_compose_respond(
+    db: &Db,
+    run: &porch_gate::RunRow,
+    bare: &GitDir,
+    wt: &Path,
+    default_branch: &str,
+    body: &str,
+    title: Option<&str>,
+) -> Result<(), DeliverError> {
+    let bin = resolve_gh_bin();
+    let timeout = gh_timeout();
+    let head_sha = porch_git::rev_parse_c(wt, "HEAD")?;
+    let pr = find_open_pr(&bin, timeout, wt, &run.branch)?
+        .ok_or_else(|| DeliverError::Msg("compose respond: no open PR for branch".into()))?;
+    let viewed = view_pr(&bin, timeout, wt, pr.number).unwrap_or(porch_deliver::PrView {
+        number: pr.number,
+        url: pr.url.clone(),
+        title: String::new(),
+        body: String::new(),
+    });
+
+    let interior = compose_managed_interior(body);
+    let attestation = attestation_post_compose(db, &run.id, &head_sha, "completed")?;
+    let merged = merge_porch_managed(&viewed.body, &interior, &attestation);
+    edit_pr_body(&bin, timeout, wt, pr.number, &merged)?;
+
+    if let Some(new_title) = title.map(str::trim).filter(|t| !t.is_empty()) {
+        let subjects = commit_subjects(wt, run.base_sha.as_deref(), &head_sha);
+        let scaffold_title = deterministic_pr_title(
+            run.branch.as_str(),
+            run.intent.as_deref(),
+            subjects.first().map(String::as_str),
+        );
+        if is_porch_managed_title(
+            &viewed.title,
+            run.pr_title_written.as_deref(),
+            &scaffold_title,
+        ) {
+            edit_pr_title(&bin, timeout, wt, pr.number, new_title)?;
+            db.set_pr_title_written(&run.id, Some(new_title))?;
+        }
+    }
+
+    let trusted = load_trusted_deliver(db, &run.id, bare, default_branch)?;
+    maybe_watch(
+        &bin,
+        timeout,
+        wt,
+        pr.number,
+        &trusted.deliver_github.watch_checks,
+        None,
+    )?;
+    db.insert_step_result(&run.id, "compose", "completed", Some("compose=agent"))?;
+    db.insert_step_result(&run.id, "deliver", "completed", Some("compose=agent"))?;
+    db.set_run_status(&run.id, "completed", None)?;
+    if let Some(hub) = event_hub() {
+        hub.publish_state(&run.id);
+        hub.publish_activity(&run.id, "step=deliver status=completed");
+    }
+    Ok(())
+}
+
+fn apply_compose_skip(
+    db: &Db,
+    run: &porch_gate::RunRow,
+    bare: &GitDir,
+    wt: &Path,
+    default_branch: &str,
+) -> Result<(), DeliverError> {
+    let bin = resolve_gh_bin();
+    let timeout = gh_timeout();
+    let head_sha = porch_git::rev_parse_c(wt, "HEAD")?;
+    let pr = find_open_pr(&bin, timeout, wt, &run.branch)?
+        .ok_or_else(|| DeliverError::Msg("compose skip: no open PR for branch".into()))?;
+    let viewed = view_pr(&bin, timeout, wt, pr.number).unwrap_or(porch_deliver::PrView {
+        number: pr.number,
+        url: pr.url.clone(),
+        title: String::new(),
+        body: String::new(),
+    });
+
+    let attestation = attestation_post_compose(db, &run.id, &head_sha, "skipped")?;
+    // Keep scaffold managed interior; refresh attestation only.
+    let interior = compose_managed_interior(&viewed.body);
+    let interior = if interior.trim().is_empty() {
+        let assembly = assemble_scaffold(db, bare, run, &head_sha, wt)?;
+        assembly.managed_interior
+    } else {
+        interior
+    };
+    let merged = merge_porch_managed(&viewed.body, &interior, &attestation);
+    edit_pr_body(&bin, timeout, wt, pr.number, &merged)?;
+
+    let trusted = load_trusted_deliver(db, &run.id, bare, default_branch)?;
+    maybe_watch(
+        &bin,
+        timeout,
+        wt,
+        pr.number,
+        &trusted.deliver_github.watch_checks,
+        None,
+    )?;
+    db.insert_step_result(&run.id, "compose", "skipped", Some("compose=scaffold"))?;
+    db.insert_step_result(&run.id, "deliver", "completed", Some("compose=scaffold"))?;
+    db.set_run_status(&run.id, "completed", None)?;
+    if let Some(hub) = event_hub() {
+        hub.publish_state(&run.id);
+        hub.publish_activity(&run.id, "step=deliver status=completed");
+    }
+    Ok(())
+}
+
+/// Attestation as it will look after compose resolves (exclude parked compose row).
+fn attestation_post_compose(
+    db: &Db,
+    run_id: &str,
+    head_sha: &str,
+    compose_status: &str,
+) -> Result<Attestation, DeliverError> {
+    let steps = db.step_results_for_run(run_id)?;
+    let mut snapshots: Vec<StepSnapshot> = steps
+        .iter()
+        .filter(|s| !(s.step == "compose" && s.status == "parked"))
+        .map(|s| StepSnapshot {
+            step: s.step.clone(),
+            status: s.status.clone(),
+        })
+        .collect();
+    snapshots.push(StepSnapshot {
+        step: "compose".into(),
+        status: compose_status.into(),
+    });
+    snapshots.push(StepSnapshot {
+        step: "deliver".into(),
+        status: "completed".into(),
+    });
+    Ok(Attestation {
+        head_sha: head_sha.to_string(),
+        steps: snapshots,
+    })
 }
 
 fn commit_subjects(wt: &Path, base_sha: Option<&str>, head_sha: &str) -> Vec<String> {

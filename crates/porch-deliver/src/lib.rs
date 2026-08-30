@@ -893,6 +893,107 @@ pub fn theater_reject_rules() -> serde_json::Value {
     })
 }
 
+/// Extract the managed interior from an Agent compose body (markers optional).
+#[must_use]
+pub fn compose_managed_interior(body: &str) -> String {
+    let cleaned = strip_attestation_comments(body);
+    match (cleaned.find(MANAGED_BEGIN), cleaned.find(MANAGED_END)) {
+        (Some(begin), Some(end)) if begin < end => {
+            let interior = cleaned[begin + MANAGED_BEGIN.len()..end].trim();
+            if interior.is_empty() {
+                String::new()
+            } else {
+                format!("{interior}\n")
+            }
+        }
+        _ => {
+            let trimmed = cleaned.trim();
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("{trimmed}\n")
+            }
+        }
+    }
+}
+
+/// Validate Agent compose body before merge (PRCMP-4.4).
+///
+/// # Errors
+///
+/// Returns a human-readable rejection when the body is empty or reintroduces
+/// porch self-review theater signatures.
+pub fn validate_compose_body(body: &str) -> Result<(), String> {
+    let interior = compose_managed_interior(body);
+    if interior.trim().is_empty() {
+        return Err("compose body is empty".into());
+    }
+
+    let visible = strip_attestation_comments(body);
+    if has_pipeline_board(&visible) {
+        return Err("compose body rejected: porch theater signature (Pipeline board)".into());
+    }
+    if has_approved_at_sha_line(&visible) {
+        return Err("compose body rejected: porch theater signature (approved-at SHA)".into());
+    }
+    if has_certify_transcript(&visible) {
+        return Err("compose body rejected: porch theater signature (Certify transcript)".into());
+    }
+    if has_review_findings_dump(&visible) {
+        return Err("compose body rejected: porch theater signature (Review findings dump)".into());
+    }
+    if has_visible_attestation_restatement(&visible) {
+        return Err("compose body rejected: porch theater signature (visible attestation)".into());
+    }
+    Ok(())
+}
+
+fn has_pipeline_board(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("## pipeline") {
+        return false;
+    }
+    // intent → … → deliver (ASCII or unicode arrows)
+    let collapsed: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    collapsed.contains("intent")
+        && collapsed.contains("deliver")
+        && (collapsed.contains("→") || collapsed.contains("->") || collapsed.contains("=>"))
+}
+
+fn has_approved_at_sha_line(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("approved at") && lower.chars().filter(char::is_ascii_hexdigit).count() >= 7
+}
+
+fn has_certify_transcript(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("## certify") {
+        return false;
+    }
+    // Gate-style transcript cues (not a bare consumer checklist heading).
+    lower.contains("continuity")
+        || lower.contains("certified head")
+        || lower.contains("certify:")
+        || (lower.contains("passed") && lower.contains("failed"))
+}
+
+fn has_review_findings_dump(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("## review") {
+        return false;
+    }
+    lower.contains("\"severity\"")
+        || lower.contains("finding id")
+        || lower.contains("findings:")
+        || lower.contains("blocking finding")
+}
+
+fn has_visible_attestation_restatement(body: &str) -> bool {
+    // HTML comment attestation is stripped before this check; bare marker is theater.
+    body.to_ascii_lowercase().contains("porch-attestation")
+        || (body.contains("\"head_sha\"") && body.contains("\"steps\""))
+}
+
 /// Options for [`watch_allowlisted_checks`].
 #[derive(Debug, Clone)]
 pub struct WatchChecksOpts<'a> {
@@ -1265,6 +1366,23 @@ mod tests {
         assert!(!body.contains("## Review"), "{body}");
         assert!(!body.contains("## Certify"), "{body}");
         assert!(!body.contains("## Pipeline"), "{body}");
+    }
+
+    #[test]
+    fn validate_compose_body_rejects_theater_and_empty() {
+        assert!(validate_compose_body("").is_err());
+        assert!(validate_compose_body("   \n").is_err());
+        let theater =
+            "## Summary\nok\n\n## Pipeline\n\nintent → rebase → review → certify → deliver\n";
+        assert!(
+            validate_compose_body(theater)
+                .unwrap_err()
+                .contains("theater")
+        );
+        let approved = "## Summary\nok\n\napproved at `deadbeefcafebabe`\n";
+        assert!(validate_compose_body(approved).is_err());
+        let ok = "## Summary\n\nShip it.\n\n## Why\n\nBecause.\n";
+        assert!(validate_compose_body(ok).is_ok());
     }
 
     fn bare_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, porch_git::GitDir, String) {

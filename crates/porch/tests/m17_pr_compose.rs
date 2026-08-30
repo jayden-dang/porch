@@ -496,3 +496,355 @@ deliver:
 
     kill_daemon(&s.home);
 }
+
+fn agent_cmd(s: &Setup) -> Command {
+    let mut cmd = Command::cargo_bin("porch").unwrap();
+    cmd.current_dir(&s.work)
+        .env("PORCH_HOME", &s.home)
+        .env(REVIEW_BIN_ENV, &s.fake_review)
+        .env(GH_BIN_ENV, &s.fake_gh)
+        .env("PORCH_FAKE_REVIEW_MODE", "clean")
+        .env("PORCH_FAKE_GH_MODE", "ok")
+        .env("PATH", &s.path);
+    cmd
+}
+
+fn park_compose_run(s: &Setup, branch: &str, intent: Option<&str>) -> porch_gate::RunRow {
+    git(&s.work, &["checkout", "-b", branch]);
+    commit_change(&s.work, &format!("{branch}.txt"), "x\n");
+    push_feat(s, branch, intent);
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed"],
+        Duration::from_secs(45),
+    );
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
+    run
+}
+
+#[test]
+fn compose_status_exposes_pr_url_packet_and_allowed_actions() {
+    let s = setup(None);
+    let run = park_compose_run(&s, "feat-status", Some("status fields for compose"));
+
+    let out = agent_cmd(&s)
+        .args(["agent", "status", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["status"], "parked");
+    assert_eq!(status["phase"], "compose");
+    assert_eq!(status["pr_url"], "https://example.com/pull/1");
+    let packet = status["compose_packet_path"].as_str().unwrap_or_default();
+    assert!(
+        packet.ends_with("compose-packet.json"),
+        "compose_packet_path={packet}"
+    );
+    assert!(Path::new(packet).is_file(), "missing {packet}");
+    let actions = status["allowed_actions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let actions: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+    assert!(actions.contains(&"respond"), "{actions:?}");
+    assert!(actions.contains(&"skip"), "{actions:?}");
+    assert!(actions.contains(&"abort"), "{actions:?}");
+
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn compose_skip_completes_deliver_leaving_scaffold() {
+    let s = setup(None);
+    let run = park_compose_run(&s, "feat-skip-compose", Some("accept scaffold"));
+    let body_before = std::fs::read_to_string(s.home.join("gh-pr-body.txt")).unwrap();
+
+    agent_cmd(&s)
+        .args(["agent", "respond", "skip", "--run-id", &run.id])
+        .assert()
+        .success();
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("skipped"),
+        "steps={steps:?}"
+    );
+    assert!(
+        last_step(&steps, "compose")
+            .and_then(|s| s.error.as_deref())
+            .is_some_and(|d| d.contains("compose=scaffold") || d.contains("scaffold")),
+        "compose detail={:?}",
+        last_step(&steps, "compose").and_then(|s| s.error.clone())
+    );
+    assert_eq!(
+        last_step(&steps, "deliver").map(|s| s.status.as_str()),
+        Some("completed"),
+        "compose skip must continue deliver, not review-skip; steps={steps:?}"
+    );
+    assert!(
+        last_step(&steps, "certify").map(|s| s.status.as_str()) != Some("skipped"),
+        "must not take review Skip arm; steps={steps:?}"
+    );
+
+    let body = std::fs::read_to_string(s.home.join("gh-pr-body.txt")).unwrap();
+    assert!(body.contains("## Summary"), "{body}");
+    assert!(!body.contains("## Intent"), "{body}");
+    assert!(!body.contains("## Review"), "{body}");
+    assert!(!body.contains("## Certify"), "{body}");
+    assert!(!body.contains("## Pipeline"), "{body}");
+    // Attestation refreshed to post-compose state.
+    assert!(body.contains("porch-attestation"), "{body}");
+    assert!(
+        body.contains("\"step\":\"deliver\"") && body.contains("\"status\":\"completed\""),
+        "attestation should show deliver completed: {body}"
+    );
+    assert!(
+        body.contains("\"step\":\"compose\""),
+        "attestation should mention compose: {body}"
+    );
+    // Scaffold prose preserved (managed interior not blanked).
+    assert!(
+        body.contains("## Why") || body_before.contains("## Why"),
+        "{body}"
+    );
+    assert!(
+        s.home.join("gh-pr-state").is_file(),
+        "PR must remain after skip"
+    );
+    assert!(
+        run.worktree_dir.as_ref().is_none_or(|p| !p.exists()),
+        "worktree should be removed after compose resolve"
+    );
+
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn compose_respond_merges_body_title_and_completes() {
+    let s = setup(None);
+    let run = park_compose_run(&s, "feat-respond", Some("agent authors prose"));
+
+    let body_path = s.home.join("agent-body.md");
+    std::fs::write(
+        &body_path,
+        r"## Summary
+
+Agent-authored summary for compose respond.
+
+## Why
+
+Because porch must not invent PR prose.
+
+## How tested
+
+m17 compose respond test
+
+## Links
+
+_None_
+",
+    )
+    .unwrap();
+
+    agent_cmd(&s)
+        .args([
+            "agent",
+            "respond",
+            "--run-id",
+            &run.id,
+            "--body-file",
+            body_path.to_str().unwrap(),
+            "--title",
+            "Compose respond title",
+        ])
+        .assert()
+        .success();
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("completed"),
+        "steps={steps:?}"
+    );
+    assert_eq!(
+        last_step(&steps, "deliver").map(|s| s.status.as_str()),
+        Some("completed"),
+        "steps={steps:?}"
+    );
+    let compose_detail = last_step(&steps, "compose").and_then(|s| s.error.clone());
+    let deliver_detail = last_step(&steps, "deliver").and_then(|s| s.error.clone());
+    assert!(
+        compose_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("compose=agent") || d.contains("agent"))
+            || deliver_detail
+                .as_deref()
+                .is_some_and(|d| d.contains("compose=agent")),
+        "compose/deliver detail missing agent provenance: compose={compose_detail:?} deliver={deliver_detail:?}"
+    );
+
+    let body = std::fs::read_to_string(s.home.join("gh-pr-body.txt")).unwrap();
+    assert!(body.contains(MANAGED_BEGIN), "{body}");
+    assert!(
+        body.contains("Agent-authored summary for compose respond"),
+        "{body}"
+    );
+    assert!(body.contains("porch-attestation"), "{body}");
+    assert!(
+        body.contains("\"status\":\"completed\""),
+        "attestation refreshed: {body}"
+    );
+    assert!(!body.contains("## Pipeline"), "{body}");
+
+    let title = std::fs::read_to_string(s.home.join("gh-pr-title.txt")).unwrap();
+    assert!(
+        title.contains("Compose respond title"),
+        "expected managed title update, got {title}"
+    );
+
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn compose_abort_fails_run_and_leaves_pr_open() {
+    let s = setup(None);
+    let run = park_compose_run(&s, "feat-abort-compose", None);
+    assert!(s.home.join("gh-pr-state").is_file());
+
+    let out = agent_cmd(&s)
+        .args(["agent", "respond", "abort", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    // cancelled/failed → non-zero agent exit
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert!(
+        run.status == "cancelled" || run.status == "failed",
+        "status={} err={:?}",
+        run.status,
+        run.error
+    );
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert!(
+        last_step(&steps, "deliver").map(|s| s.status.as_str()) != Some("completed"),
+        "abort must not complete deliver; steps={steps:?}"
+    );
+    assert!(
+        s.home.join("gh-pr-state").is_file(),
+        "PR must remain open after abort"
+    );
+    let log = gh_argv_log(&s.home);
+    assert!(
+        !log.contains("pr close"),
+        "must not auto-close PR on abort: {log}"
+    );
+
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn compose_respond_rejects_theater_and_stays_parked() {
+    let s = setup(None);
+    let run = park_compose_run(&s, "feat-theater-reject", None);
+
+    let body_path = s.home.join("bad-body.md");
+    std::fs::write(
+        &body_path,
+        r"## Summary
+
+oops
+
+## Pipeline
+
+intent → rebase → review → certify → deliver
+
+## Review
+
+approved at `deadbeefcafebabe`
+",
+    )
+    .unwrap();
+
+    let out = agent_cmd(&s)
+        .args([
+            "agent",
+            "respond",
+            "--run-id",
+            &run.id,
+            "--body-file",
+            body_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0), "theater body must be rejected");
+    let err_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let err = err_json["error"].as_str().unwrap_or_default();
+    assert!(
+        err.to_lowercase().contains("theater")
+            || err.to_lowercase().contains("pipeline")
+            || err.to_lowercase().contains("reject"),
+        "stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("parked"),
+        "steps={steps:?}"
+    );
+
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn compose_approve_and_fix_are_usage_errors() {
+    let s = setup(None);
+    let run = park_compose_run(&s, "feat-compose-usage", None);
+
+    for verb in ["approve", "fix"] {
+        let out = agent_cmd(&s)
+            .args(["agent", "respond", verb, "--run-id", &run.id])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "verb={verb} stdout={}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["code"], "usage", "verb={verb} {v}");
+    }
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "parked");
+
+    kill_daemon(&s.home);
+}
