@@ -402,6 +402,10 @@ fn pipeline_summary(steps: &[porch_gate::StepResultRow]) -> String {
     parts.join(" → ")
 }
 
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 #[cfg(test)]
 mod body_tests {
     use super::{certify_summary, pipeline_summary, review_summary};
@@ -494,8 +498,4 @@ mod body_tests {
         assert!(pipe.contains("certify:completed"), "{pipe}");
         assert!(pipe.contains("deliver:completed"), "{pipe}");
     }
-}
-
-fn cancelled(cancel: Option<&AtomicBool>) -> bool {
-    cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
 }

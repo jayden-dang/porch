@@ -472,7 +472,8 @@ mod tests {
         std::fs::create_dir_all(wt.join("src")).unwrap();
         let mut body = String::new();
         for i in 1..=20 {
-            body.push_str(&format!("line {i} content\n"));
+            use std::fmt::Write as _;
+            writeln!(body, "line {i} content").unwrap();
         }
         std::fs::write(wt.join("src/a.rs"), &body).unwrap();
 
