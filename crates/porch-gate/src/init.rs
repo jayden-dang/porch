@@ -7,6 +7,7 @@ use crate::Result;
 use crate::db::Db;
 use crate::home::{db_path, repos_dir};
 use crate::id::repo_id_for;
+use crate::skill::{SkillInstallReport, install_agent_skills, user_home_from_env};
 
 #[derive(Clone, Copy)]
 pub struct InitOptions<'a> {
@@ -20,6 +21,8 @@ pub struct InitResult {
     pub repo_id: String,
     pub bare_path: PathBuf,
     pub default_branch: String,
+    /// Best-effort agent skill install (empty when `$HOME` unset).
+    pub skills: SkillInstallReport,
 }
 
 /// Install the named remote, bare repo, and hooks. Optionally start the daemon.
@@ -58,10 +61,20 @@ pub fn init(opts: InitOptions<'_>) -> Result<InitResult> {
     if opts.start_daemon {
         crate::ensure_daemon(opts.porch_bin, &porch_home)?;
     }
+    let skills = if let Some(user_home) = user_home_from_env() {
+        install_agent_skills(&user_home)
+    } else {
+        let mut report = SkillInstallReport::default();
+        report
+            .warnings
+            .push("skill: HOME unset — skip agent skill install".into());
+        report
+    };
     Ok(InitResult {
         repo_id,
         bare_path,
         default_branch,
+        skills,
     })
 }
 

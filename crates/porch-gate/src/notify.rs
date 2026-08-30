@@ -1,3 +1,5 @@
+//! post-receive: record runs and ask the daemon to start them.
+
 use std::io::Read;
 use std::path::Path;
 
@@ -8,8 +10,8 @@ use crate::rpc;
 
 /// Parse post-receive lines and insert a pending run per updated branch.
 ///
-/// When `PORCH_INTENT` is set and non-empty, it is stored on the run as
-/// authoritative intent (`intent_source = env`).
+/// Intent (E17): non-empty `intent_cli` wins (source `cli`); else non-empty
+/// `PORCH_INTENT` (source `env`); empty skips the intent phase and does not fail.
 ///
 /// After insert, requests the daemon to `start_run` (best-effort if down).
 ///
@@ -17,17 +19,28 @@ use crate::rpc;
 ///
 /// Returns an error if stdin cannot be read, the database cannot be opened, the
 /// bare path is unknown, or a run row cannot be inserted.
-pub fn notify_push(home: &Path, git_dir: &Path, mut stdin: impl Read) -> Result<Vec<String>> {
+pub fn notify_push(
+    home: &Path,
+    git_dir: &Path,
+    stdin: impl Read,
+    intent_cli: Option<&str>,
+) -> Result<Vec<String>> {
+    notify_push_inner(home, git_dir, stdin, intent_cli)
+}
+
+fn notify_push_inner(
+    home: &Path,
+    git_dir: &Path,
+    mut stdin: impl Read,
+    intent_cli: Option<&str>,
+) -> Result<Vec<String>> {
     let mut buf = String::new();
     stdin.read_to_string(&mut buf)?;
     let db = Db::open(&db_path(home))?;
     let repo = db
         .repo_by_bare(git_dir)?
         .ok_or_else(|| crate::Error::Other(format!("no repo for bare {}", git_dir.display())))?;
-    let (intent, intent_source) = match std::env::var("PORCH_INTENT") {
-        Ok(s) if !s.trim().is_empty() => (Some(s), Some("env")),
-        _ => (None, None),
-    };
+    let (intent, intent_source) = resolve_intent(intent_cli, std::env::var("PORCH_INTENT").ok());
     let mut ids = Vec::new();
     for line in buf.lines() {
         let line = line.trim();
@@ -56,6 +69,24 @@ pub fn notify_push(home: &Path, git_dir: &Path, mut stdin: impl Read) -> Result<
     Ok(ids)
 }
 
+/// CLI `--intent` preferred when the flag is present; otherwise env value.
+/// Empty string skips (does not fail).
+fn resolve_intent(
+    intent_cli: Option<&str>,
+    intent_env: Option<String>,
+) -> (Option<String>, Option<&'static str>) {
+    if let Some(raw) = intent_cli {
+        if raw.trim().is_empty() {
+            return (None, None);
+        }
+        return (Some(raw.to_string()), Some("cli"));
+    }
+    match intent_env {
+        Some(s) if !s.trim().is_empty() => (Some(s), Some("env")),
+        _ => (None, None),
+    }
+}
+
 /// Resolve `GIT_DIR` from the environment to a canonical absolute path.
 ///
 /// # Errors
@@ -72,4 +103,37 @@ pub fn git_dir_from_env() -> Result<std::path::PathBuf> {
         std::env::current_dir()?.join(path)
     };
     Ok(absolute.canonicalize()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_intent;
+
+    #[test]
+    fn cli_intent_preferred_over_env() {
+        let (intent, src) = resolve_intent(Some("from-cli"), Some("from-env".into()));
+        assert_eq!(intent.as_deref(), Some("from-cli"));
+        assert_eq!(src, Some("cli"));
+    }
+
+    #[test]
+    fn empty_cli_intent_skips_without_env_fallback() {
+        let (intent, src) = resolve_intent(Some("  "), Some("from-env".into()));
+        assert!(intent.is_none());
+        assert!(src.is_none());
+    }
+
+    #[test]
+    fn env_intent_when_cli_absent() {
+        let (intent, src) = resolve_intent(None, Some("from-env".into()));
+        assert_eq!(intent.as_deref(), Some("from-env"));
+        assert_eq!(src, Some("env"));
+    }
+
+    #[test]
+    fn empty_env_skips() {
+        let (intent, src) = resolve_intent(None, Some("  ".into()));
+        assert!(intent.is_none());
+        assert!(src.is_none());
+    }
 }

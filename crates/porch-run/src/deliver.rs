@@ -264,38 +264,236 @@ fn assemble_body(
         })
         .collect();
 
-    let what = match porch_git::diff_name_only(
-        wt,
-        &format!(
-            "{}..{head_sha}",
-            run.base_sha.as_deref().unwrap_or(head_sha)
-        ),
-    ) {
-        Ok(files) if !files.is_empty() => files.join("\n"),
-        _ => "_see commits_".into(),
-    };
-
-    let review = if run.review_approved_head_sha.is_some() {
-        format!(
-            "approved at `{}`",
-            run.review_approved_head_sha.as_deref().unwrap_or("")
-        )
-    } else {
-        "n/a".into()
-    };
+    let what = what_changed_summary(run, head_sha, wt);
+    let review = review_summary(run);
+    let certify = certify_summary(&steps);
+    let pipeline = pipeline_summary(&steps);
 
     Ok(build_pr_body(
         run.intent.as_deref(),
         &what,
         "_not assessed_",
         &review,
-        "completed",
-        "intent → rebase → review → certify → deliver",
+        &certify,
+        &pipeline,
         &Attestation {
             head_sha: head_sha.to_string(),
             steps: snapshots,
         },
     ))
+}
+
+fn what_changed_summary(run: &porch_gate::RunRow, head_sha: &str, wt: &Path) -> String {
+    const CAP: usize = 40;
+    match porch_git::diff_name_only(
+        wt,
+        &format!(
+            "{}..{head_sha}",
+            run.base_sha.as_deref().unwrap_or(head_sha)
+        ),
+    ) {
+        Ok(files) if !files.is_empty() => {
+            let mut lines = files;
+            if lines.len() > CAP {
+                let extra = lines.len() - CAP;
+                lines.truncate(CAP);
+                lines.push(format!("…and {extra} more"));
+            }
+            lines.join("\n")
+        }
+        _ => "_see commits_".into(),
+    }
+}
+
+fn review_summary(run: &porch_gate::RunRow) -> String {
+    let findings: Vec<serde_json::Value> = run
+        .findings_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let approved = run.review_approved_head_sha.as_deref();
+    if findings.is_empty() {
+        return match approved {
+            Some(sha) => format!("approved at `{sha}` (clean)"),
+            None => "n/a (skipped or not approved)".into(),
+        };
+    }
+    let mut blocking = 0usize;
+    let mut other = 0usize;
+    let mut samples: Vec<String> = Vec::new();
+    for f in &findings {
+        let severity = f.get("severity").and_then(|v| v.as_str()).unwrap_or("");
+        let action = f.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let is_blocking = matches!(severity, "error" | "warning") || action == "ask-user";
+        if is_blocking {
+            blocking += 1;
+        } else {
+            other += 1;
+        }
+        if samples.len() < 5 {
+            let id = f.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let msg = f.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let short: String = msg.chars().take(80).collect();
+            samples.push(format!("- `{id}` ({severity}) {path}: {short}"));
+        }
+    }
+    let mut out = match approved {
+        Some(sha) => {
+            format!("approved at `{sha}` — {blocking} blocking, {other} other finding(s) recorded")
+        }
+        None => format!("{blocking} blocking, {other} other finding(s) (not approved)"),
+    };
+    if !samples.is_empty() {
+        out.push('\n');
+        out.push_str(&samples.join("\n"));
+        if findings.len() > samples.len() {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\n- …and {} more", findings.len() - samples.len());
+        }
+    }
+    out
+}
+
+fn certify_summary(steps: &[porch_gate::StepResultRow]) -> String {
+    let latest = steps.iter().rev().find(|s| s.step == "certify");
+    match latest {
+        Some(s) if s.status == "completed" => "completed".into(),
+        Some(s) if s.status == "skipped" => {
+            format!(
+                "skipped{}",
+                s.error
+                    .as_deref()
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default()
+            )
+        }
+        Some(s) if s.status == "failed" => {
+            format!(
+                "failed{}",
+                s.error
+                    .as_deref()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default()
+            )
+        }
+        Some(s) => format!(
+            "{}{}",
+            s.status,
+            s.error
+                .as_deref()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default()
+        ),
+        None => "n/a".into(),
+    }
+}
+
+fn pipeline_summary(steps: &[porch_gate::StepResultRow]) -> String {
+    const ORDER: &[&str] = &["intent", "rebase", "review", "certify", "deliver"];
+    let mut parts = Vec::new();
+    for name in ORDER {
+        let latest = steps.iter().rev().find(|s| s.step == *name);
+        match latest {
+            Some(s) => parts.push(format!("{name}:{status}", status = s.status)),
+            None => parts.push(format!("{name}:-")),
+        }
+    }
+    parts.join(" → ")
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::{certify_summary, pipeline_summary, review_summary};
+    use porch_gate::{RunRow, StepResultRow};
+
+    fn run_with_findings(json: &str, approved: Option<&str>) -> RunRow {
+        RunRow {
+            id: "r1".into(),
+            repo_id: "repo".into(),
+            branch: "feat".into(),
+            sha: "abc".into(),
+            status: "completed".into(),
+            worktree_dir: None,
+            head_sha: Some("abc".into()),
+            base_sha: Some("def".into()),
+            intent: Some("ship it".into()),
+            intent_source: Some("cli".into()),
+            error: None,
+            review_approved_head_sha: approved.map(str::to_string),
+            findings_json: Some(json.into()),
+            fixer_session_id: None,
+            pr_url: None,
+            deliver_repair_attempts: 0,
+            trusted_config_sha: None,
+        }
+    }
+
+    #[test]
+    fn review_summary_lists_findings_when_approved() {
+        let run = run_with_findings(
+            r#"[{"id":"f0","path":"a.rs","message":"null deref","severity":"warning","action":"ask-user"}]"#,
+            Some("deadbeef"),
+        );
+        let s = review_summary(&run);
+        assert!(s.contains("approved at `deadbeef`"), "{s}");
+        assert!(s.contains("1 blocking"), "{s}");
+        assert!(s.contains("`f0`"), "{s}");
+        assert!(s.contains("null deref"), "{s}");
+    }
+
+    #[test]
+    fn review_summary_clean_when_no_findings() {
+        let run = run_with_findings("[]", Some("abc"));
+        let s = review_summary(&run);
+        assert!(s.contains("clean"), "{s}");
+    }
+
+    #[test]
+    fn certify_and_pipeline_from_steps() {
+        let steps = vec![
+            StepResultRow {
+                id: "1".into(),
+                run_id: "r".into(),
+                step: "intent".into(),
+                status: "skipped".into(),
+                error: Some("no intent".into()),
+            },
+            StepResultRow {
+                id: "2".into(),
+                run_id: "r".into(),
+                step: "rebase".into(),
+                status: "completed".into(),
+                error: None,
+            },
+            StepResultRow {
+                id: "3".into(),
+                run_id: "r".into(),
+                step: "review".into(),
+                status: "completed".into(),
+                error: None,
+            },
+            StepResultRow {
+                id: "4".into(),
+                run_id: "r".into(),
+                step: "certify".into(),
+                status: "completed".into(),
+                error: None,
+            },
+            StepResultRow {
+                id: "5".into(),
+                run_id: "r".into(),
+                step: "deliver".into(),
+                status: "completed".into(),
+                error: None,
+            },
+        ];
+        assert_eq!(certify_summary(&steps), "completed");
+        let pipe = pipeline_summary(&steps);
+        assert!(pipe.contains("intent:skipped"), "{pipe}");
+        assert!(pipe.contains("certify:completed"), "{pipe}");
+        assert!(pipe.contains("deliver:completed"), "{pipe}");
+    }
 }
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {

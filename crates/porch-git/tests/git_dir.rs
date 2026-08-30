@@ -306,6 +306,82 @@ fn push_exact_sha_new_branch_then_up_to_date() {
 }
 
 #[test]
+fn push_exact_sha_skips_client_pre_push_hooks() {
+    // Deliver must pass --no-verify so a rejecting client pre-push (e.g. lefthook
+    // planted into the bare gate hooks dir) cannot block origin forward.
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let (origin_gd, seed, _main_sha) = seed_bare_with_main(&root);
+
+    std::fs::write(seed.join("feat.txt"), "x\n").unwrap();
+    Command::new("git")
+        .current_dir(&seed)
+        .args(["add", "feat.txt"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(&seed)
+        .args(["commit", "-m", "feat"])
+        .status()
+        .unwrap();
+    let feat_sha = stdout_trim(
+        &run(
+            &GitDir::new(seed.join(".git")).unwrap(),
+            &["rev-parse", "HEAD"],
+        )
+        .unwrap(),
+    );
+
+    let gate = root.join("gate.git");
+    let gate_gd = init_bare(&gate).unwrap();
+    run(
+        &gate_gd,
+        &[
+            "remote",
+            "add",
+            "origin",
+            origin_gd.as_path().to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    Command::new("git")
+        .current_dir(&seed)
+        .args(["remote", "add", "gate", gate.to_str().unwrap()])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(&seed)
+        .args(["push", "gate", "HEAD:refs/heads/feat"])
+        .status()
+        .unwrap();
+
+    let hook = gate.join("hooks/pre-push");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\necho 'pre-push should be skipped' >&2\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook, perms).unwrap();
+    }
+
+    push_exact_sha(
+        &gate_gd,
+        "origin",
+        "refs/heads/feat",
+        &feat_sha,
+        PushDecision::NewBranch,
+    )
+    .unwrap();
+    let tip = ls_remote_sha(&gate_gd, "origin", "refs/heads/feat").unwrap();
+    assert_eq!(tip, RemoteTip::Present(feat_sha));
+}
+
+#[test]
 fn lease_push_updates_when_incorporated() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -387,6 +463,7 @@ fn lease_push_updates_when_incorporated() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn incorporate_refuses_divergent_remote() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();

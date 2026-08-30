@@ -355,7 +355,7 @@ fn empty_diff_after_rebase_completes_and_skips_later_phases() {
 }
 
 #[test]
-fn rebase_conflict_aborts_and_fails_run() {
+fn rebase_conflict_aborts_and_parks_run() {
     let (_tmp, work, home, origin) = setup_with_origin();
 
     git(&work, &["checkout", "-b", "conflict"]);
@@ -386,19 +386,20 @@ fn rebase_conflict_aborts_and_fails_run() {
         .iter()
         .find(|r| r.branch == "conflict")
         .expect("conflict run");
-    assert_eq!(run.status, "failed", "err={:?}", run.error);
+    // M13 / E15: park after successful abort (worktree kept).
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
     assert!(
         run.error.as_deref().is_some_and(|e| e.contains("rebase")),
         "error={:?}",
         run.error
     );
 
-    if let Some(wt) = &run.worktree_dir {
-        assert!(
-            !wt.join(".git/rebase-merge").exists() && !wt.join(".git/rebase-apply").exists(),
-            "rebase state left in worktree"
-        );
-    }
+    let wt = run.worktree_dir.as_ref().expect("worktree kept on park");
+    assert!(wt.exists());
+    assert!(
+        !wt.join(".git/rebase-merge").exists() && !wt.join(".git/rebase-apply").exists(),
+        "rebase state left in worktree"
+    );
 
     kill_daemon(&home);
 }

@@ -1,8 +1,10 @@
 //! Execute a porch run: disposable worktree, intent, rebase, review, certify, deliver.
 
+mod agent_run;
 mod certify;
 mod config;
 mod deliver;
+mod sync;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -13,15 +15,18 @@ static FETCH_RESOLVE_LOCK: Mutex<()> = Mutex::new(());
 
 use porch_agent::{
     RunFixerOpts, fixer_bin, fixer_timeout, run_fixer, write_deliver_repair_inputs,
-    write_fixer_inputs,
+    write_fixer_inputs, write_rebase_fix_inputs,
 };
 use porch_gate::{
-    Db, RunExecutor, RunRow, db_path, event_hub, run_deliver_repair_dir, run_fixer_dir,
-    run_worktree_dir,
+    Db, RunExecutor, RunRow, db_path, event_hub, load_finding_notes, repo_id_for, rpc_start_run,
+    run_deliver_repair_dir, run_fixer_dir, run_worktree_dir,
 };
 use porch_git::GitDir;
 use porch_review::{Finding, RunReviewOpts, review_bin, review_timeout, run_review};
 use serde::Serialize;
+
+pub use agent_run::{AgentRunOpts, agent_run};
+pub use sync::{SyncStatus, agent_sync, recovery_ref_name, sync_hint_for};
 
 use crate::config::{
     effective_base_branch, load_trusted_at_sha, persist_path_instructions,
@@ -151,21 +156,21 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                     }
                 }
                 "rebase" => {
-                    match run_rebase(&db, home, run_id, &bare, &wt_path, &repo.default_branch) {
-                        Ok(empty) => {
+                    match run_rebase(&db, home, run_id, &bare, &wt_path, &repo.default_branch)? {
+                        RebaseOutcome::Completed { empty } => {
                             record_step(&db, run_id, phase, "completed", None)?;
                             if empty {
                                 skip_remaining = true;
                             }
                         }
-                        Err(e) => {
-                            let msg = e.to_string();
-                            record_step(&db, run_id, phase, "failed", Some(&msg))?;
-                            return Err(e);
+                        RebaseOutcome::Parked { detail } => {
+                            record_step(&db, run_id, phase, "parked", Some(&detail))?;
+                            set_status(&db, run_id, "parked", Some(&detail))?;
+                            return Ok(PhaseLoop::Parked);
                         }
                     }
                 }
-                "review" => match run_review_phase(&db, run_id, &wt_path, false)? {
+                "review" => match run_review_phase(&db, home, run_id, &wt_path, false)? {
                     ReviewPhase::Approved => {
                         record_step(&db, run_id, phase, "completed", None)?;
                     }
@@ -177,6 +182,7 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                 "certify" => {
                     execute_certify_step(
                         &db,
+                        home,
                         run_id,
                         &bare,
                         &wt_path,
@@ -225,7 +231,11 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
             let _ = set_status(&db, run_id, "failed", Some(&e.to_string()));
         }
     }
-    remove_run_worktree(&bare, &wt_path);
+    if let Ok(Some(final_run)) = db.run_by_id(run_id) {
+        finish_remove_worktree(&bare, &final_run, &wt_path);
+    } else {
+        remove_run_worktree(&bare, &wt_path);
+    }
     match outcome {
         Ok(_) => Ok(()),
         Err(e) => Err(e),
@@ -237,7 +247,13 @@ enum ReviewPhase {
     Parked,
 }
 
-fn run_review_phase(db: &Db, run_id: &str, wt: &Path, after_fix: bool) -> Result<ReviewPhase> {
+fn run_review_phase(
+    db: &Db,
+    home: &Path,
+    run_id: &str,
+    wt: &Path,
+    after_fix: bool,
+) -> Result<ReviewPhase> {
     let run = db
         .run_by_id(run_id)?
         .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
@@ -261,6 +277,9 @@ fn run_review_phase(db: &Db, run_id: &str, wt: &Path, after_fix: bool) -> Result
         changed_files: &changed,
         bin: &bin,
         timeout,
+        porch_home: Some(home),
+        run_id: Some(run_id),
+        intent: run.intent.as_deref(),
     }) {
         Ok(o) => o,
         Err(porch_review::Error::Timeout(d)) => {
@@ -331,6 +350,7 @@ fn clear_uncertified_if_certified(
 
 fn execute_certify_step(
     db: &Db,
+    home: &Path,
     run_id: &str,
     bare: &GitDir,
     wt: &Path,
@@ -338,7 +358,7 @@ fn execute_certify_step(
     cancel: &AtomicBool,
 ) -> Result<()> {
     assert_head_continuity(db, run_id, wt)?;
-    match certify::run_certify_phase(db, run_id, bare, wt, default_branch, Some(cancel)) {
+    match certify::run_certify_phase(db, home, run_id, bare, wt, default_branch, Some(cancel)) {
         Ok(()) => {
             record_step(db, run_id, "certify", "completed", None)?;
             Ok(())
@@ -438,12 +458,20 @@ fn deliver_with_repair(
                 )?;
 
                 // Session-free rereview (after_fix never passes fixer session).
-                match run_review_phase(db, run_id, wt, true)? {
+                match run_review_phase(db, home, run_id, wt, true)? {
                     ReviewPhase::Approved => {
                         record_step(db, run_id, "review", "completed", Some("deliver_repair"))?;
                         let local_cancel = AtomicBool::new(false);
                         let cancel_flag = cancel.unwrap_or(&local_cancel);
-                        execute_certify_step(db, run_id, bare, wt, default_branch, cancel_flag)?;
+                        execute_certify_step(
+                            db,
+                            home,
+                            run_id,
+                            bare,
+                            wt,
+                            default_branch,
+                            cancel_flag,
+                        )?;
                         assert_head_continuity(db, run_id, wt)?;
                         // Loop: lease-push + PR update + re-watch.
                     }
@@ -658,6 +686,11 @@ fn persist_uncertified_after_fix(
     Ok(())
 }
 
+enum RebaseOutcome {
+    Completed { empty: bool },
+    Parked { detail: String },
+}
+
 fn run_rebase(
     db: &Db,
     home: &Path,
@@ -665,7 +698,7 @@ fn run_rebase(
     bare: &GitDir,
     wt: &Path,
     default_branch: &str,
-) -> Result<bool> {
+) -> Result<RebaseOutcome> {
     let (onto, path_instructions, trusted_sha) = {
         let _guard = FETCH_RESOLVE_LOCK
             .lock()
@@ -680,14 +713,21 @@ fn run_rebase(
     if head == onto {
         db.set_run_shas(run_id, Some(&head), Some(&onto))?;
         maybe_persist_path_instructions(home, run_id, wt, &onto, &head, &path_instructions)?;
-        return Ok(true);
+        return Ok(RebaseOutcome::Completed { empty: true });
     }
 
     if porch_git::is_ancestor(wt, &head, &onto)? {
         porch_git::reset_hard(wt, &onto)?;
     } else if let Err(e) = porch_git::rebase(wt, &onto) {
-        let _ = porch_git::rebase_abort(wt);
-        return Err(RunError::Msg(format!("rebase conflict: {e}")));
+        // Fail closed if abort itself fails (E15 superseded: park after clean abort).
+        porch_git::rebase_abort(wt).map_err(|abort_err| {
+            RunError::Msg(format!(
+                "rebase conflict: {e}; rebase --abort failed: {abort_err}"
+            ))
+        })?;
+        return Ok(RebaseOutcome::Parked {
+            detail: format!("rebase conflict: {e}"),
+        });
     }
 
     let head = porch_git::rev_parse_c(wt, "HEAD")?;
@@ -695,7 +735,7 @@ fn run_rebase(
     maybe_persist_path_instructions(home, run_id, wt, &onto, &head, &path_instructions)?;
     let range = format!("{onto}..{head}");
     let empty = porch_git::diff_is_empty(wt, &range)?;
-    Ok(empty)
+    Ok(RebaseOutcome::Completed { empty })
 }
 
 fn maybe_persist_path_instructions(
@@ -720,6 +760,22 @@ fn remove_run_worktree(bare: &GitDir, wt: &Path) {
     let _ = std::fs::remove_dir_all(wt);
 }
 
+/// Pin recovery ref when required, then remove the disposable worktree.
+///
+/// Fail closed: if pinning unpublished pipeline commits fails, keep the worktree.
+fn finish_remove_worktree(bare: &GitDir, run: &RunRow, wt: &Path) {
+    if let Err(e) = sync::pin_recovery_if_needed(bare, run, wt) {
+        tracing::error!(
+            run_id = %run.id,
+            error = %e,
+            worktree = %wt.display(),
+            "recovery pin failed — keeping worktree (fail closed)"
+        );
+        return;
+    }
+    remove_run_worktree(bare, wt);
+}
+
 fn recover_stale_running(home: &Path) -> Result<()> {
     let db = Db::open(&db_path(home))?;
     let stale = db.fail_stale_running("daemon restarted while run was in progress")?;
@@ -733,7 +789,7 @@ fn recover_stale_running(home: &Path) -> Result<()> {
         };
         let bare_path = repo.bare_path;
         if let Ok(bare) = GitDir::new(&bare_path) {
-            remove_run_worktree(&bare, wt);
+            finish_remove_worktree(&bare, &run, wt);
         } else {
             let _ = std::fs::remove_dir_all(wt);
         }
@@ -805,6 +861,8 @@ pub struct AgentStatus {
 pub struct AgentCliResult {
     pub exit_code: i32,
     pub json: String,
+    /// When true, JSONL/JSON was already written to stdout (e.g. `agent run --wait`).
+    pub already_emitted: bool,
 }
 
 /// Build status JSON for a parked (or specified) run.
@@ -814,14 +872,17 @@ pub fn agent_status(home: &Path, run_id: Option<&str>, work_tree: &Path) -> Agen
         Ok(status) => AgentCliResult {
             exit_code: status_exit(&status.status),
             json: serde_json::to_string_pretty(&status).unwrap_or_else(|_| "{}".into()),
+            already_emitted: false,
         },
         Err(UsageOrFail::Usage(msg)) => AgentCliResult {
             exit_code: 2,
             json: serde_json::json!({"error": msg, "code": "usage"}).to_string(),
+            already_emitted: false,
         },
         Err(UsageOrFail::Fail(msg)) => AgentCliResult {
             exit_code: 1,
             json: serde_json::json!({"error": msg}).to_string(),
+            already_emitted: false,
         },
     }
 }
@@ -838,14 +899,17 @@ pub fn agent_respond(
         Ok(status) => AgentCliResult {
             exit_code: status_exit(&status.status),
             json: serde_json::to_string_pretty(&status).unwrap_or_else(|_| "{}".into()),
+            already_emitted: false,
         },
         Err(UsageOrFail::Usage(msg)) => AgentCliResult {
             exit_code: 2,
             json: serde_json::json!({"error": msg, "code": "usage"}).to_string(),
+            already_emitted: false,
         },
         Err(UsageOrFail::Fail(msg)) => AgentCliResult {
             exit_code: 1,
             json: serde_json::json!({"error": msg}).to_string(),
+            already_emitted: false,
         },
     }
 }
@@ -855,7 +919,7 @@ enum UsageOrFail {
     Fail(String),
 }
 
-fn status_exit(status: &str) -> i32 {
+pub(crate) fn status_exit(status: &str) -> i32 {
     match status {
         "failed" | "cancelled" => 1,
         _ => 0,
@@ -869,7 +933,7 @@ fn agent_status_inner(
 ) -> std::result::Result<AgentStatus, UsageOrFail> {
     let db = Db::open(&db_path(home)).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     let run = resolve_run(&db, run_id, work_tree)?;
-    Ok(status_from_run(&run))
+    Ok(status_from_run(&db, &run))
 }
 
 fn agent_respond_inner(
@@ -897,7 +961,13 @@ fn agent_respond_inner(
         .clone()
         .ok_or_else(|| UsageOrFail::Fail("parked run has no worktree_dir".into()))?;
 
+    let phase = parked_phase(&db, &run);
     match response {
+        AgentResponse::Approve | AgentResponse::Skip if phase == "rebase" => {
+            return Err(UsageOrFail::Usage(
+                "rebase park accepts fix|abort only (not approve/skip)".into(),
+            ));
+        }
         AgentResponse::Approve => {
             let head = porch_git::rev_parse_c(&wt, "HEAD")
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
@@ -910,7 +980,7 @@ fn agent_respond_inner(
             let parked =
                 finish_certify_and_deliver(home, &db, &bare, &wt, &run.id, &repo.default_branch)?;
             if !parked {
-                remove_run_worktree(&bare, &wt);
+                finish_remove_worktree(&bare, &run, &wt);
             }
         }
         AgentResponse::Skip => {
@@ -923,15 +993,19 @@ fn agent_respond_inner(
             }
             set_status(&db, &run.id, "completed", None)
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            remove_run_worktree(&bare, &wt);
+            finish_remove_worktree(&bare, &run, &wt);
         }
         AgentResponse::Abort => {
             set_status(&db, &run.id, "cancelled", Some("agent abort"))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            remove_run_worktree(&bare, &wt);
+            finish_remove_worktree(&bare, &run, &wt);
         }
         AgentResponse::Fix { finding_ids, yes } => {
-            respond_fix(&db, home, &run, &bare, &wt, finding_ids.as_ref(), yes)?;
+            if phase == "rebase" {
+                respond_rebase_fix(&db, home, &run, &bare, &wt, &repo.default_branch)?;
+            } else {
+                respond_fix(&db, home, &run, &bare, &wt, finding_ids.as_ref(), yes)?;
+            }
         }
     }
 
@@ -939,7 +1013,135 @@ fn agent_respond_inner(
         .run_by_id(&run.id)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?
         .ok_or_else(|| UsageOrFail::Fail("run disappeared".into()))?;
-    Ok(status_from_run(&run))
+    Ok(status_from_run(&db, &run))
+}
+
+fn parked_phase(db: &Db, run: &RunRow) -> String {
+    if run.status != "parked" {
+        return String::new();
+    }
+    if let Ok(steps) = db.step_results_for_run(&run.id) {
+        if let Some(step) = steps.iter().rev().find(|s| s.status == "parked") {
+            return step.step.clone();
+        }
+    }
+    "review".into()
+}
+
+/// Fixer for rebase-parked runs: edit tip, then retry rebase and continue pipeline.
+fn respond_rebase_fix(
+    db: &Db,
+    home: &Path,
+    run: &RunRow,
+    bare: &GitDir,
+    wt: &Path,
+    default_branch: &str,
+) -> std::result::Result<(), UsageOrFail> {
+    if !wt.exists() {
+        return Err(UsageOrFail::Fail("parked run worktree missing".into()));
+    }
+    let onto = run
+        .base_sha
+        .clone()
+        .ok_or_else(|| UsageOrFail::Fail("rebase park missing base_sha".into()))?;
+    let detail = run
+        .error
+        .clone()
+        .unwrap_or_else(|| "rebase conflict".into());
+    let findings_json = serde_json::json!([{
+        "id": "rebase0",
+        "path": "",
+        "message": detail,
+        "severity": "error",
+        "action": "ask-user",
+        "category": "rebase",
+        "base_sha": onto,
+    }])
+    .to_string();
+
+    let fixer_dir = run_fixer_dir(home, &run.id);
+    let (prompt_file, findings_file) = write_rebase_fix_inputs(&fixer_dir, &findings_json)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+
+    set_status(db, &run.id, "running", None).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+
+    let bin = match fixer_bin() {
+        Ok(b) => b,
+        Err(e) => {
+            fail_fix_run(db, bare, wt, run, &run.sha, &e.to_string())?;
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = run_fixer(&RunFixerOpts {
+        work_tree: wt,
+        prompt_file: &prompt_file,
+        findings_file: &findings_file,
+        porch_home: home,
+        bin: &bin,
+        timeout: fixer_timeout(),
+        session_id: run.fixer_session_id.as_deref(),
+    }) {
+        fail_fix_run(db, bare, wt, run, &run.sha, &e.to_string())?;
+        return Ok(());
+    }
+
+    // Retry rebase onto the recorded base (do not refresh trusted pin).
+    if let Err(e) = porch_git::rebase(wt, &onto) {
+        match porch_git::rebase_abort(wt) {
+            Ok(()) => {
+                let msg = format!("rebase conflict: {e}");
+                record_step(db, &run.id, "rebase", "parked", Some(&msg))
+                    .map_err(|err| UsageOrFail::Fail(err.to_string()))?;
+                set_status(db, &run.id, "parked", Some(&msg))
+                    .map_err(|err| UsageOrFail::Fail(err.to_string()))?;
+                return Ok(());
+            }
+            Err(abort_err) => {
+                let msg = format!("rebase conflict: {e}; rebase --abort failed: {abort_err}");
+                set_status(db, &run.id, "failed", Some(&msg))
+                    .map_err(|err| UsageOrFail::Fail(err.to_string()))?;
+                finish_remove_worktree(bare, run, wt);
+                return Ok(());
+            }
+        }
+    }
+
+    let head = porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    db.set_run_shas(&run.id, Some(&head), Some(&onto))
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    record_step(db, &run.id, "rebase", "completed", Some("after fix"))
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+
+    let range = format!("{onto}..{head}");
+    let empty = porch_git::diff_is_empty(wt, &range).unwrap_or(false);
+    if empty {
+        for phase in ["review", "certify", "deliver"] {
+            record_step(db, &run.id, phase, "skipped", Some("empty after rebase"))
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        }
+        set_status(db, &run.id, "completed", None).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        finish_remove_worktree(bare, run, wt);
+        return Ok(());
+    }
+
+    match run_review_phase(db, home, &run.id, wt, false) {
+        Ok(ReviewPhase::Approved) => {
+            complete_after_review(db, home, bare, wt, run, None)?;
+        }
+        Ok(ReviewPhase::Parked) => {
+            record_step(db, &run.id, "review", "parked", None)
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            set_status(db, &run.id, "failed", Some(&msg))
+                .map_err(|err| UsageOrFail::Fail(err.to_string()))?;
+            finish_remove_worktree(bare, run, wt);
+        }
+    }
+    let _ = default_branch;
+    Ok(())
 }
 
 fn respond_fix(
@@ -991,7 +1193,7 @@ fn spawn_and_wait_fixer(
     selected: &[Finding],
 ) -> std::result::Result<Option<String>, UsageOrFail> {
     let findings_json =
-        serde_json::to_string_pretty(selected).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        findings_json_with_notes(home, &run.id, selected).map_err(UsageOrFail::Fail)?;
     let fixer_dir = run_fixer_dir(home, &run.id);
     let (prompt_file, findings_file) = write_fixer_inputs(&fixer_dir, &findings_json)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
@@ -1043,7 +1245,7 @@ fn fail_fix_run(
         let _ = persist_uncertified_after_fix(db, wt, run, pre_fix_head, &new_head);
     }
     set_status(db, &run.id, "failed", Some(msg)).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    remove_run_worktree(bare, wt);
+    finish_remove_worktree(bare, run, wt);
     Ok(())
 }
 
@@ -1056,7 +1258,7 @@ fn finish_rereview(
     yes: bool,
 ) -> std::result::Result<(), UsageOrFail> {
     // Session-free rereview (never pass fixer session).
-    match run_review_phase(db, &run.id, wt, true) {
+    match run_review_phase(db, home, &run.id, wt, true) {
         Ok(ReviewPhase::Approved) => {
             complete_after_review(db, home, bare, wt, run, None)?;
         }
@@ -1085,7 +1287,7 @@ fn finish_rereview(
             let msg = e.to_string();
             set_status(db, &run.id, "failed", Some(&msg))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            remove_run_worktree(bare, wt);
+            finish_remove_worktree(bare, run, wt);
         }
     }
     Ok(())
@@ -1107,7 +1309,7 @@ fn complete_after_review(
         .ok_or_else(|| UsageOrFail::Fail(format!("unknown repo {}", run.repo_id)))?;
     let parked = finish_certify_and_deliver(home, db, bare, wt, &run.id, &repo.default_branch)?;
     if !parked {
-        remove_run_worktree(bare, wt);
+        finish_remove_worktree(bare, run, wt);
     }
     Ok(())
 }
@@ -1124,7 +1326,7 @@ fn finish_certify_and_deliver(
     default_branch: &str,
 ) -> std::result::Result<bool, UsageOrFail> {
     assert_head_continuity(db, run_id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    match certify::run_certify_phase(db, run_id, bare, wt, default_branch, None) {
+    match certify::run_certify_phase(db, home, run_id, bare, wt, default_branch, None) {
         Ok(()) => {
             record_step(db, run_id, "certify", "completed", None)
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
@@ -1133,7 +1335,11 @@ fn finish_certify_and_deliver(
             let msg = e.to_string();
             let _ = record_step(db, run_id, "certify", "failed", Some(&msg));
             let _ = set_status(db, run_id, "failed", Some(&msg));
-            remove_run_worktree(bare, wt);
+            if let Ok(Some(run)) = db.run_by_id(run_id) {
+                finish_remove_worktree(bare, &run, wt);
+            } else {
+                remove_run_worktree(bare, wt);
+            }
             return Err(UsageOrFail::Fail(msg));
         }
     }
@@ -1148,7 +1354,11 @@ fn finish_certify_and_deliver(
         Err(e) => {
             let msg = e.to_string();
             let _ = set_status(db, run_id, "failed", Some(&msg));
-            remove_run_worktree(bare, wt);
+            if let Ok(Some(run)) = db.run_by_id(run_id) {
+                finish_remove_worktree(bare, &run, wt);
+            } else {
+                remove_run_worktree(bare, wt);
+            }
             Err(UsageOrFail::Fail(msg))
         }
     }
@@ -1173,6 +1383,31 @@ fn select_findings(
     }
 }
 
+/// Serialize selected findings for the fixer, merging optional operator notes.
+fn findings_json_with_notes(
+    home: &Path,
+    run_id: &str,
+    selected: &[Finding],
+) -> std::result::Result<String, String> {
+    let mut value = serde_json::to_value(selected).map_err(|e| e.to_string())?;
+    let notes = load_finding_notes(home, run_id).unwrap_or_default();
+    if let Some(arr) = value.as_array_mut() {
+        for item in arr {
+            let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Some(note) = notes.get(id) {
+                if !note.is_empty() {
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert("note".into(), serde_json::Value::String(note.clone()));
+                    }
+                }
+            }
+        }
+    }
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+}
+
 fn resolve_run(
     db: &Db,
     run_id: Option<&str>,
@@ -1193,29 +1428,205 @@ fn resolve_run(
         .ok_or_else(|| UsageOrFail::Usage("no parked run for this repo".into()))
 }
 
-fn status_from_run(run: &RunRow) -> AgentStatus {
+pub(crate) fn status_from_run(db: &Db, run: &RunRow) -> AgentStatus {
     let findings = run
         .findings_json
         .as_deref()
         .and_then(|s| serde_json::from_str::<Vec<Finding>>(s).ok())
         .unwrap_or_default();
     let phase = match run.status.as_str() {
-        "parked" => "review",
-        "completed" | "failed" | "cancelled" => "done",
-        "running" | "pending" => "pipeline",
-        other => other,
+        "parked" => parked_phase(db, run),
+        "completed" | "failed" | "cancelled" => "done".into(),
+        "running" | "pending" => "pipeline".into(),
+        other => other.to_string(),
     };
     AgentStatus {
         run_id: run.id.clone(),
         repo_id: run.repo_id.clone(),
         branch: run.branch.clone(),
         status: run.status.clone(),
-        phase: phase.into(),
+        phase,
         head_sha: run.head_sha.clone(),
         base_sha: run.base_sha.clone(),
         review_approved_head_sha: run.review_approved_head_sha.clone(),
         findings,
         error: run.error.clone(),
+    }
+}
+
+/// Enqueue a **new** run from a prior run's recorded tip (or branch tip).
+///
+/// Always allocates a fresh run id / worktree — never reuses a half-applied tree.
+///
+/// # Errors
+///
+/// Returns a string error on missing run, detached HEAD, or DB/RPC failure.
+pub fn rerun(
+    home: &Path,
+    work_tree: &Path,
+    run_id: Option<&str>,
+) -> std::result::Result<String, String> {
+    let work = work_tree.canonicalize().map_err(|e| e.to_string())?;
+    let db = Db::open(&db_path(home)).map_err(|e| e.to_string())?;
+    let repo_id = repo_id_for(&work);
+    let prior = if let Some(id) = run_id {
+        db.run_by_id(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("unknown run {id}"))?
+    } else {
+        let branch = porch_git::stdout_trim(
+            &porch_git::run_c(&work, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .map_err(|e| e.to_string())?,
+        );
+        if branch == "HEAD" {
+            return Err("detached HEAD — checkout a branch or pass --run-id".into());
+        }
+        db.latest_run_for_branch(&repo_id, &branch)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no prior run for branch {branch}"))?
+    };
+
+    let sha = prior.sha.clone();
+    let intent = prior.intent.as_deref();
+    let intent_source = if intent.is_some() {
+        Some("rerun")
+    } else {
+        None
+    };
+    let row = db
+        .insert_run(&prior.repo_id, &prior.branch, &sha, intent, intent_source)
+        .map_err(|e| e.to_string())?;
+    if let Err(e) = rpc_start_run(home, &row.id) {
+        tracing::warn!(run_id = %row.id, "start_run rpc: {e}");
+    }
+    Ok(row.id)
+}
+
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+    use porch_git::{init_bare, worktree_add_detach};
+    use tempfile::TempDir;
+
+    fn git(work: &Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .current_dir(work)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+
+    fn git_out(work: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(work)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn pin_failure_keeps_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let bare_path = root.join("bare.git");
+        init_bare(&bare_path).unwrap();
+        let bare = GitDir::new(&bare_path).unwrap();
+
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init"]);
+        git(&seed, &["config", "user.email", "porch@example.com"]);
+        git(&seed, &["config", "user.name", "Porch"]);
+        git(&seed, &["checkout", "-b", "main"]);
+        std::fs::write(seed.join("README"), "submit\n").unwrap();
+        git(&seed, &["add", "README"]);
+        git(&seed, &["commit", "-m", "submit"]);
+        let submit = git_out(&seed, &["rev-parse", "HEAD"]);
+        std::fs::write(seed.join("README"), "descendant\n").unwrap();
+        git(&seed, &["add", "README"]);
+        git(&seed, &["commit", "-m", "pipeline"]);
+        let head = git_out(&seed, &["rev-parse", "HEAD"]);
+        git(
+            &seed,
+            &["push", bare_path.to_str().unwrap(), "main:refs/heads/main"],
+        );
+
+        let db = Db::open(&db_path(&home)).unwrap();
+        db.upsert_repo("r-pin", &seed, &bare_path, "main").unwrap();
+        let run = db.insert_run("r-pin", "feat", &submit, None, None).unwrap();
+        let wt = root.join("wt-pin");
+        worktree_add_detach(&bare, &wt, &head).unwrap();
+        assert!(wt.exists());
+        assert_ne!(submit, head);
+
+        // Force update-ref refs/porch/recover/<run> to fail: refs/porch is a file.
+        std::fs::create_dir_all(bare_path.join("refs")).unwrap();
+        std::fs::write(bare_path.join("refs/porch"), "not-a-directory\n").unwrap();
+
+        finish_remove_worktree(&bare, &run, &wt);
+        assert!(
+            wt.exists(),
+            "worktree must be kept when required recovery pin fails"
+        );
+        assert!(
+            porch_git::rev_parse(&bare, &sync::recovery_ref_name(&run.id)).is_err(),
+            "recovery ref must not exist after failed pin"
+        );
+    }
+
+    #[test]
+    fn pin_success_then_removes_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let bare_path = root.join("bare.git");
+        init_bare(&bare_path).unwrap();
+        let bare = GitDir::new(&bare_path).unwrap();
+
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init"]);
+        git(&seed, &["config", "user.email", "porch@example.com"]);
+        git(&seed, &["config", "user.name", "Porch"]);
+        git(&seed, &["checkout", "-b", "main"]);
+        std::fs::write(seed.join("README"), "submit\n").unwrap();
+        git(&seed, &["add", "README"]);
+        git(&seed, &["commit", "-m", "submit"]);
+        let submit = git_out(&seed, &["rev-parse", "HEAD"]);
+        std::fs::write(seed.join("README"), "descendant\n").unwrap();
+        git(&seed, &["add", "README"]);
+        git(&seed, &["commit", "-m", "pipeline"]);
+        let head = git_out(&seed, &["rev-parse", "HEAD"]);
+        git(
+            &seed,
+            &["push", bare_path.to_str().unwrap(), "main:refs/heads/main"],
+        );
+
+        let db = Db::open(&db_path(&home)).unwrap();
+        db.upsert_repo("r-pin-ok", &seed, &bare_path, "main")
+            .unwrap();
+        let run = db
+            .insert_run("r-pin-ok", "feat", &submit, None, None)
+            .unwrap();
+        let wt = root.join("wt-pin-ok");
+        worktree_add_detach(&bare, &wt, &head).unwrap();
+
+        finish_remove_worktree(&bare, &run, &wt);
+        assert!(!wt.exists(), "worktree removed after successful pin");
+        assert_eq!(
+            porch_git::rev_parse(&bare, &sync::recovery_ref_name(&run.id)).unwrap(),
+            head
+        );
     }
 }
 
@@ -1263,5 +1674,34 @@ mod continuity_tests {
         // Documented contract: empty-diff skip_remaining never calls assert_head_continuity.
         // Smoke: execute path with empty diff is covered by m2_run integration.
         let _ = init_bare;
+    }
+}
+
+#[cfg(test)]
+mod notes_tests {
+    use super::*;
+    use porch_gate::set_finding_note;
+    use porch_review::{Action, Severity};
+    use tempfile::TempDir;
+
+    #[test]
+    fn findings_json_merges_operator_notes() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        set_finding_note(home, "run-n", "f0", "keep the helper public").unwrap();
+        let selected = vec![Finding {
+            id: "f0".into(),
+            path: "src/a.rs".into(),
+            message: "unused".into(),
+            severity: Severity::Warning,
+            action: Action::AskUser,
+            category: None,
+            start_line: Some(1),
+            end_line: Some(2),
+        }];
+        let json = findings_json_with_notes(home, "run-n", &selected).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v[0]["note"], "keep the helper public");
+        assert_eq!(v[0]["id"], "f0");
     }
 }

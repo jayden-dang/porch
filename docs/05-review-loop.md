@@ -2,7 +2,7 @@
 
 This is the heart of the product.
 
-**Sequencing (D9, 2026-08-29):** M3–M9 compose an external review CLI (OCR wrapper). **M10** switches the default reviewer to a session-free **coding agent** so the operator workflow no longer depends on that CLI. The quality properties below (coverage, line anchors, language rules, precision bias) remain the bar for **M16**, a porch-owned engine built **last**, after M10–M15, then dogfood. Until M16, M10 is coverage-lite (changed-file list + skip reasons) and must not pretend to be the engine.
+**Sequencing (D9, 2026-08-29):** M3–M9 composed an external review CLI (OCR wrapper, transitional). **M10** made the workflow reviewer a session-free **coding agent**. **M16** (done) adds the porch-owned **`porch-quality`** engine (coverage, relocate, rule packs, grouping, precision bias). Setup prefers `quality` when `porch-quality` is on PATH; otherwise `agent`. OCR remains optional/legacy (`porch setup --engine ocr`).
 
 ## When review runs
 

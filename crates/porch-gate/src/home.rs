@@ -71,6 +71,12 @@ pub fn run_fixer_dir(home: &std::path::Path, run_id: &str) -> PathBuf {
     run_artifact_dir(home, run_id).join("fixer")
 }
 
+/// Agent-review prompt/result directory: `$PORCH_HOME/runs/<run_id>/review/`.
+#[must_use]
+pub fn run_review_dir(home: &std::path::Path, run_id: &str) -> PathBuf {
+    run_artifact_dir(home, run_id).join("review")
+}
+
 /// Deliver-repair prompt/findings directory: `$PORCH_HOME/runs/<run_id>/deliver-repair/`.
 #[must_use]
 pub fn run_deliver_repair_dir(home: &std::path::Path, run_id: &str) -> PathBuf {

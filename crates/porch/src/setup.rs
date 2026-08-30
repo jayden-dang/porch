@@ -1,10 +1,12 @@
 //! `porch setup` — headless JSON + easy one-screen TUI.
 
+use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Result, bail};
+use porch_gate::install_service;
 use porch_review::{
     DetectedEngine, EngineKind, SetupResult, default_engine, detect_engines, detect_optional_tools,
     review_setup_ok, setup_apply, setup_verify, setup_yes,
@@ -24,11 +26,14 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 /// CLI flags for `porch setup`.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // clap-shaped headless flags
 pub struct SetupArgs {
     pub yes: bool,
     pub verify: bool,
     pub apply: bool,
     pub engine: Option<String>,
+    /// Opt-in: write OS login service (default off — detached daemon remains default).
+    pub install_daemon: bool,
 }
 
 /// Run `porch setup` (TTY wizard or headless JSON).
@@ -56,9 +61,13 @@ fn run_headless(home: &Path, args: &SetupArgs) -> Result<ExitCode> {
                     ok: false,
                     engine: None,
                     wrapper: None,
+                    agent_bin: None,
                     verified: false,
                     warnings: Vec::new(),
-                    error: Some(format!("unknown engine `{s}` (expected ocr|generic)")),
+                    error: Some(format!(
+                        "unknown engine `{s}` (expected quality|agent|ocr|generic)"
+                    )),
+                    daemon_service: None,
                 };
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 return Ok(ExitCode::from(2));
@@ -66,7 +75,7 @@ fn run_headless(home: &Path, args: &SetupArgs) -> Result<ExitCode> {
         }
     };
 
-    let result = if args.verify {
+    let mut result = if args.verify {
         setup_verify(home)?
     } else if args.apply {
         setup_apply(home)?
@@ -74,7 +83,40 @@ fn run_headless(home: &Path, args: &SetupArgs) -> Result<ExitCode> {
         // `--yes`, forced `--engine`, or non-TTY bare `porch setup`.
         setup_yes(home, engine)?
     };
+    // `--verify` is read-only: never write a daemon service even with `--install-daemon`.
+    if args.install_daemon && result.ok && !args.verify {
+        maybe_install_daemon_service(home, &mut result);
+    }
     emit_setup_json(&result)
+}
+
+/// Write launchd/systemd definition when the operator opted in.
+fn maybe_install_daemon_service(home: &Path, result: &mut SetupResult) {
+    let Some(user_home) = env::var_os("HOME").map(PathBuf::from) else {
+        result
+            .warnings
+            .push("daemon service install skipped: HOME unset".into());
+        return;
+    };
+    let bin = match env::current_exe() {
+        Ok(b) => b,
+        Err(e) => {
+            result
+                .warnings
+                .push(format!("daemon service install skipped: current_exe: {e}"));
+            return;
+        }
+    };
+    match install_service(&bin, home, &user_home) {
+        Ok(paths) => {
+            result.daemon_service = Some(paths.definition_path.display().to_string());
+        }
+        Err(e) => {
+            result
+                .warnings
+                .push(format!("daemon service install failed: {e}"));
+        }
+    }
 }
 
 fn emit_setup_json(result: &SetupResult) -> Result<ExitCode> {
@@ -113,6 +155,8 @@ pub enum WizardAction {
 
 #[cfg(test)]
 type ApplyHook = Box<dyn FnMut(EngineKind) -> Result<SetupResult, String>>;
+#[cfg(test)]
+type DaemonHook = Box<dyn FnMut() -> Result<PathBuf, String>>;
 
 /// Unit-testable setup wizard model (one screen + result).
 pub struct SetupWizard {
@@ -125,9 +169,14 @@ pub struct SetupWizard {
     pub error: Option<String>,
     pub success_wrapper: Option<PathBuf>,
     pub success_engine: Option<String>,
+    /// Optional login-service install; default **unchecked** (detached daemon).
+    pub install_daemon: bool,
+    pub success_daemon_service: Option<PathBuf>,
     /// When set, Enter on Select invokes this instead of real setup (tests).
     #[cfg(test)]
     apply_hook: Option<ApplyHook>,
+    #[cfg(test)]
+    daemon_hook: Option<DaemonHook>,
 }
 
 impl SetupWizard {
@@ -148,8 +197,12 @@ impl SetupWizard {
             error: None,
             success_wrapper: None,
             success_engine: None,
+            install_daemon: false,
+            success_daemon_service: None,
             #[cfg(test)]
             apply_hook: None,
+            #[cfg(test)]
+            daemon_hook: None,
         }
     }
 
@@ -160,6 +213,16 @@ impl SetupWizard {
         F: FnMut(EngineKind) -> Result<SetupResult, String> + 'static,
     {
         self.apply_hook = Some(Box::new(hook));
+        self
+    }
+
+    /// Inject a daemon-install hook (unit tests).
+    #[cfg(test)]
+    pub fn with_daemon_hook<F>(mut self, hook: F) -> Self
+    where
+        F: FnMut() -> Result<PathBuf, String> + 'static,
+    {
+        self.daemon_hook = Some(Box::new(hook));
         self
     }
 
@@ -180,6 +243,10 @@ impl SetupWizard {
             WizardScreen::Select => match code {
                 KeyCode::Char('q') | KeyCode::Esc => WizardAction::Quit,
                 KeyCode::Char('s') => WizardAction::Skip,
+                KeyCode::Char('d' | ' ') => {
+                    self.install_daemon = !self.install_daemon;
+                    WizardAction::None
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     if !self.engines.is_empty() {
                         self.focus = self.focus.saturating_sub(1);
@@ -195,7 +262,7 @@ impl SetupWizard {
                 KeyCode::Enter => {
                     if self.engines.is_empty() {
                         self.error = Some(
-                            "no review engine on PATH — install ocr (brew/cargo) or a binary named review"
+                            "no review engine on PATH — install porch-quality (M16) or claude/codex, or legacy ocr / review"
                                 .into(),
                         );
                         return WizardAction::None;
@@ -216,17 +283,44 @@ impl SetupWizard {
             self.error = Some("no engine selected".into());
             return WizardAction::None;
         };
-        let result = self.run_apply(home, kind);
+        let mut result = self.run_apply(home, kind);
         if result.ok {
+            if self.install_daemon {
+                self.run_daemon_install(home, &mut result);
+            }
             self.screen = WizardScreen::Success;
             self.success_engine.clone_from(&result.engine);
-            self.success_wrapper = result.wrapper.map(PathBuf::from);
+            self.success_wrapper = result
+                .wrapper
+                .as_ref()
+                .or(result.agent_bin.as_ref())
+                .map(PathBuf::from);
+            self.success_daemon_service = result.daemon_service.as_ref().map(PathBuf::from);
             self.error = None;
         } else {
             self.screen = WizardScreen::Select;
             self.error = result.error.or_else(|| Some("setup failed".into()));
         }
         WizardAction::None
+    }
+
+    #[allow(clippy::unused_self)] // `self` used only when `cfg(test)` daemon_hook is set
+    fn run_daemon_install(&mut self, home: &Path, result: &mut SetupResult) {
+        #[cfg(test)]
+        if let Some(hook) = self.daemon_hook.as_mut() {
+            match hook() {
+                Ok(path) => {
+                    result.daemon_service = Some(path.display().to_string());
+                }
+                Err(e) => {
+                    result
+                        .warnings
+                        .push(format!("daemon service install failed: {e}"));
+                }
+            }
+            return;
+        }
+        maybe_install_daemon_service(home, result);
     }
 
     #[allow(clippy::unused_self)] // `self` used only when `cfg(test)` apply_hook is set
@@ -239,9 +333,11 @@ impl SetupWizard {
                     ok: false,
                     engine: Some(kind.as_str().into()),
                     wrapper: None,
+                    agent_bin: None,
                     verified: false,
                     warnings: Vec::new(),
                     error: Some(e),
+                    daemon_service: None,
                 },
             };
         }
@@ -251,9 +347,11 @@ impl SetupWizard {
                 ok: false,
                 engine: Some(kind.as_str().into()),
                 wrapper: None,
+                agent_bin: None,
                 verified: false,
                 warnings: Vec::new(),
                 error: Some(e.to_string()),
+                daemon_service: None,
             },
         }
     }
@@ -288,20 +386,31 @@ impl SetupWizard {
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(
-                "  install ocr, or put a binary named `review` on PATH",
+                "  install porch-quality (M16) or claude/codex; legacy ocr / `review` also ok",
             ));
         } else {
             for (i, eng) in self.engines.iter().enumerate() {
                 let marker = if i == self.focus { "●" } else { "○" };
-                let rec = if eng.kind == EngineKind::Ocr {
+                let rec = if eng.kind == EngineKind::Quality
+                    || (eng.kind == EngineKind::Agent
+                        && !self.engines.iter().any(|e| e.kind == EngineKind::Quality))
+                {
                     "  ← recommended"
                 } else {
                     ""
                 };
                 let label = match eng.kind {
-                    EngineKind::Ocr => format!("  {marker} ocr   ({}){rec}", eng.bin.display()),
+                    EngineKind::Quality => {
+                        format!("  {marker} quality ({}){rec}", eng.bin.display())
+                    }
+                    EngineKind::Agent => {
+                        format!("  {marker} agent ({}){rec}", eng.bin.display())
+                    }
+                    EngineKind::Ocr => {
+                        format!("  {marker} ocr   ({}) (legacy)", eng.bin.display())
+                    }
                     EngineKind::Generic => {
-                        format!("  {marker} generic (binary already named review){rec}")
+                        format!("  {marker} generic (binary already named review)")
                     }
                 };
                 let style = if i == self.focus {
@@ -327,6 +436,11 @@ impl SetupWizard {
         )));
         lines.push(Line::from(self.tools_line.clone()));
         lines.push(Line::from(""));
+        let daemon_mark = if self.install_daemon { "[x]" } else { "[ ]" };
+        lines.push(Line::from(format!(
+            "{daemon_mark} install daemon as login service (default: detached)"
+        )));
+        lines.push(Line::from(""));
         if let Some(err) = &self.error {
             lines.push(Line::from(Span::styled(
                 format!("error: {err}"),
@@ -337,6 +451,7 @@ impl SetupWizard {
             lines.push(Line::from("Enter  write wrapper + config and verify"));
         }
         lines.push(Line::from("↑↓     change engine"));
+        lines.push(Line::from("d/spc  toggle login-service install"));
         lines.push(Line::from("s      skip (leave nothing written)"));
         lines.push(Line::from("q      quit"));
         lines
@@ -346,20 +461,28 @@ impl SetupWizard {
         let wrap = self
             .success_wrapper
             .as_ref()
-            .map_or_else(|| "(unknown)".into(), |p| p.display().to_string());
+            .map_or_else(|| "(none — agent path)".into(), |p| p.display().to_string());
         let eng = self
             .success_engine
             .clone()
             .unwrap_or_else(|| "review".into());
-        vec![
+        let mut lines = vec![
             Line::from("setup ok"),
             Line::from(format!("engine    {eng}")),
             Line::from(format!("wrapper   {wrap}")),
-            Line::from("doctor    review=ok (resolved wrapper)"),
-            Line::from("next      porch init   or   git push porch"),
-            Line::from(""),
-            Line::from("Enter / q  dismiss"),
-        ]
+            Line::from("doctor    review=ok"),
+        ];
+        if let Some(svc) = &self.success_daemon_service {
+            lines.push(Line::from(format!("daemon    {}", svc.display())));
+        } else {
+            lines.push(Line::from(
+                "daemon    detached (login service not installed)",
+            ));
+        }
+        lines.push(Line::from("next      porch init   or   git push porch"));
+        lines.push(Line::from(""));
+        lines.push(Line::from("Enter / q  dismiss"));
+        lines
     }
 }
 
@@ -409,7 +532,7 @@ fn run_wizard(home: &Path) -> Result<ExitCode> {
     let mut wizard = SetupWizard::detect();
     if wizard.engines.is_empty() {
         wizard.error = Some(
-            "no review engine on PATH — install ocr OR ensure `review` is on PATH, then re-open"
+            "no review engine on PATH — install porch-quality (M16) or claude/codex, or legacy ocr / `review`, then re-open"
                 .into(),
         );
     }
@@ -503,25 +626,59 @@ mod tests {
         }
     }
 
+    fn fake_agent_engine() -> DetectedEngine {
+        DetectedEngine {
+            kind: EngineKind::Agent,
+            bin: PathBuf::from("/opt/homebrew/bin/claude"),
+        }
+    }
+
     #[test]
     fn ocr_is_focused_by_default_when_only_engine() {
         let mut w = SetupWizard {
             screen: WizardScreen::Select,
             engines: vec![fake_ocr_engine()],
-            focus: 0,
+            focus: default_focus(&[fake_ocr_engine()]),
             gh: None,
             fixer: None,
             tools_line: String::new(),
             error: None,
             success_wrapper: None,
             success_engine: None,
+            install_daemon: false,
+            success_daemon_service: None,
             apply_hook: None,
+            daemon_hook: None,
         };
         assert_eq!(w.focused_engine(), Some(EngineKind::Ocr));
         let s = render_to_string(&w, 80, 24);
         assert!(s.contains("ocr"), "buffer={s}");
-        assert!(s.contains("recommended") || s.contains('●'), "buffer={s}");
         let _ = &mut w;
+    }
+
+    #[test]
+    fn agent_is_recommended_when_present() {
+        let engines = vec![fake_ocr_engine(), fake_agent_engine()];
+        let focus = default_focus(&engines);
+        let w = SetupWizard {
+            screen: WizardScreen::Select,
+            engines,
+            focus,
+            gh: None,
+            fixer: None,
+            tools_line: String::new(),
+            error: None,
+            success_wrapper: None,
+            success_engine: None,
+            install_daemon: false,
+            success_daemon_service: None,
+            apply_hook: None,
+            daemon_hook: None,
+        };
+        assert_eq!(w.focused_engine(), Some(EngineKind::Agent));
+        let s = render_to_string(&w, 80, 24);
+        assert!(s.contains("agent"), "buffer={s}");
+        assert!(s.contains("recommended"), "buffer={s}");
     }
 
     #[test]
@@ -536,16 +693,21 @@ mod tests {
             error: None,
             success_wrapper: None,
             success_engine: None,
+            install_daemon: false,
+            success_daemon_service: None,
             apply_hook: None,
+            daemon_hook: None,
         }
         .with_apply_hook(|_| {
             Ok(SetupResult {
                 ok: true,
                 engine: Some("ocr".into()),
                 wrapper: Some("/tmp/home/bin/review".into()),
+                agent_bin: None,
                 verified: true,
                 warnings: Vec::new(),
                 error: None,
+                daemon_service: None,
             })
         });
         assert_eq!(w.handle_key(KeyCode::Enter), WizardAction::Apply);
@@ -572,7 +734,10 @@ mod tests {
             error: None,
             success_wrapper: None,
             success_engine: None,
+            install_daemon: false,
+            success_daemon_service: None,
             apply_hook: None,
+            daemon_hook: None,
         }
         .with_apply_hook(move |_| {
             flag.store(true, Ordering::SeqCst);
@@ -594,7 +759,10 @@ mod tests {
             error: None,
             success_wrapper: None,
             success_engine: None,
+            install_daemon: false,
+            success_daemon_service: None,
             apply_hook: None,
+            daemon_hook: None,
         }
         .with_apply_hook(|_| Err("tampered wrapper".into()));
         assert_eq!(w.handle_key(KeyCode::Enter), WizardAction::Apply);
@@ -603,5 +771,79 @@ mod tests {
         assert!(w.error.as_deref().is_some_and(|e| e.contains("tampered")));
         let s = render_to_string(&w, 80, 24);
         assert!(s.contains("tampered"), "buffer={s}");
+    }
+
+    #[test]
+    fn daemon_checkbox_defaults_off_and_toggles() {
+        let mut w = SetupWizard {
+            screen: WizardScreen::Select,
+            engines: vec![fake_ocr_engine()],
+            focus: 0,
+            gh: None,
+            fixer: None,
+            tools_line: String::new(),
+            error: None,
+            success_wrapper: None,
+            success_engine: None,
+            install_daemon: false,
+            success_daemon_service: None,
+            apply_hook: None,
+            daemon_hook: None,
+        };
+        let s = render_to_string(&w, 100, 28);
+        assert!(s.contains("[ ]"), "buffer={s}");
+        assert!(s.contains("login service"), "buffer={s}");
+        assert_eq!(w.handle_key(KeyCode::Char('d')), WizardAction::None);
+        assert!(w.install_daemon);
+        let s = render_to_string(&w, 100, 28);
+        assert!(s.contains("[x]"), "buffer={s}");
+        assert_eq!(w.handle_key(KeyCode::Char(' ')), WizardAction::None);
+        assert!(!w.install_daemon);
+    }
+
+    #[test]
+    fn daemon_opt_in_calls_hook_on_apply() {
+        let mut w = SetupWizard {
+            screen: WizardScreen::Select,
+            engines: vec![fake_ocr_engine()],
+            focus: 0,
+            gh: None,
+            fixer: None,
+            tools_line: String::new(),
+            error: None,
+            success_wrapper: None,
+            success_engine: None,
+            install_daemon: true,
+            success_daemon_service: None,
+            apply_hook: None,
+            daemon_hook: None,
+        }
+        .with_apply_hook(|_| {
+            Ok(SetupResult {
+                ok: true,
+                engine: Some("ocr".into()),
+                wrapper: Some("/tmp/home/bin/review".into()),
+                agent_bin: None,
+                verified: true,
+                warnings: Vec::new(),
+                error: None,
+                daemon_service: None,
+            })
+        })
+        .with_daemon_hook(|| {
+            Ok(PathBuf::from(
+                "/tmp/user/Library/LaunchAgents/ai.porch.daemon.plist",
+            ))
+        });
+        assert_eq!(w.handle_key(KeyCode::Enter), WizardAction::Apply);
+        let _ = w.apply(Path::new("/tmp"));
+        assert_eq!(w.screen, WizardScreen::Success);
+        assert!(
+            w.success_daemon_service
+                .as_ref()
+                .is_some_and(|p| p.to_string_lossy().contains("LaunchAgents")),
+        );
+        let s = render_to_string(&w, 100, 28);
+        assert!(s.contains("LaunchAgents"), "buffer={s}");
     }
 }

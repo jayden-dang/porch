@@ -16,29 +16,40 @@ Porch is the missing **inner gate**: opt-in, local, isolated. You push to a remo
 
 Slice crates stay unpublished (`publish = false`), so **0.1.0 is git/path install only** — not crates.io yet.
 
+From a clone (macOS/Linux), prefer the small installer — it puts the binary in `~/.cargo/bin` (or `$CARGO_HOME/bin` / `$PORCH_PREFIX`):
+
 ```sh
-cargo install --git https://github.com/jayden-dang/porch --locked
-# or from a clone:
-cargo install --path crates/porch --locked
+./install.sh
+# dry-run: PORCH_INSTALL_DRY_RUN=1 ./install.sh
 ```
 
-crates.io (`cargo install porch`) is a **future** option if/when the slice graph is published. Needs `git` and Rust 1.85+ (stable). Check the machine with `porch doctor`.
+Or with Cargo directly:
+
+```sh
+cargo install --path crates/porch --locked
+# or:
+cargo install --git https://github.com/jayden-dang/porch --locked
+```
+
+Ensure `~/.cargo/bin` is on `PATH` (`porch doctor` warns when the binary is installed there but the dir is missing from `PATH`). crates.io (`cargo install porch`) is a **future** option if/when the slice graph is published. Needs `git` and Rust 1.85+ (stable).
 
 ## Loop
 
 ```sh
-porch setup                          # or: porch setup --yes  (writes OCR→review wrapper + config.yaml)
+porch setup                          # or: porch setup --yes  (detects coding agent; writes config.yaml)
+# optional login service (default remains detached):
+#   porch setup --yes --install-daemon
 porch doctor
 cd /path/to/your/clone
-porch init                           # --yes also runs setup when review is missing
+porch init                           # copies /porch skill for detected claude/codex; --yes also runs setup
 porch daemon start                   # optional: install KeepAlive via `porch daemon install`
 git push porch HEAD:refs/heads/your-branch
 porch runs                           # or bare `porch` / `porch attach`
 ```
 
-`$PORCH_HOME` overrides `~/.porch`. Operator config is `$PORCH_HOME/config.yaml` (from setup). Put a trusted `.porch.yaml` on the **default branch** (`commands.format` / `commands.lint`, `deliver.github.watch_checks`, …). Executing config is read from that SHA, never from the pushed tip.
+`$PORCH_HOME` overrides `~/.porch`. Operator config is `$PORCH_HOME/config.yaml` (from setup). Put a trusted `.porch.yaml` on the **default branch** (`commands.format` / `commands.lint`, `deliver.github.watch_checks`, …). Executing config is read from that SHA, never from the pushed tip. Full operator loop (M15 / 0.2-class): [`docs/10-operator-checklist.md`](docs/10-operator-checklist.md).
 
-Review is an external CLI. Prefer `porch setup` so OCR (`ocr review …`) is wrapped as `$PORCH_HOME/bin/review`; `PORCH_REVIEW_BIN` still overrides. To switch engines later: edit `review.engine` / `review.bin` in `$PORCH_HOME/config.yaml`, then `porch setup --apply` (rewrites the wrapper and re-verifies). Deliver uses `gh` (`PORCH_GH_BIN`). When review parks, attach the TUI (`porch` / `porch attach` on a TTY) or respond headlessly:
+**Review default is a session-free coding-agent turn** (`porch setup` detects `claude` / `codex`). Legacy OCR remains available via `porch setup --engine ocr` (wrapper at `$PORCH_HOME/bin/review`). `PORCH_REVIEW_BIN` still overrides for PATH fakes / generic CLIs; `PORCH_REVIEW_AGENT_BIN` overrides the agent binary. To switch engines later: edit `review.engine` in `$PORCH_HOME/config.yaml`, then `porch setup --apply`. Deliver uses `gh` (`PORCH_GH_BIN`). When review parks, attach the TUI (`porch` / `porch attach` on a TTY) or respond headlessly:
 
 ```sh
 porch agent status

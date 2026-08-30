@@ -1,0 +1,26 @@
+id: js
+globs:
+  - "**/*.{js,jsx,ts,tsx,mjs,cjs}"
+exclude_globs:
+  - "**/*.test.*"
+  - "**/*.spec.*"
+  - "**/__tests__/**"
+  - "**/node_modules/**"
+  - "**/dist/**"
+  - "**/*.d.ts"
+rules:
+  - id: loose-equality
+    category: bug
+    severity: medium
+    message: "Loose equality (== / !=) in changed lines — prefer === / !=="
+    match: "(^|[^=!<>])==([^=]|$)|(^|[^=!<>])!=([^=]|$)"
+  - id: console-log
+    category: maintainability
+    severity: low
+    message: "console.log in changed lines — remove or gate behind debug"
+    match: "\\bconsole\\.log\\s*\\("
+  - id: var-keyword
+    category: style
+    severity: low
+    message: "var keyword in changed lines — prefer let/const"
+    match: "(^|[^\\w.$])var\\s+"

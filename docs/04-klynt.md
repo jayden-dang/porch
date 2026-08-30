@@ -30,6 +30,8 @@ feature PR ──► CI workflow
 
 Lefthook **pre-push** is the expensive local gate (fmt/lint/typecheck/**test-coverage**/build + **Platform E2E**). Porch certify must not mirror it.
 
+**`git push --no-verify porch` is expected.** Porch is not lefthook: the `porch` remote's hooks are porch admit/notify, and lefthook's pre-push suite must not block consent to the inner gate. Use `--no-verify` (or an equivalent skip) when pushing to `porch`; keep lefthook for pushes that actually target `origin`.
+
 There is **no** cheap GitHub check that is only fmt/lint/drift. Honest `watch_checks: []` — push+PR, no babysit.
 
 ## Cheap local commands (certify)

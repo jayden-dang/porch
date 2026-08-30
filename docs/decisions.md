@@ -40,7 +40,7 @@ Reopen only with an explicit written change. Coding sessions do not get to “ju
 | E12 | Deliver watches **allowlisted PR check names** only. `ci.rerun_transient` default 0. Never rerun spend-money or deploy workflows. |
 | E13 | Unit tests never call real LLMs, a real review-CLI network, or real `gh`. PATH fakes + JSON fixtures. |
 | E14 | `Cargo.lock` is committed (this is a binary). |
-| E15 | Rebase conflict: **fail the run** after `git rebase --abort`. No park until a later milestone owns the park TUI. |
+| E15 | Rebase conflict: **park** after a successful `git rebase --abort` (keep worktree; `status=parked`, phase=`rebase`; respond `fix`/`abort`). Fail closed if abort itself fails. **Superseded 2026-08-30 (M13):** earlier wording was fail-the-run until a park TUI existed; M8 shipped attach, M13 owns rebase-park. |
 | E16 | Fetch/resolve of `origin/<default>` fails: **fail the run** (fail closed). Default-branch tip is a safety fact for rebase. |
 | E17 | Intent for execute: hook/`notify` reads **`PORCH_INTENT`**. Empty → skip intent phase, do not fail. Default branch column: `repos.default_branch` (default `main`). |
 | E18 | M3 park + agent JSON: blocking review findings set `status=parked` and keep the worktree; `porch agent status` / `respond` emit JSON on stdout (D11). Respond supports **`approve` \| `skip` \| `abort` only** (no fixer). `review_approved_head_sha` is written only on completed review or **approve**; **skip** does not write it. Review subprocess timeout **fails** the run (does not park). Review adapter lives in `porch-review`; `porch-gate` must not depend on it. **Partly superseded by E23** (adds `fix`). |

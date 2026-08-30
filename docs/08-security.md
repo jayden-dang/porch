@@ -68,4 +68,4 @@ Review comments are also untrusted: they become findings, not shell.
 
 ## Least privilege year-1
 
-Operator’s `gh` and `git` credentials are the blast radius. Porch does not store PATs. Daemon inherits the user’s environment (PATH, `gh` auth, `SSH_AUTH_SOCK`) — document that.
+Operator’s `gh` and `git` credentials are the blast radius. Porch does not store PATs. Daemon inherits the user’s environment (PATH, `gh` auth, `SSH_AUTH_SOCK`) — document that. Certify also prepends parent dirs of recorded `$PORCH_HOME/config.yaml` `tools.*` paths (from `porch setup`) so a cold/thin daemon PATH still finds e.g. `biome` in disposable worktrees.

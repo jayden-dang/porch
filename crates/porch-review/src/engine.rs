@@ -1,24 +1,33 @@
-//! Review engine profiles (`ocr`, `generic`). Adding later = another profile.
+//! Review engine profiles (`agent`, `quality`, `generic`, `ocr`).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+/// PATH names tried for [`EngineKind::Agent`] (same family as the fixer, D8).
+pub const AGENT_DETECT_BINS: &[&str] = &["claude", "codex"];
+
 /// Known review engines for first-run setup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineKind {
-    /// `ocr` (Open Code Review) CLI: wrapper prefixes `review`.
-    Ocr,
+    /// Session-free coding-agent turn (claude/codex); workflow default when quality absent.
+    Agent,
+    /// Porch-owned quality engine (`porch-quality`); M16 preferred when on PATH.
+    Quality,
     /// Binary already speaks porch argv (`--from --to --format json --output`).
     Generic,
+    /// `ocr` CLI (legacy/optional): wrapper prefixes `review`.
+    Ocr,
 }
 
 impl EngineKind {
-    /// Parse `ocr` / `generic` (case-insensitive).
+    /// Parse `agent` / `quality` / `generic` / `ocr` (case-insensitive).
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "ocr" => Some(Self::Ocr),
+            "agent" => Some(Self::Agent),
+            "quality" => Some(Self::Quality),
             "generic" => Some(Self::Generic),
+            "ocr" => Some(Self::Ocr),
             _ => None,
         }
     }
@@ -27,17 +36,21 @@ impl EngineKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Ocr => "ocr",
+            Self::Agent => "agent",
+            Self::Quality => "quality",
             Self::Generic => "generic",
+            Self::Ocr => "ocr",
         }
     }
 
-    /// PATH binary to detect for this engine.
+    /// PATH binary to detect for this engine (`agent` uses [`AGENT_DETECT_BINS`]).
     #[must_use]
     pub const fn detect_bin(self) -> &'static str {
         match self {
-            Self::Ocr => "ocr",
+            Self::Agent => "claude",
+            Self::Quality => "porch-quality",
             Self::Generic => "review",
+            Self::Ocr => "ocr",
         }
     }
 
@@ -46,8 +59,14 @@ impl EngineKind {
     pub const fn wrapper_prefix(self) -> &'static [&'static str] {
         match self {
             Self::Ocr => &["review"],
-            Self::Generic => &[],
+            Self::Agent | Self::Generic | Self::Quality => &[],
         }
+    }
+
+    /// Whether this engine uses a `$PORCH_HOME/bin/review` argv wrapper.
+    #[must_use]
+    pub const fn uses_wrapper(self) -> bool {
+        matches!(self, Self::Ocr | Self::Generic | Self::Quality)
     }
 }
 
@@ -64,19 +83,37 @@ pub struct DetectedEngine {
     pub bin: PathBuf,
 }
 
+/// Binaries tried when detecting the agent engine.
+#[must_use]
+pub fn agent_detect_bins() -> &'static [&'static str] {
+    AGENT_DETECT_BINS
+}
+
 /// Build the shell wrapper body for `engine` targeting absolute `backend`.
+///
+/// Agent review does not use this wrapper; callers should skip via
+/// [`EngineKind::uses_wrapper`].
 #[must_use]
 pub fn wrapper_script(engine: EngineKind, backend: &Path) -> String {
     let backend = backend.display();
     match engine {
         EngineKind::Ocr => format!("#!/bin/sh\nexec {backend} review \"$@\"\n"),
-        EngineKind::Generic => format!("#!/bin/sh\nexec {backend} \"$@\"\n"),
+        EngineKind::Generic | EngineKind::Quality => {
+            format!("#!/bin/sh\nexec {backend} \"$@\"\n")
+        }
+        EngineKind::Agent => {
+            "#!/bin/sh\necho \"porch: agent engine has no review wrapper\" >&2\nexit 2\n"
+                .to_string()
+        }
     }
 }
 
 /// Whether `body` is an acceptable porch-owned wrapper for `engine` + `backend`.
 #[must_use]
 pub fn wrapper_body_matches(engine: EngineKind, backend: &Path, body: &str) -> bool {
+    if !engine.uses_wrapper() {
+        return false;
+    }
     let expected = wrapper_script(engine, backend);
     normalize_script(body) == normalize_script(&expected)
 }
@@ -85,8 +122,13 @@ fn normalize_script(s: &str) -> String {
     s.replace("\r\n", "\n").trim().to_string()
 }
 
-/// Registry of engines porch knows how to set up (lookahead: two only).
+/// Registry of engines porch knows how to set up (quality preferred, agent workflow, ocr legacy).
 #[must_use]
 pub fn known_engines() -> &'static [EngineKind] {
-    &[EngineKind::Ocr, EngineKind::Generic]
+    &[
+        EngineKind::Quality,
+        EngineKind::Agent,
+        EngineKind::Generic,
+        EngineKind::Ocr,
+    ]
 }

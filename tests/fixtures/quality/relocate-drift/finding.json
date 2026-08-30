@@ -1,0 +1,6 @@
+{
+  "path": "file.rs",
+  "start_line": 2,
+  "existing_code": "let x = danger();",
+  "expect": { "outcome": "relocated", "line": 4 }
+}

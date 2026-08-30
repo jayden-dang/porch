@@ -32,9 +32,10 @@ crates/porch/              # binary; clap; `porch daemon run` is a fast path
 crates/porch-git/          # git CLI wrapper, --git-dir absolute; publish = false
 crates/porch-gate/         # init, hooks, admit, notify, sqlite, daemon (+ RunExecutor inject)
 crates/porch-run/          # worktree, intent, rebase, review, certify, deliver, agent respond
-crates/porch-review/       # review adapter (agent or CLI; PATH fake in tests)
+crates/porch-review/       # review adapter (agent / quality / CLI; PATH fake in tests)
+crates/porch-quality/      # M16 porch-owned review quality engine (`porch-quality` bin)
 crates/porch-agent/        # native fixer CLI adapter (PATH fake in tests)
-crates/porch-deliver/    # GitHub PR + allowlisted checks (`gh`)
+crates/porch-deliver/      # GitHub PR + allowlisted checks (`gh`)
 ```
 
 State root: `$PORCH_HOME` (default `~/.porch`).

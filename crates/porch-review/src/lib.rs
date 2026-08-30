@@ -1,8 +1,9 @@
-//! External review CLI adapter: spawn, parse JSON, map to findings.
+//! External review CLI / coding-agent review adapter: spawn, parse JSON, map to findings.
 //!
 //! Also owns operator `$PORCH_HOME/config.yaml` load + review-engine setup
 //! (wrapper write/verify). Gate must not depend on this crate.
 
+mod agent_review;
 mod engine;
 mod home_config;
 mod pathutil;
@@ -17,7 +18,14 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-pub use engine::{DetectedEngine, EngineKind, known_engines, wrapper_script};
+pub use agent_review::{
+    REVIEW_AGENT_BIN_ENV, REVIEW_ARTIFACT_REL, REVIEWER_PROMPT, RunAgentReviewOpts,
+    agent_review_bin, assert_prompt_under_home, build_reviewer_prompt, parse_agent_review_json,
+    review_uses_agent, run_agent_review, write_reviewer_prompt,
+};
+pub use engine::{
+    AGENT_DETECT_BINS, DetectedEngine, EngineKind, agent_detect_bins, known_engines, wrapper_script,
+};
 pub use home_config::{
     CONFIG_FILE, FixerConfig, GithubConfig, HomeConfig, ReviewConfig, ToolsConfig, config_path,
     load_home_config, write_home_config,
@@ -189,6 +197,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("coverage: changed file `{0}` missing from review manifest without skip")]
     Coverage(String),
+    #[error("prompt file missing or not under PORCH_HOME: {0}")]
+    PromptRefuse(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -215,7 +225,7 @@ pub fn review_bin() -> String {
     DEFAULT_BIN.to_string()
 }
 
-fn porch_home_dir() -> Option<PathBuf> {
+pub(crate) fn porch_home_dir() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("PORCH_HOME") {
         return Some(PathBuf::from(v));
     }
@@ -376,14 +386,72 @@ pub struct RunReviewOpts<'a> {
     pub changed_files: &'a [String],
     pub bin: &'a str,
     pub timeout: Duration,
+    /// `$PORCH_HOME` — required for agent-engine dispatch and prompt artifacts.
+    pub porch_home: Option<&'a Path>,
+    /// Run id for `$PORCH_HOME/runs/<id>/review/` artifacts (agent engine).
+    pub run_id: Option<&'a str>,
+    /// Authoritative intent text, if any (agent prompt).
+    pub intent: Option<&'a str>,
 }
 
-/// Spawn the review CLI in `work_tree`, parse JSON, enforce coverage.
+/// Spawn review: agent path when configured (`PORCH_REVIEW_BIN` unset); else CLI.
 ///
 /// # Errors
 ///
-/// Returns spawn, timeout, exit, JSON, coverage, or I/O errors.
+/// Returns spawn, timeout, exit, JSON, coverage, prompt-refuse, or I/O errors.
 pub fn run_review(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
+    if review_uses_agent(opts.porch_home) {
+        let home = opts.porch_home.ok_or_else(|| {
+            Error::Msg("agent review requires porch_home for prompt artifacts".into())
+        })?;
+        return run_review_via_agent(opts, home);
+    }
+    run_review_cli(opts)
+}
+
+fn run_review_via_agent(
+    opts: &RunReviewOpts<'_>,
+    porch_home: &Path,
+) -> Result<ReviewOutcome, Error> {
+    let run_id = opts.run_id.ok_or_else(|| {
+        Error::Msg("agent review requires run_id for prompt artifacts under PORCH_HOME".into())
+    })?;
+    let review_dir = porch_home
+        .join("runs")
+        .join(run_id)
+        .join(REVIEW_ARTIFACT_REL);
+    let path_instructions = {
+        let p = porch_home
+            .join("runs")
+            .join(run_id)
+            .join("path_instructions.json");
+        if p.is_file() {
+            Some(fs::read_to_string(&p)?)
+        } else {
+            None
+        }
+    };
+    let prompt_file = write_reviewer_prompt(
+        &review_dir,
+        opts.intent,
+        path_instructions.as_deref(),
+        opts.changed_files,
+    )?;
+    let bin = agent_review_bin(porch_home)?;
+    run_agent_review(&RunAgentReviewOpts {
+        work_tree: opts.work_tree,
+        prompt_file: &prompt_file,
+        porch_home,
+        from_sha: opts.from_sha,
+        to_sha: opts.to_sha,
+        changed_files: opts.changed_files,
+        bin: &bin,
+        timeout: opts.timeout,
+    })
+}
+
+/// Spawn the review CLI in `work_tree`, parse JSON, enforce coverage.
+fn run_review_cli(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
     let out_dir = opts.work_tree.join(".porch-review");
     fs::create_dir_all(&out_dir)?;
     let out_file = out_dir.join("result.json");

@@ -190,7 +190,7 @@ fn notify_inserts_a_pending_run() {
     .unwrap();
     let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let stdin = format!("0000000000000000000000000000000000000000 {sha} refs/heads/main\n");
-    let ids = notify_push(&home_path, &result.bare_path, stdin.as_bytes()).unwrap();
+    let ids = notify_push(&home_path, &result.bare_path, stdin.as_bytes(), None).unwrap();
     assert_eq!(ids.len(), 1);
     let db = Db::open(&home_path.join("state.sqlite")).unwrap();
     let runs = db.runs_for_repo(&result.repo_id).unwrap();
@@ -198,6 +198,58 @@ fn notify_inserts_a_pending_run() {
     assert_eq!(runs[0].sha, sha);
     assert_eq!(runs[0].status, "pending");
     assert_eq!(runs[0].branch, "main");
+}
+
+#[test]
+fn notify_cli_intent_persists_on_run() {
+    let (_keep, work) = git_repo();
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let dummy_bin = dummy_bin(&work);
+    let result = init(InitOptions {
+        work_tree: &work,
+        porch_home: &home_path,
+        porch_bin: &dummy_bin,
+        start_daemon: false,
+    })
+    .unwrap();
+    let sha = "dddddddddddddddddddddddddddddddddddddddd";
+    let stdin = format!("0000000000000000000000000000000000000000 {sha} refs/heads/feat\n");
+    let ids = notify_push(
+        &home_path,
+        &result.bare_path,
+        stdin.as_bytes(),
+        Some("ship feat via cli"),
+    )
+    .unwrap();
+    assert_eq!(ids.len(), 1);
+    let db = Db::open(&home_path.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&ids[0]).unwrap().unwrap();
+    assert_eq!(run.intent.as_deref(), Some("ship feat via cli"));
+    assert_eq!(run.intent_source.as_deref(), Some("cli"));
+}
+
+#[test]
+fn notify_empty_cli_intent_skips() {
+    let (_keep, work) = git_repo();
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let dummy_bin = dummy_bin(&work);
+    let result = init(InitOptions {
+        work_tree: &work,
+        porch_home: &home_path,
+        porch_bin: &dummy_bin,
+        start_daemon: false,
+    })
+    .unwrap();
+    let sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let stdin = format!("0000000000000000000000000000000000000000 {sha} refs/heads/empty-intent\n");
+    let ids = notify_push(&home_path, &result.bare_path, stdin.as_bytes(), Some("")).unwrap();
+    assert_eq!(ids.len(), 1);
+    let db = Db::open(&home_path.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&ids[0]).unwrap().unwrap();
+    assert!(run.intent.is_none());
+    assert!(run.intent_source.is_none());
 }
 
 #[test]
@@ -219,7 +271,7 @@ fn notify_skips_non_heads_refs() {
         "0000000000000000000000000000000000000000 {sha} refs/heads/feature\n\
          0000000000000000000000000000000000000000 {tag_sha} refs/tags/v1.0.0\n"
     );
-    let ids = notify_push(&home_path, &result.bare_path, stdin.as_bytes()).unwrap();
+    let ids = notify_push(&home_path, &result.bare_path, stdin.as_bytes(), None).unwrap();
     assert_eq!(ids.len(), 1);
     let db = Db::open(&home_path.join("state.sqlite")).unwrap();
     let runs = db.runs_for_repo(&result.repo_id).unwrap();

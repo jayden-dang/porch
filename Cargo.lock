@@ -826,6 +826,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "porch-quality"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "predicates",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "porch-review"
 version = "0.1.0"
 dependencies = [

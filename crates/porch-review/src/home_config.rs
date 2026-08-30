@@ -33,6 +33,9 @@ pub struct ReviewConfig {
     pub bin: Option<String>,
     #[serde(default)]
     pub wrapper: Option<String>,
+    /// Native coding-agent CLI for `engine: agent` (`claude` / `codex`).
+    #[serde(default)]
+    pub agent_bin: Option<String>,
 }
 
 impl ReviewConfig {

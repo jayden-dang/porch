@@ -24,13 +24,16 @@ pub(crate) enum CertifyError {
     Msg(String),
 }
 
-/// Resolve timeout from `PORCH_CERTIFY_TIMEOUT_SECS` (default 30s).
+/// Resolve timeout from `PORCH_CERTIFY_TIMEOUT_SECS` (default 600s).
+///
+/// Cold monorepo lint/typecheck (e.g. moon) routinely exceeds 30s; keep the
+/// env override for tighter tests.
 #[must_use]
 pub(crate) fn certify_timeout() -> Duration {
     std::env::var(CERTIFY_TIMEOUT_ENV)
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .map_or(Duration::from_secs(30), Duration::from_secs)
+        .map_or(Duration::from_secs(600), Duration::from_secs)
 }
 
 /// Load trusted commands and run one pass of format then lint.
@@ -40,12 +43,16 @@ pub(crate) fn certify_timeout() -> Duration {
 /// (default-branch tip observed at rebase), not from a fresh remote-tracking
 /// rev-parse and not from the rebase-onto / `base_sha` tip.
 ///
+/// Child PATH is enriched with parent dirs of `$PORCH_HOME/config.yaml` `tools.*`
+/// so cold daemons (thin PATH) still see recorded binaries such as `biome`.
+///
 /// # Errors
 ///
 /// Fails closed on missing `base_sha` or `trusted_config_sha`, unreadable pinned
 /// commit, unparseable yaml, non-zero format/lint, timeout, or cancel.
 pub(crate) fn run_certify_phase(
     db: &Db,
+    home: &Path,
     run_id: &str,
     bare: &GitDir,
     wt: &Path,
@@ -54,12 +61,13 @@ pub(crate) fn run_certify_phase(
 ) -> Result<(), CertifyError> {
     let cmds = load_trusted_commands(db, run_id, bare)?;
     let timeout = certify_timeout();
+    let path_extra = tools_path_prefix(home);
 
     if let Some(cmd) = non_empty(&cmds.format) {
         if cancelled(cancel) {
             return Err(CertifyError::Msg("cancelled".into()));
         }
-        run_adapter(wt, "format", cmd, timeout)?;
+        run_adapter(wt, "format", cmd, timeout, &path_extra)?;
         if maybe_correction_commit(wt, "porch: apply format")? {
             refresh_head_sha(db, run_id, wt)?;
         }
@@ -69,7 +77,7 @@ pub(crate) fn run_certify_phase(
         if cancelled(cancel) {
             return Err(CertifyError::Msg("cancelled".into()));
         }
-        run_adapter(wt, "lint", cmd, timeout)?;
+        run_adapter(wt, "lint", cmd, timeout, &path_extra)?;
         if maybe_correction_commit(wt, "porch: apply lint")? {
             refresh_head_sha(db, run_id, wt)?;
         }
@@ -78,6 +86,33 @@ pub(crate) fn run_certify_phase(
     // commands.test is intentionally not run in M5.
     let _ = cmds.test;
     Ok(())
+}
+
+/// Parent directories of recorded `tools.*` paths, joined for PATH prepend.
+fn tools_path_prefix(home: &Path) -> String {
+    let Ok(Some(cfg)) = porch_review::load_home_config(home) else {
+        return String::new();
+    };
+    let mut dirs = Vec::new();
+    for path in [
+        cfg.tools.biome.as_deref(),
+        cfg.tools.bun.as_deref(),
+        cfg.tools.cargo.as_deref(),
+        cfg.tools.just.as_deref(),
+        cfg.tools.moon.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let p = Path::new(path);
+        if let Some(parent) = p.parent() {
+            let s = parent.to_string_lossy();
+            if !s.is_empty() && !dirs.iter().any(|d: &String| d == s.as_ref()) {
+                dirs.push(s.into_owned());
+            }
+        }
+    }
+    dirs.join(":")
 }
 
 fn load_trusted_commands(db: &Db, run_id: &str, bare: &GitDir) -> Result<Commands, CertifyError> {
@@ -124,9 +159,10 @@ fn run_adapter(
     name: &str,
     command: &str,
     timeout: Duration,
+    path_extra: &str,
 ) -> Result<(), CertifyError> {
-    let out =
-        run_shell(wt, command, timeout).map_err(|e| CertifyError::Msg(format!("{name}: {e}")))?;
+    let out = run_shell(wt, command, timeout, path_extra)
+        .map_err(|e| CertifyError::Msg(format!("{name}: {e}")))?;
     if out.code != 0 {
         return Err(CertifyError::Msg(format!(
             "{name} exited {}: {}: {}",
@@ -154,14 +190,29 @@ fn truncate_output(s: &str) -> String {
     if s.len() <= OUTPUT_TRUNCATE {
         return s.to_string();
     }
-    let mut end = OUTPUT_TRUNCATE;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    // Keep head + tail: moon/cargo noise is front-loaded; the real error is usually last.
+    let keep_tail = OUTPUT_TRUNCATE / 2;
+    let keep_head = OUTPUT_TRUNCATE.saturating_sub(keep_tail);
+    let mut head_end = keep_head.min(s.len());
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    format!("{}…", &s[..end])
+    let mut tail_start = s.len().saturating_sub(keep_tail);
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if tail_start <= head_end {
+        return s.to_string();
+    }
+    format!("{}…\n{}", &s[..head_end], &s[tail_start..])
 }
 
-fn run_shell(wt: &Path, command: &str, timeout: Duration) -> Result<ShellOutput, String> {
+fn run_shell(
+    wt: &Path,
+    command: &str,
+    timeout: Duration,
+    path_extra: &str,
+) -> Result<ShellOutput, String> {
     if !wt.is_absolute() {
         return Err(format!("worktree must be absolute, got {}", wt.display()));
     }
@@ -172,6 +223,15 @@ fn run_shell(wt: &Path, command: &str, timeout: Duration) -> Result<ShellOutput,
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    if !path_extra.is_empty() {
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut combined = std::ffi::OsString::from(path_extra);
+        if !inherited.is_empty() {
+            combined.push(":");
+            combined.push(inherited);
+        }
+        cmd.env("PATH", combined);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

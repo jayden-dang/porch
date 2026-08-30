@@ -7,11 +7,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use porch_gate::{
-    InitOptions, admit_push, ensure_daemon, get_run, git_dir_from_env, health_check, init,
-    install_service, list_runs, notify_push, porch_home, repo_id_for, run_daemon, service_status,
-    start_service, stop_daemon, uninstall_service,
+    EjectOptions, InitOptions, admit_push, eject, ensure_daemon, get_run, git_dir_from_env,
+    health_check, init, install_service, list_runs, notify_push, porch_home, repo_id_for,
+    run_daemon, service_status, start_service, stop_daemon, uninstall_service,
 };
-use porch_run::{AgentResponse, PipelineExecutor, agent_respond, agent_status};
+use porch_run::{
+    AgentResponse, AgentRunOpts, PipelineExecutor, agent_respond, agent_run, agent_status,
+    agent_sync, rerun,
+};
 
 mod doctor;
 mod setup;
@@ -34,6 +37,10 @@ enum Command {
         /// Skip first-run review setup entirely.
         #[arg(long)]
         skip_setup: bool,
+        /// Optional intent reminder printed in next-steps (E17: empty skips).
+        /// Authoritative intent is set on push via `PORCH_INTENT` or `porch agent run --intent`.
+        #[arg(long)]
+        intent: Option<String>,
     },
     /// Detect review engine, write `$PORCH_HOME/config.yaml` + wrapper.
     Setup {
@@ -43,12 +50,15 @@ enum Command {
         /// Re-check wrapper/config without rewriting.
         #[arg(long)]
         verify: bool,
-        /// Force engine (`ocr` or `generic`).
+        /// Force engine (`agent`, `ocr`, or `generic`).
         #[arg(long)]
         engine: Option<String>,
         /// Rewrite wrapper from current config.yaml.
         #[arg(long)]
         apply: bool,
+        /// Also install the daemon as a login service (default: off / detached).
+        #[arg(long)]
+        install_daemon: bool,
     },
     /// Check PATH / home / daemon prerequisites for a push.
     Doctor,
@@ -66,6 +76,19 @@ enum Command {
     },
     /// Attach the park TUI (or print a snapshot when not a TTY).
     Attach {
+        #[arg(long)]
+        run_id: Option<String>,
+    },
+    /// Remove the `porch` remote (and neutralize bare hooks).
+    Eject {
+        /// Also delete this repo's bare, worktrees, run artifacts, and DB row.
+        /// Leaves other repos under `$PORCH_HOME` and global config untouched.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Enqueue a new run from a prior run's recorded tip (fresh worktree).
+    Rerun {
+        /// Prior run id. Default: latest run for the current branch.
         #[arg(long)]
         run_id: Option<String>,
     },
@@ -88,7 +111,12 @@ enum DaemonCommand {
     /// pre-receive: currently always allow.
     AdmitPush,
     /// post-receive: record a pending run and ask the daemon to start it.
-    NotifyPush,
+    NotifyPush {
+        /// Authoritative intent for enqueued runs (preferred over `PORCH_INTENT`).
+        /// Empty skips intent (E17); does not fail.
+        #[arg(long)]
+        intent: Option<String>,
+    },
     /// Write the OS service definition (launchd/systemd).
     Install,
     /// Stop if possible and remove the service definition.
@@ -110,6 +138,21 @@ enum DaemonCommand {
 
 #[derive(Subcommand)]
 enum AgentCommand {
+    /// Ensure daemon; attach or push; optional wait until park/terminal (JSON/JSONL).
+    Run {
+        /// Attach to this run (no push). Defaults: active branch run, else `git push porch`.
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Stream JSONL until parked, completed, failed, or cancelled.
+        #[arg(long)]
+        wait: bool,
+        /// Max seconds to wait (only with `--wait`). Omit for no limit.
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Authoritative intent when pushing (E17: empty skips). Not with `--run-id`.
+        #[arg(long)]
+        intent: Option<String>,
+    },
     /// Print run status JSON (default: latest parked for this repo).
     Status {
         /// Run id (ULID). Defaults to latest parked run for the cwd repo.
@@ -129,6 +172,14 @@ enum AgentCommand {
         /// After one fix round, approve remaining findings (only with `fix`).
         #[arg(long)]
         yes: bool,
+    },
+    /// Custody / sync JSON: author branch vs pipeline HEAD (`--recover` optional).
+    Sync {
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Fast-forward local branch from a recorded recovery tip when safe.
+        #[arg(long)]
+        recover: bool,
     },
 }
 
@@ -163,12 +214,17 @@ fn main_inner() -> Result<ExitCode> {
 
     match Cli::parse().command {
         None => run_bare(),
-        Some(Command::Init { yes, skip_setup }) => run_init(yes, skip_setup),
+        Some(Command::Init {
+            yes,
+            skip_setup,
+            intent,
+        }) => run_init(yes, skip_setup, intent.as_deref()),
         Some(Command::Setup {
             yes,
             verify,
             engine,
             apply,
+            install_daemon,
         }) => {
             let home = porch_home();
             setup::run(
@@ -178,6 +234,7 @@ fn main_inner() -> Result<ExitCode> {
                     verify,
                     apply,
                     engine,
+                    install_daemon,
                 },
             )
         }
@@ -185,7 +242,23 @@ fn main_inner() -> Result<ExitCode> {
         Some(Command::Runs { limit }) => run_runs(limit),
         Some(Command::Status { json }) => run_status(json),
         Some(Command::Attach { run_id }) => run_attach_cmd(run_id.as_deref()),
+        Some(Command::Eject { purge }) => run_eject(purge),
+        Some(Command::Rerun { run_id }) => run_rerun(run_id.as_deref()),
         Some(Command::Daemon { command }) => run_daemon_command(&command),
+        Some(Command::Agent {
+            command:
+                AgentCommand::Run {
+                    run_id,
+                    wait,
+                    timeout,
+                    intent,
+                },
+        }) => Ok(run_agent_run(
+            run_id.as_deref(),
+            wait,
+            timeout,
+            intent.as_deref(),
+        )?),
         Some(Command::Agent {
             command: AgentCommand::Status { run_id },
         }) => {
@@ -208,7 +281,59 @@ fn main_inner() -> Result<ExitCode> {
             findings.as_deref(),
             yes,
         )?),
+        Some(Command::Agent {
+            command: AgentCommand::Sync { run_id, recover },
+        }) => {
+            let home = porch_home();
+            let work = env::current_dir()?;
+            Ok(emit_agent(&agent_sync(
+                &home,
+                &work,
+                run_id.as_deref(),
+                recover,
+            )))
+        }
     }
+}
+
+fn run_eject(purge: bool) -> Result<ExitCode> {
+    let work = env::current_dir()?;
+    if !is_git_work_tree(&work) {
+        bail!("not a git work tree");
+    }
+    let home = porch_home();
+    let result = eject(EjectOptions {
+        work_tree: &work,
+        porch_home: &home,
+        purge,
+    })?;
+    println!(
+        "ejected repo {} (bare was {})",
+        result.repo_id,
+        result.bare_path.display()
+    );
+    if result.purged {
+        println!(
+            "purged this repo's bare, worktrees, run artifacts, and DB row under {}",
+            home.display()
+        );
+        println!("other repos under PORCH_HOME were not touched");
+    } else {
+        println!("PORCH_HOME left intact (use --purge to remove this repo's gate state)");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_rerun(run_id: Option<&str>) -> Result<ExitCode> {
+    let work = env::current_dir()?;
+    if !is_git_work_tree(&work) {
+        bail!("not a git work tree");
+    }
+    let home = porch_home();
+    ensure_daemon_for_cwd(&home)?;
+    let new_id = rerun(&home, &work, run_id).map_err(|e| anyhow::anyhow!(e))?;
+    println!("rerun started: {new_id}");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_daemon_command(command: &DaemonCommand) -> Result<ExitCode> {
@@ -223,10 +348,10 @@ fn run_daemon_command(command: &DaemonCommand) -> Result<ExitCode> {
             admit_push(io::stdin())?;
             Ok(ExitCode::SUCCESS)
         }
-        DaemonCommand::NotifyPush => {
+        DaemonCommand::NotifyPush { intent } => {
             let home = porch_home();
             let git_dir = git_dir_from_env()?;
-            let ids = notify_push(&home, &git_dir, io::stdin())?;
+            let ids = notify_push(&home, &git_dir, io::stdin(), intent.as_deref())?;
             for id in ids {
                 eprintln!("porch: recorded run {id}");
             }
@@ -303,7 +428,7 @@ fn ensure_daemon_for_cwd(home: &Path) -> Result<()> {
     ensure_daemon(&bin, home).context("ensure daemon (try: porch daemon start)")
 }
 
-fn run_init(yes: bool, skip_setup: bool) -> Result<ExitCode> {
+fn run_init(yes: bool, skip_setup: bool, intent: Option<&str>) -> Result<ExitCode> {
     let work = env::current_dir()?;
     let home = porch_home();
     if !skip_setup {
@@ -337,7 +462,7 @@ fn run_init(yes: bool, skip_setup: bool) -> Result<ExitCode> {
         porch_bin: &bin,
         start_daemon: true,
     })?;
-    print_init_next_steps(&result, &work, &home);
+    print_init_next_steps(&result, &work, &home, intent);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -375,6 +500,7 @@ fn run_bare() -> Result<ExitCode> {
                     verify: false,
                     apply: false,
                     engine: None,
+                    install_daemon: false,
                 },
             );
         }
@@ -502,23 +628,66 @@ fn print_init_next_steps(
     result: &porch_gate::InitResult,
     work: &std::path::Path,
     home: &std::path::Path,
+    intent: Option<&str>,
 ) {
     let branch = doctor::current_branch(work);
     println!("porch remote -> {}", result.bare_path.display());
     println!("repo id: {}", result.repo_id);
     println!("default branch: {}", result.default_branch);
     println!("PORCH_HOME: {}", home.display());
+    for path in &result.skills.written {
+        println!("skill: wrote {}", path.display());
+    }
+    for path in &result.skills.skipped_identical {
+        println!("skill: unchanged {}", path.display());
+    }
+    for w in &result.skills.warnings {
+        eprintln!("porch: {w}");
+    }
     println!("next: git push porch HEAD:refs/heads/{branch}");
+    println!("or:   porch agent run --wait");
+    if let Some(text) = intent.map(str::trim).filter(|s| !s.is_empty()) {
+        println!("intent tip: porch agent run --intent {text:?} --wait");
+        println!("       or: PORCH_INTENT={text:?} git push porch");
+    }
 
-    let review_bin = porch_review::review_bin();
+    // Agent engine has no `review` wrapper — use setup-aware check (same as doctor).
+    let missing_review = !porch_review::review_setup_ok(home);
     let gh_bin = env::var("PORCH_GH_BIN").unwrap_or_else(|_| "gh".into());
-    let missing_review = !doctor::bin_on_path(&review_bin);
     let missing_gh = !doctor::bin_on_path(&gh_bin);
     if missing_review || missing_gh {
         println!(
             "tip: run `porch setup` / `porch doctor` — review and/or gh look missing for a complete run"
         );
     }
+}
+
+fn run_agent_run(
+    run_id: Option<&str>,
+    wait: bool,
+    timeout: Option<u64>,
+    intent: Option<&str>,
+) -> Result<ExitCode> {
+    let work = env::current_dir()?;
+    if !is_git_work_tree(&work) {
+        let _ = writeln!(
+            io::stdout(),
+            "{}",
+            serde_json::json!({"error": "not a git work tree", "code": "usage"})
+        );
+        return Ok(ExitCode::from(2));
+    }
+    let home = porch_home();
+    ensure_daemon_for_cwd(&home)?;
+    let result = agent_run(AgentRunOpts {
+        home: &home,
+        work_tree: &work,
+        run_id,
+        wait,
+        timeout_secs: timeout,
+        intent,
+    });
+    Ok(emit_agent(&result))
 }
 
 fn run_agent_respond(
@@ -580,7 +749,9 @@ fn parse_agent_response(
 }
 
 fn emit_agent(result: &porch_run::AgentCliResult) -> ExitCode {
-    println!("{}", result.json);
+    if !result.already_emitted {
+        println!("{}", result.json);
+    }
     ExitCode::from(u8::try_from(result.exit_code).unwrap_or(1))
 }
 

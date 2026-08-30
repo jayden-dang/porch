@@ -849,6 +849,91 @@ impl Db {
         }
         Ok(out)
     }
+
+    /// Latest step named `step` for a run (by creation time), if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the query fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn latest_step_for_run(&self, run_id: &str, step: &str) -> Result<Option<StepResultRow>> {
+        let conn = self.conn.lock().expect("db mutex");
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, step, status, error FROM step_results
+             WHERE run_id = ?1 AND step = ?2
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![run_id, step])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(StepResultRow {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                step: row.get(2)?,
+                status: row.get(3)?,
+                error: row.get(4)?,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Delete a repo and its runs / step results / uncertified ranges.
+    ///
+    /// Only touches rows for `repo_id` — never other repos.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if any delete fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn delete_repo(&self, repo_id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex");
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM step_results WHERE run_id IN (SELECT id FROM runs WHERE repo_id = ?1)",
+            rusqlite::params![repo_id],
+        )?;
+        tx.execute(
+            "DELETE FROM uncertified_pipeline_ranges WHERE repo_id = ?1",
+            rusqlite::params![repo_id],
+        )?;
+        tx.execute(
+            "DELETE FROM runs WHERE repo_id = ?1",
+            rusqlite::params![repo_id],
+        )?;
+        tx.execute(
+            "DELETE FROM repos WHERE id = ?1",
+            rusqlite::params![repo_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Latest run for a repo+branch (any status), newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SQLite` error if the query fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection mutex is poisoned.
+    pub fn latest_run_for_branch(&self, repo_id: &str, branch: &str) -> Result<Option<RunRow>> {
+        let conn = self.conn.lock().expect("db mutex");
+        let mut stmt = conn.prepare(&format!(
+            "{RUN_SELECT_FROM} WHERE repo_id = ?1 AND branch = ?2
+             ORDER BY created_at DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params![repo_id, branch])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(map_run(row)?));
+        }
+        Ok(None)
+    }
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {

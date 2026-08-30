@@ -177,7 +177,7 @@ fn setup_yes_with_fake_ocr_writes_wrapper_and_records_argv() {
 }
 
 #[test]
-fn setup_yes_fails_closed_without_ocr() {
+fn setup_yes_fails_closed_without_review_engine() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let home = root.join("home");

@@ -76,6 +76,9 @@ pub fn run() -> io::Result<ExitCode> {
 fn collect_checks() -> Vec<Check> {
     let mut checks = Vec::new();
     checks.push(check_porch_bin());
+    if let Some(c) = check_cargo_bin_on_path() {
+        checks.push(c);
+    }
     checks.push(check_git());
     checks.extend(check_home_and_daemon());
     checks.push(check_review());
@@ -97,6 +100,52 @@ fn check_porch_bin() -> Check {
             "porch",
             format!("could not resolve current_exe: {e}"),
         ),
+    }
+}
+
+/// Warn when `$CARGO_HOME/bin/porch` (default `~/.cargo/bin`) exists but that dir is not on PATH.
+fn check_cargo_bin_on_path() -> Option<Check> {
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cargo")))?;
+    let cargo_bin = cargo_home.join("bin");
+    let cargo_porch = cargo_bin.join("porch");
+    if !cargo_porch.is_file() {
+        return None;
+    }
+    let on_path = env::var_os("PATH").is_some_and(|p| {
+        env::split_paths(&p).any(|dir| {
+            if dir == cargo_bin {
+                return true;
+            }
+            match (dir.canonicalize(), cargo_bin.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            }
+        })
+    });
+    if on_path {
+        Some(Check::new(
+            Level::Ok,
+            "PATH",
+            format!(
+                "{} on PATH ({})",
+                cargo_bin.display(),
+                cargo_porch.display()
+            ),
+        ))
+    } else {
+        Some(Check::new(
+            Level::Warn,
+            "PATH",
+            format!(
+                "`{}` exists but {} is not on PATH — add it to your shell profile \
+(e.g. export PATH=\"{}:$PATH\")",
+                cargo_porch.display(),
+                cargo_bin.display(),
+                cargo_bin.display()
+            ),
+        ))
     }
 }
 
@@ -139,16 +188,52 @@ fn check_home_and_daemon() -> Vec<Check> {
 fn check_review() -> Check {
     let home = porch_home();
     let from_env = env::var_os(REVIEW_BIN_ENV).is_some();
-    let bin = review_bin();
-    let resolved = resolve_bin(&bin);
-    if let Some(p) = resolved {
-        if from_env {
-            return Check::new(
+    if from_env {
+        let bin = review_bin();
+        return match resolve_bin(&bin) {
+            Some(p) => Check::new(
                 Level::Ok,
                 "review",
                 format!("{} ({REVIEW_BIN_ENV})", p.display()),
-            );
+            ),
+            None => Check::new(
+                Level::Warn,
+                "review",
+                format!("`{bin}` not found ({REVIEW_BIN_ENV}); needed for a complete run"),
+            ),
+        };
+    }
+    if porch_review::review_uses_agent(Some(&home)) {
+        match porch_review::agent_review_bin(&home) {
+            Ok(agent) => {
+                if let Some(p) = resolve_bin(&agent) {
+                    let engine = load_home_config(&home)
+                        .ok()
+                        .flatten()
+                        .and_then(|c| c.review.engine)
+                        .unwrap_or_else(|| "agent".into());
+                    return Check::new(
+                        Level::Ok,
+                        "review",
+                        format!("{} (engine={engine}, agent)", p.display()),
+                    );
+                }
+                return Check::new(
+                    Level::Warn,
+                    "review",
+                    format!(
+                        "`{agent}` not found — run `porch setup --engine agent` or set PORCH_REVIEW_AGENT_BIN"
+                    ),
+                );
+            }
+            Err(e) => {
+                return Check::new(Level::Warn, "review", e.to_string());
+            }
         }
+    }
+    let bin = review_bin();
+    let resolved = resolve_bin(&bin);
+    if let Some(p) = resolved {
         if let Ok(Some(cfg)) = load_home_config(&home) {
             if let Some(engine) = cfg.review.engine.as_deref() {
                 let wrap = cfg
@@ -173,7 +258,7 @@ fn check_review() -> Check {
         Level::Warn,
         "review",
         format!(
-            "`{bin}` not found — run `porch setup` (or set {REVIEW_BIN_ENV}); needed for a complete run"
+            "review not configured — run `porch setup` (quality or agent) or set {REVIEW_BIN_ENV}; needed for a complete run"
         ),
     )
 }

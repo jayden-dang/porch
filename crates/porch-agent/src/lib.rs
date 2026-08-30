@@ -20,6 +20,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 600;
 pub const FIXER_PROMPT: &str = "\
 Investigate the selected review findings and fix them narrowly in this worktree.
 Apply the smallest change that addresses each finding.
+Findings JSON may include an optional per-finding `note` from the operator — respect it.
 Run one focused verification of the touched area only.
 Do NOT run the full repository test or lint suite.
 Do not add comments that only explain the fix.
@@ -31,6 +32,15 @@ pub const DELIVER_REPAIR_PROMPT: &str = "\
 Named allowlisted PR checks failed. Fix the smallest root cause in this worktree.
 Do not refactor unrelated code. Do not run the full suite (no just gate, Playwright, or Postgres).
 Verify only the touched area. Findings JSON lists the failing check names and states.
+";
+
+/// Prompt when a run is parked on a rebase conflict (after `git rebase --abort`).
+pub const REBASE_FIX_PROMPT: &str = "\
+Rebase onto the recorded base failed with a conflict; the in-progress rebase was aborted.
+The worktree is at the submitted tip again. Edit the branch so a fresh rebase onto the
+base SHA in findings JSON will succeed (resolve conflicting changes narrowly).
+Do NOT run the full repository test or lint suite.
+Do not rewrite unrelated history.
 ";
 
 /// Successful fixer CLI stdout payload.
@@ -159,6 +169,18 @@ pub fn write_deliver_repair_inputs(
     findings_json: &str,
 ) -> Result<(PathBuf, PathBuf), Error> {
     write_prompt_and_findings(repair_dir, DELIVER_REPAIR_PROMPT, findings_json)
+}
+
+/// Write rebase-conflict fixer inputs under `fixer_dir`.
+///
+/// # Errors
+///
+/// Returns I/O or JSON errors.
+pub fn write_rebase_fix_inputs(
+    fixer_dir: &Path,
+    findings_json: &str,
+) -> Result<(PathBuf, PathBuf), Error> {
+    write_prompt_and_findings(fixer_dir, REBASE_FIX_PROMPT, findings_json)
 }
 
 fn write_prompt_and_findings(

@@ -1,8 +1,9 @@
 //! JSON-RPC client helpers over the daemon Unix socket.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +11,9 @@ use crate::Result;
 use crate::db::{Db, RunRow, StepResultRow};
 use crate::events::{Event, EventHub};
 use crate::home::socket_path;
+
+/// Soft cap for on-demand finding hunk / diff payloads (bytes).
+pub const FINDING_HUNK_MAX_BYTES: usize = 16_384;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -196,8 +200,13 @@ pub fn list_runs(
 /// the response is invalid.
 pub fn get_run(home: &Path, run_id: &str) -> Result<RunSnapshot> {
     let resp = rpc_call(home, "get_run", Some(serde_json::json!({"run_id": run_id})))?;
-    if let Some(err) = resp.result.get("error").and_then(|v| v.as_str()) {
-        return Err(crate::Error::Other(err.into()));
+    // RPC failures are `{"error":…}` without `run_id`. A real snapshot may include
+    // `error` for a failed/cancelled run — that is not an RPC failure.
+    if resp.result.get("run_id").and_then(|v| v.as_str()).is_none() {
+        if let Some(err) = resp.result.get("error").and_then(|v| v.as_str()) {
+            return Err(crate::Error::Other(err.into()));
+        }
+        return Err(crate::Error::Other("get_run: invalid response".into()));
     }
     serde_json::from_value(resp.result).map_err(|e| crate::Error::Other(e.to_string()))
 }
@@ -287,4 +296,184 @@ pub(crate) fn get_run_result(db: &Db, hub: &EventHub, run_id: &str) -> Result<se
     let steps = db.step_results_for_run(run_id)?;
     let snap = build_run_snapshot(&run, &steps, hub.state_rev());
     serde_json::to_value(snap).map_err(|e| crate::Error::Other(e.to_string()))
+}
+
+/// Fetch a capped file snippet / diff for one finding via daemon RPC.
+///
+/// # Errors
+///
+/// Returns an error if the socket cannot be reached or the response is invalid.
+pub fn get_finding_hunk(home: &Path, run_id: &str, finding_id: &str) -> Result<serde_json::Value> {
+    let resp = rpc_call(
+        home,
+        "get_finding_hunk",
+        Some(serde_json::json!({
+            "run_id": run_id,
+            "finding_id": finding_id,
+        })),
+    )?;
+    Ok(resp.result)
+}
+
+/// Server-side: build a capped hunk/diff for one finding from the run worktree.
+pub(crate) fn get_finding_hunk_result(
+    db: &Db,
+    run_id: &str,
+    finding_id: &str,
+) -> Result<serde_json::Value> {
+    let Some(run) = db.run_by_id(run_id)? else {
+        return Ok(serde_json::json!({"error": format!("unknown run {run_id}")}));
+    };
+    let findings = run
+        .findings_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+    let Some(arr) = findings.as_array() else {
+        return Ok(serde_json::json!({"error": "findings are not an array"}));
+    };
+    let Some(finding) = arr
+        .iter()
+        .find(|v| v.get("id").and_then(|x| x.as_str()) == Some(finding_id))
+    else {
+        return Ok(serde_json::json!({
+            "error": format!("unknown finding {finding_id}")
+        }));
+    };
+    let path = finding
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if path.is_empty() {
+        return Ok(serde_json::json!({"error": "finding has empty path"}));
+    }
+    let start_line = finding
+        .get("start_line")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+    let end_line = finding
+        .get("end_line")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+
+    let Some(wt) = run.worktree_dir.as_ref() else {
+        return Ok(serde_json::json!({"error": "run has no worktree_dir"}));
+    };
+    if !wt.is_absolute() || !wt.is_dir() {
+        return Ok(serde_json::json!({"error": "worktree missing or not absolute"}));
+    }
+
+    let file_path = match safe_worktree_file(wt, &path) {
+        Ok(p) => p,
+        Err(msg) => return Ok(serde_json::json!({"error": msg})),
+    };
+
+    let (hunk, source, truncated) = if file_path.is_file() {
+        match file_snippet(&file_path, start_line, end_line, FINDING_HUNK_MAX_BYTES) {
+            Ok(v) => v,
+            Err(e) => return Ok(serde_json::json!({"error": e})),
+        }
+    } else if let Some(base) = run.base_sha.as_deref() {
+        match path_diff_snippet(wt, base, &path, FINDING_HUNK_MAX_BYTES) {
+            Ok(v) => v,
+            Err(e) => return Ok(serde_json::json!({"error": e})),
+        }
+    } else {
+        return Ok(serde_json::json!({
+            "error": format!("path not found in worktree: {path}")
+        }));
+    };
+
+    Ok(serde_json::json!({
+        "run_id": run_id,
+        "finding_id": finding_id,
+        "path": path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "source": source,
+        "hunk": hunk,
+        "truncated": truncated,
+    }))
+}
+
+fn safe_worktree_file(work_tree: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err("finding path must be relative".into());
+    }
+    if rel_path.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err("finding path escapes worktree".into());
+    }
+    Ok(work_tree.join(rel_path))
+}
+
+fn file_snippet(
+    path: &Path,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+    max_bytes: usize,
+) -> std::result::Result<(String, &'static str, bool), String> {
+    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let lines: Vec<&str> = raw.lines().collect();
+    if lines.is_empty() {
+        return Ok((String::new(), "file", false));
+    }
+    let last = lines.len();
+    let (mut from, mut to) = match (start_line, end_line) {
+        (Some(s), Some(e)) => {
+            let s = usize::try_from(s.max(1)).unwrap_or(1);
+            let e = usize::try_from(e.max(1)).unwrap_or(1).max(s);
+            (s.saturating_sub(3).max(1), e.saturating_add(3))
+        }
+        (Some(s), None) => {
+            let s = usize::try_from(s.max(1)).unwrap_or(1);
+            (s.saturating_sub(3).max(1), s.saturating_add(3))
+        }
+        _ => (1usize, last.min(80)),
+    };
+    if from > last {
+        from = last.saturating_sub(19).max(1);
+        to = last;
+    } else {
+        to = to.min(last).max(from);
+    }
+    let mut out = String::new();
+    let mut truncated = false;
+    for (idx, line) in lines.iter().enumerate().skip(from - 1).take(to - from + 1) {
+        let numbered = format!("{:>4}|{}\n", idx + 1, line);
+        if out.len() + numbered.len() > max_bytes {
+            truncated = true;
+            break;
+        }
+        out.push_str(&numbered);
+    }
+    if out.len() > max_bytes {
+        out.truncate(max_bytes);
+        truncated = true;
+    }
+    Ok((out, "file", truncated))
+}
+
+fn path_diff_snippet(
+    work_tree: &Path,
+    base_sha: &str,
+    path: &str,
+    max_bytes: usize,
+) -> std::result::Result<(String, &'static str, bool), String> {
+    let range = format!("{base_sha}..HEAD");
+    let out =
+        porch_git::run_c(work_tree, &["diff", &range, "--", path]).map_err(|e| e.to_string())?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut truncated = false;
+    if text.len() > max_bytes {
+        text.truncate(max_bytes);
+        truncated = true;
+    }
+    Ok((text, "diff", truncated))
 }

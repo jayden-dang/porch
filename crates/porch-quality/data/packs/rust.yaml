@@ -1,0 +1,30 @@
+id: rust
+globs:
+  - "**/*.rs"
+exclude_globs:
+  - "**/tests/**"
+  - "**/*_test.rs"
+  - "**/test_*.rs"
+  - "**/benches/**"
+  - "**/examples/**"
+rules:
+  - id: unwrap-in-lib
+    category: bug
+    severity: medium
+    message: ".unwrap() in non-test Rust — prefer ? or explicit error handling"
+    match: "\\.unwrap\\(\\s*\\)"
+  - id: expect-in-lib
+    category: bug
+    severity: medium
+    message: ".expect(...) in non-test Rust — prefer ? or explicit error handling"
+    match: "\\.expect\\("
+  - id: dbg-macro
+    category: maintainability
+    severity: low
+    message: "dbg! left in changed lines"
+    match: "\\bdbg!\\s*\\("
+  - id: todo-macro
+    category: bug
+    severity: high
+    message: "todo!() in changed lines will panic at runtime"
+    match: "\\btodo!\\s*\\("

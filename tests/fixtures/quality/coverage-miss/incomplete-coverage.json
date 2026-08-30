@@ -1,0 +1,8 @@
+{
+  "files": ["src/a.rs", "src/b.rs"],
+  "coverage": [
+    { "path": "src/a.rs", "status": "pass" },
+    { "path": "src/b.rs", "status": "pass" }
+  ],
+  "comments": []
+}

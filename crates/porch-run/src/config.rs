@@ -303,12 +303,12 @@ commands:
     #[test]
     fn format_and_lint() {
         let cmds = parse_porch_config(
-            br#"
+            br"
 commands:
   format: fmt-cmd
   lint: lint-cmd
   test: should-not-run
-"#,
+",
         )
         .unwrap()
         .commands;
@@ -352,10 +352,10 @@ ignore_patterns:
         assert_eq!(cfg.deliver_github.rerun_transient, 0);
 
         let cfg = parse_porch_config(
-            br#"
+            br"
 commands:
   format: x
-"#,
+",
         )
         .unwrap();
         assert!(cfg.deliver_github.watch_checks.is_empty());
@@ -365,12 +365,12 @@ commands:
     #[test]
     fn deliver_github_watch_checks_and_rerun() {
         let cfg = parse_porch_config(
-            br#"
+            br"
 deliver:
   github:
     watch_checks: [lint, types-check]
     rerun_transient: 0
-"#,
+",
         )
         .unwrap();
         assert_eq!(cfg.deliver_github.watch_checks, vec!["lint", "types-check"]);
@@ -380,11 +380,11 @@ deliver:
     #[test]
     fn deliver_github_omitted_rerun_defaults_zero() {
         let cfg = parse_porch_config(
-            br#"
+            br"
 deliver:
   github:
     watch_checks: [lint]
-"#,
+",
         )
         .unwrap();
         assert_eq!(cfg.deliver_github.watch_checks, vec!["lint"]);
@@ -396,10 +396,10 @@ deliver:
         let cfg = parse_porch_config(b"").unwrap();
         assert!(cfg.pr_base_branch.is_empty());
         let cfg = parse_porch_config(
-            br#"
+            br"
 commands:
   format: x
-"#,
+",
         )
         .unwrap();
         assert!(cfg.pr_base_branch.is_empty());
@@ -408,10 +408,10 @@ commands:
     #[test]
     fn pr_base_branch_parsed() {
         let cfg = parse_porch_config(
-            br#"
+            br"
 pr:
   base_branch: dev
-"#,
+",
         )
         .unwrap();
         assert_eq!(cfg.pr_base_branch, "dev");
@@ -420,7 +420,7 @@ pr:
     #[test]
     fn path_instructions_parsed_unknown_keys_ignored() {
         let cfg = parse_porch_config(
-            br#"
+            br"
 review:
   path_instructions:
     - path: crates/enclave/**
@@ -432,7 +432,7 @@ review:
 auto_fix:
   review: 0
   other: ignored
-"#,
+",
         )
         .unwrap();
         assert_eq!(cfg.path_instructions.len(), 2);
@@ -450,10 +450,10 @@ auto_fix:
         let cfg = parse_porch_config(b"").unwrap();
         assert_eq!(cfg.auto_fix_review, 0);
         let cfg = parse_porch_config(
-            br#"
+            br"
 auto_fix:
   review: 2
-"#,
+",
         )
         .unwrap();
         assert_eq!(cfg.auto_fix_review, 2);

@@ -1,0 +1,20 @@
+id: generic
+globs:
+  - "**/*"
+exclude_globs:
+  - "**/Cargo.lock"
+  - "**/package-lock.json"
+  - "**/yarn.lock"
+  - "**/pnpm-lock.yaml"
+  - "**/*.lock"
+rules:
+  - id: leftover-conflict-marker
+    category: bug
+    severity: high
+    message: "Unresolved merge conflict marker in changed lines"
+    match: "^(<<<<<<<|=======|>>>>>>>)"
+  - id: todo-fixme-blocker
+    category: maintainability
+    severity: low
+    message: "TODO/FIXME left in changed lines — confirm it is intentional before merge"
+    match: "\\b(TODO|FIXME)\\b"

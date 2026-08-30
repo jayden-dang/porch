@@ -149,6 +149,28 @@ fn handle_connection(
                 Err(e) => serde_json::json!({"error": e.to_string()}),
             }
         }
+        "get_finding_hunk" => {
+            let run_id = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("run_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    crate::Error::Other("get_finding_hunk requires params.run_id".into())
+                })?;
+            let finding_id = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("finding_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    crate::Error::Other("get_finding_hunk requires params.finding_id".into())
+                })?;
+            match rpc::get_finding_hunk_result(db, run_id, finding_id) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({"error": e.to_string()}),
+            }
+        }
         other => serde_json::json!({"error": format!("unknown method {other}")}),
     };
     let resp = rpc::Response {
@@ -231,6 +253,12 @@ fn start_run(
         .ok_or_else(|| crate::Error::Other(format!("unknown run {run_id}")))?;
     if run.status != "pending" && run.status != "running" {
         return Ok(());
+    }
+    {
+        let guard = state.lock().expect("daemon state");
+        if guard.inflight.contains_key(run_id) {
+            return Ok(());
+        }
     }
 
     let prior = db.in_flight_same_branch(&run.repo_id, &run.branch, run_id)?;
@@ -391,6 +419,12 @@ mod tests {
         assert_eq!(snap.steps.len(), 1);
         assert_eq!(snap.steps[0].step, "review");
 
+        let hunk_missing_wt = rpc::get_finding_hunk(&home, &run.id, "f0").unwrap();
+        assert!(
+            hunk_missing_wt.get("error").is_some(),
+            "without worktree, hunk RPC should error: {hunk_missing_wt}"
+        );
+
         // Subscribe: first event is stream_gap; publish_state yields state or gap.
         let hub = crate::event_hub().expect("hub installed");
         let run_id = run.id.clone();
@@ -426,6 +460,85 @@ mod tests {
             if let Ok(pid) = pid.trim().parse::<u32>() {
                 crate::kill_group(pid);
             }
+        }
+    }
+
+    #[test]
+    fn get_finding_hunk_result_reads_capped_snippet_from_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        let mut body = String::new();
+        for i in 1..=20 {
+            body.push_str(&format!("line {i} content\n"));
+        }
+        std::fs::write(wt.join("src/a.rs"), &body).unwrap();
+
+        let db = Db::open(&db_path(&home)).unwrap();
+        db.upsert_repo("repo1", &home, &home.join("bare.git"), "main")
+            .unwrap();
+        let run = db
+            .insert_run("repo1", "feat", "abc123", None, None)
+            .unwrap();
+        db.set_worktree_dir(&run.id, &wt).unwrap();
+        db.set_findings_json(
+            &run.id,
+            Some(
+                r#"[{"id":"f0","path":"src/a.rs","message":"bug","severity":"warning","action":"ask-user","start_line":5,"end_line":7}]"#,
+            ),
+        )
+        .unwrap();
+
+        let hunk = rpc::get_finding_hunk_result(&db, &run.id, "f0").unwrap();
+        assert!(hunk.get("error").is_none(), "hunk={hunk}");
+        let text = hunk["hunk"].as_str().unwrap();
+        assert!(text.contains("line 5 content"), "hunk={text}");
+        assert!(text.contains("line 7 content"), "hunk={text}");
+        assert_eq!(hunk["path"], "src/a.rs");
+        assert_eq!(hunk["truncated"], false);
+    }
+
+    #[test]
+    fn get_finding_hunk_result_rejects_path_escape() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/a.rs"), "fn ok() {}\n").unwrap();
+
+        let db = Db::open(&db_path(&home)).unwrap();
+        db.upsert_repo("repo1", &home, &home.join("bare.git"), "main")
+            .unwrap();
+        let run = db
+            .insert_run("repo1", "feat", "abc123", None, None)
+            .unwrap();
+        db.set_worktree_dir(&run.id, &wt).unwrap();
+
+        for (id, path) in [
+            ("f_dotdot", "../etc/passwd"),
+            ("f_abs", "/etc/passwd"),
+            ("f_nested", "src/../../etc/passwd"),
+        ] {
+            db.set_findings_json(
+                &run.id,
+                Some(&format!(
+                    r#"[{{"id":"{id}","path":"{path}","message":"escape","severity":"warning","action":"ask-user","start_line":1,"end_line":1}}]"#
+                )),
+            )
+            .unwrap();
+            let hunk = rpc::get_finding_hunk_result(&db, &run.id, id).unwrap();
+            let err = hunk.get("error").and_then(|e| e.as_str()).unwrap_or("");
+            assert!(
+                err.contains("escape") || err.contains("relative"),
+                "path={path} hunk={hunk}"
+            );
+            assert!(
+                hunk.get("hunk").is_none(),
+                "must not return hunk for {path}"
+            );
         }
     }
 }

@@ -799,6 +799,10 @@ mod tests {
         assert!(body.contains("\"head_sha\":\"abc123deadbeef\""), "{body}");
         assert!(body.contains("## Intent"), "{body}");
         assert!(body.contains("fix it"), "{body}");
+        assert!(body.contains("## What Changed"), "{body}");
+        assert!(body.contains("one file"), "{body}");
+        assert!(body.contains("## Review"), "{body}");
+        assert!(body.contains("## Certify"), "{body}");
     }
 
     #[test]

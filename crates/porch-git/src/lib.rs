@@ -273,6 +273,29 @@ pub fn rev_parse_c(work_tree: &Path, rev: &str) -> Result<String, Error> {
     Ok(stdout_trim(&out))
 }
 
+/// `git update-ref <ref> <sha>` in a bare/git-dir (creates or moves the ref).
+///
+/// # Errors
+///
+/// Returns git errors if the ref cannot be updated.
+pub fn update_ref(git_dir: &GitDir, refname: &str, sha: &str) -> Result<(), Error> {
+    run(git_dir, &["update-ref", refname, sha])?;
+    Ok(())
+}
+
+/// Delete a ref (`git update-ref -d <ref>`). Missing refs are ok.
+///
+/// # Errors
+///
+/// Returns git errors other than a missing ref.
+pub fn delete_ref(git_dir: &GitDir, refname: &str) -> Result<(), Error> {
+    match run(git_dir, &["update-ref", "-d", refname]) {
+        Ok(_) => Ok(()),
+        Err(Error::Command { stderr, .. }) if stderr.contains("unable to resolve") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// `git merge-base --is-ancestor <maybe_ancestor> <tip>` (exit 0 = yes).
 ///
 /// # Errors
@@ -481,6 +504,11 @@ pub fn remote_commits_incorporated(
 /// - [`PushDecision::Lease`][]: `--force-with-lease=<ref>:<observed>`
 /// - [`PushDecision::RefuseIncorporate`][]: error without mutating
 ///
+/// Always passes `--no-verify`: deliver runs from the bare gate (or a disposable
+/// worktree), and author lefthook/`pre-push` must not re-run after certify. A
+/// worktree `lefthook install` can also write `pre-push` into the shared bare
+/// hooks dir; without `--no-verify` that blocks origin forward.
+///
 /// After a mutating push, callers should re-`ls-remote` and require equality.
 ///
 /// # Errors
@@ -502,13 +530,13 @@ pub fn push_exact_sha(
         }),
         PushDecision::NewBranch => {
             let spec = format!("{exact_sha}:{refname}");
-            run(git_dir, &["push", remote, &spec])?;
+            run(git_dir, &["push", "--no-verify", remote, &spec])?;
             Ok(())
         }
         PushDecision::Lease { observed_sha } => {
             let lease = format!("--force-with-lease={refname}:{observed_sha}");
             let spec = format!("{exact_sha}:{refname}");
-            run(git_dir, &["push", &lease, remote, &spec])?;
+            run(git_dir, &["push", "--no-verify", &lease, remote, &spec])?;
             Ok(())
         }
     }
