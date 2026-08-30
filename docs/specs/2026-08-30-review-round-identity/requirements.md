@@ -86,6 +86,9 @@ reviews it, so that every attempted judgment is on the record even when the atte
 - **ROUND-1.31** WHEN comparing a recorded round for applicability or reuse THE SYSTEM
   SHALL require the current set of required producer invocations to have a one-to-one
   descriptor-equivalent correspondence with the set recorded for that round.
+- **ROUND-1.32** WHEN porch retains an input or output artifact for a producer invocation
+  THE SYSTEM SHALL store it under a namespace unique to the run, review round, and producer
+  invocation, without overwriting an artifact retained for another invocation.
 
 ## 2. A finalized round is all-or-nothing
 
