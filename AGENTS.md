@@ -6,7 +6,7 @@ Instructions for anyone (human or agent) working in this repository.
 
 Porch is a **local git gate** written in Rust. Push to a remote named `porch`; a disposable worktree runs independent review and cheap certification; the branch is forwarded and a PR opened only after the inner gate passes. It is not CI, not a deploy system, and not a fork of anything else.
 
-Operator docs are being rewritten; the only committed guide today is **`docs/install.md`**. Product shape lives in this file until briefing docs return. Locked decisions are not to be silently reopened in a coding session.
+Operator docs: **`docs/install.md`** and **`docs/usage.md`**. Product shape for contributors lives in this file. Locked decisions are not to be silently reopened in a coding session.
 
 Local implementation notes (gitignored): **`.research/`**. Read that directory before implementing the gate, review adapter, or custody/force-push paths. Do not copy third-party source into this tree. Do not put clone paths or prior-product names into committed files.
 

@@ -11,6 +11,6 @@ porch setup
 porch doctor
 ```
 
-Needs Rust 1.85+ and git. Guide: [docs/install.md](https://github.com/jayden-dang/porch/blob/main/docs/install.md).
+Needs Rust 1.85+ and git. [Install](https://github.com/jayden-dang/porch/blob/main/docs/install.md) · [Usage A–Z](https://github.com/jayden-dang/porch/blob/main/docs/usage.md).
 
 Apache-2.0.

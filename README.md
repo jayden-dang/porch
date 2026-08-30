@@ -17,7 +17,10 @@ porch setup
 porch doctor
 ```
 
-That one command installs **`porch` and `porch-quality`**. Full guide: **[docs/install.md](docs/install.md)**. Rust 1.85+ and git.
+That one command installs **`porch` and `porch-quality`**. Rust 1.85+ and git.
+
+- Install: **[docs/install.md](docs/install.md)**
+- Usage A–Z: **[docs/usage.md](docs/usage.md)**
 
 ## License
 
