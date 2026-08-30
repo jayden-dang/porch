@@ -11,6 +11,25 @@ use porch_deliver::{
     gh_timeout, is_porch_managed_title, load_pr_template, merge_porch_managed, pr_mergeable,
     theater_reject_rules, view_pr, watch_allowlisted_checks,
 };
+
+#[cfg(test)]
+use std::sync::Mutex;
+
+/// Test-only `gh` override (edition 2024 forbids `env::set_var` in unit tests).
+#[cfg(test)]
+static TEST_GH_BIN: Mutex<Option<String>> = Mutex::new(None);
+
+fn resolve_gh_bin() -> String {
+    #[cfg(test)]
+    {
+        if let Ok(guard) = TEST_GH_BIN.lock() {
+            if let Some(bin) = guard.as_ref() {
+                return bin.clone();
+            }
+        }
+    }
+    gh_bin()
+}
 use porch_gate::{Db, event_hub, run_artifact_dir};
 use porch_git::{
     GitDir, PushDecision, RemoteTip, ls_remote_sha, push_exact_sha, remote_commits_incorporated,
@@ -79,7 +98,7 @@ pub(crate) fn run_deliver_phase(
     let head_sha = porch_git::rev_parse_c(wt, "HEAD")?;
     db.set_run_shas(run_id, Some(&head_sha), None)?;
 
-    let bin = gh_bin();
+    let bin = resolve_gh_bin();
     // Prefer fail before push when gh cannot run (no branch without PR adapter).
     ensure_gh_runnable(&bin)?;
 
@@ -527,4 +546,264 @@ fn load_trusted_deliver(
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[cfg(test)]
+mod already_composed_tests {
+    use super::*;
+    use porch_gate::db_path;
+    use porch_git::{GitDir, init_bare, worktree_add_detach};
+    use std::process::Command as StdCommand;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn git(work: &Path, args: &[&str]) {
+        let st = StdCommand::new("git")
+            .current_dir(work)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+
+    fn git_out(work: &Path, args: &[&str]) -> String {
+        let out = StdCommand::new("git")
+            .current_dir(work)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn chmod_755(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    #[test]
+    fn already_composed_tip_refreshes_body_without_repark() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let origin = root.join("origin.git");
+        init_bare(&origin).unwrap();
+
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init"]);
+        git(&seed, &["config", "user.email", "porch@example.com"]);
+        git(&seed, &["config", "user.name", "Porch"]);
+        git(&seed, &["checkout", "-b", "main"]);
+        std::fs::write(seed.join("README"), "base\n").unwrap();
+        git(&seed, &["add", "README"]);
+        git(&seed, &["commit", "-m", "base"]);
+        let main_sha = git_out(&seed, &["rev-parse", "HEAD"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&seed, &["push", "-u", "origin", "main"]);
+
+        // Feature tip already on origin (lease will be up-to-date / fast-forward).
+        git(&seed, &["checkout", "-b", "feat-composed"]);
+        std::fs::write(seed.join("feat.txt"), "feat\n").unwrap();
+        git(&seed, &["add", "feat.txt"]);
+        git(&seed, &["commit", "-m", "feat change"]);
+        let head = git_out(&seed, &["rev-parse", "HEAD"]);
+        git(
+            &seed,
+            &[
+                "push",
+                "origin",
+                "HEAD:refs/heads/feat-composed",
+            ],
+        );
+
+        let bare_path = root.join("bare.git");
+        init_bare(&bare_path).unwrap();
+        let bare = GitDir::new(&bare_path).unwrap();
+        // Mirror objects + origin remote for lease-push / template show.
+        let st = StdCommand::new("git")
+            .args([
+                "--git-dir",
+                bare_path.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let st = StdCommand::new("git")
+            .args([
+                "--git-dir",
+                bare_path.to_str().unwrap(),
+                "fetch",
+                "origin",
+                "+refs/heads/*:refs/heads/*",
+            ])
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        let wt = root.join("wt");
+        worktree_add_detach(&bare, &wt, &head).unwrap();
+
+        let body_file = home.join("gh-pr-body.txt");
+        let log_file = home.join("gh-argv.log");
+        let state_file = home.join("gh-pr-state");
+        // Existing open PR with prior managed body (first park already happened).
+        let prior_body = format!(
+            "{MANAGED_BEGIN}\n## Summary\nold scaffold\n{MANAGED_END}\n\n<!-- porch-attestation -->\nold\n"
+        );
+        std::fs::write(&body_file, &prior_body).unwrap();
+        std::fs::write(
+            &state_file,
+            r#"[{"number":7,"url":"https://example.com/pull/7","title":"porch: feat-composed"}]"#,
+        )
+        .unwrap();
+
+        let fake_gh = root.join("fake-gh");
+        std::fs::write(
+            &fake_gh,
+            format!(
+                r#"#!/bin/sh
+set -e
+LOG="{log}"
+BODY="{body}"
+STATE="{state}"
+{{
+  printf '+'
+  for a in "$@"; do printf ' %s' "$a"; done
+  printf '\n'
+}} >> "$LOG"
+for a in "$@"; do
+  if [ "$a" = "--version" ]; then echo "gh version 2.50.0 (fake)"; exit 0; fi
+done
+CMD=""; PREV=""
+for a in "$@"; do
+  if [ "$PREV" = "pr" ]; then CMD="$a"; break; fi
+  PREV="$a"
+done
+case "$CMD" in
+  list) cat "$STATE"; exit 0 ;;
+  edit)
+    HAS_BODY=0
+    for a in "$@"; do
+      if [ "$a" = "--body-file" ]; then HAS_BODY=1; fi
+    done
+    if [ "$HAS_BODY" -eq 1 ]; then
+      cat > "$BODY"
+    fi
+    exit 0
+    ;;
+  view)
+    if echo "$*" | grep -q mergeable; then
+      printf '{{"mergeable":"MERGEABLE"}}\n'
+    else
+      BODY_ESC=$(printf '%s' "$(cat "$BODY")" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null || sed 's/"/\\"/g' "$BODY" | tr '\n' ' ')
+      printf '{{"number":7,"url":"https://example.com/pull/7","title":"porch: feat-composed","body":"%s"}}\n' "$BODY_ESC"
+    fi
+    exit 0
+    ;;
+  create)
+    echo "fake-gh: create must not run on already-open PR" >&2
+    exit 1
+    ;;
+  *)
+    echo "fake-gh: unhandled: $*" >&2
+    exit 1
+    ;;
+esac
+"#,
+                log = log_file.display(),
+                body = body_file.display(),
+                state = state_file.display(),
+            ),
+        )
+        .unwrap();
+        chmod_755(&fake_gh);
+
+        {
+            let mut slot = TEST_GH_BIN.lock().unwrap();
+            *slot = Some(fake_gh.to_string_lossy().into_owned());
+        }
+
+        let db = Db::open(&db_path(&home)).unwrap();
+        db.upsert_repo("r-composed", &seed, &bare_path, "main")
+            .unwrap();
+        let run = db
+            .insert_run(
+                "r-composed",
+                "feat-composed",
+                &head,
+                Some("compose already"),
+                None,
+            )
+            .unwrap();
+        db.set_run_shas(&run.id, Some(&head), Some(&main_sha))
+            .unwrap();
+        db.set_trusted_config_sha(&run.id, &main_sha).unwrap();
+        db.set_worktree_dir(&run.id, &wt).unwrap();
+        db.set_pr_url(&run.id, Some("https://example.com/pull/7"))
+            .unwrap();
+        db.set_pr_title_written(&run.id, Some("porch: feat-composed"))
+            .unwrap();
+        // Simulate Task-5 compose resolve on this tip (only completed row needed;
+        // same-second parked+completed can make latest_step_for_run non-deterministic).
+        db.insert_step_result(&run.id, "compose", "completed", Some("compose=scaffold"))
+            .unwrap();
+        db.set_run_status(&run.id, "running", None).unwrap();
+
+        let outcome = match run_deliver_phase(&db, &home, &run.id, &bare, &wt, "main", None) {
+            Ok(o) => o,
+            Err(e) => {
+                *TEST_GH_BIN.lock().unwrap() = None;
+                panic!("already-composed deliver: {e}");
+            }
+        };
+        *TEST_GH_BIN.lock().unwrap() = None;
+        assert_eq!(outcome, DeliverOutcome::Completed);
+
+        let steps = db.step_results_for_run(&run.id).unwrap();
+        let compose_parked = steps
+            .iter()
+            .filter(|s| s.step == "compose" && s.status == "parked")
+            .count();
+        assert_eq!(
+            compose_parked, 0,
+            "must not re-enter compose park: {steps:?}"
+        );
+        assert!(
+            compose_already_resolved(&db, &run.id).unwrap(),
+            "compose remains resolved"
+        );
+
+        let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+        assert!(log.contains("pr edit"), "expected body refresh edit: {log}");
+        assert!(!log.contains("pr create"), "must not create: {log}");
+        let body = std::fs::read_to_string(&body_file).unwrap();
+        assert!(body.contains(MANAGED_BEGIN), "{body}");
+        assert!(body.contains(MANAGED_END), "{body}");
+        assert!(
+            body.contains("## Summary") || body.contains("feat"),
+            "{body}"
+        );
+    }
 }

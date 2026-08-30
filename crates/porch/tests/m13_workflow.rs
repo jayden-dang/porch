@@ -776,15 +776,20 @@ echo biome-ok
 
     let db = Db::open(&h.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&h.work);
+    // Compose parks after certify+scaffold; park proves certify reached deliver.
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(25),
     );
     assert_eq!(
-        run.status, "completed",
-        "certify should find biome via tools PATH: {:?}",
+        run.status, "parked",
+        "certify should find biome via tools PATH then park compose: {:?}",
         run.error
+    );
+    assert!(
+        run.pr_url.is_some(),
+        "scaffold PR proves certify completed before compose park"
     );
 }

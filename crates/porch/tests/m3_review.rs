@@ -30,15 +30,18 @@ for a in "$@"; do
 done
 case "$CMD" in
   list)
-    if [ -f "$STATE" ]; then cat "$STATE"; else printf '[]\n'; fi
+    if [ -f "$STATE" ]; then /bin/cat "$STATE"; else printf '[]\n'; fi
     ;;
   create)
-    cat >/dev/null
+    /bin/cat >/dev/null
     printf '[{"number":1,"url":"https://example.com/pull/1","title":"t"}]\n' > "$STATE"
     echo "https://example.com/pull/1"
     ;;
   edit)
-    cat >/dev/null
+    /bin/cat >/dev/null
+    ;;
+  view)
+    printf '{"mergeable":"MERGEABLE","number":1,"url":"https://example.com/pull/1","title":"t","body":""}\n'
     ;;
   checks)
     printf '[]\n'
@@ -265,13 +268,14 @@ fn clean_review_sets_approved_sha_and_completes() {
 
     let db = Db::open(&home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&work);
+    // Clean path parks at compose after certify+scaffold.
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(20),
     );
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
     assert!(
         run.review_approved_head_sha
             .as_ref()
@@ -279,13 +283,34 @@ fn clean_review_sets_approved_sha_and_completes() {
         "approved sha missing: {run:?}"
     );
     let steps = db.step_results_for_run(&run.id).unwrap();
-    let by: std::collections::HashMap<_, _> = steps
-        .iter()
-        .map(|s| (s.step.as_str(), s.status.as_str()))
-        .collect();
-    assert_eq!(by.get("review"), Some(&"completed"));
-    assert_eq!(by.get("certify"), Some(&"completed"));
-    assert_eq!(by.get("deliver"), Some(&"completed"));
+    assert_eq!(
+        steps
+            .iter()
+            .rfind(|s| s.step == "review")
+            .map(|s| s.status.as_str()),
+        Some("completed")
+    );
+    assert_eq!(
+        steps
+            .iter()
+            .rfind(|s| s.step == "certify")
+            .map(|s| s.status.as_str()),
+        Some("completed")
+    );
+    assert_eq!(
+        steps
+            .iter()
+            .rfind(|s| s.step == "compose")
+            .map(|s| s.status.as_str()),
+        Some("parked")
+    );
+    assert!(
+        steps
+            .iter()
+            .rfind(|s| s.step == "deliver")
+            .is_none_or(|s| s.status != "completed" && s.status != "parked"),
+        "deliver must not be completed/parked: {steps:?}"
+    );
 
     kill_daemon(&home);
 }
@@ -359,15 +384,25 @@ fn respond_approve_writes_sha_and_completes() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["status"], "completed");
+    // Approve finishes review+certify then parks compose (Task 5 resolves).
+    assert_eq!(v["status"], "parked");
     assert!(v["review_approved_head_sha"].as_str().unwrap().len() >= 7);
 
     let run = db.run_by_id(&run.id).unwrap().unwrap();
-    assert_eq!(run.status, "completed");
+    assert_eq!(run.status, "parked");
     assert!(run.review_approved_head_sha.is_some());
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .rfind(|s| s.step == "compose")
+            .map(|s| s.status.as_str()),
+        Some("parked"),
+        "steps={steps:?}"
+    );
     assert!(
-        run.worktree_dir.as_ref().is_none_or(|p| !p.exists()),
-        "worktree should be removed after approve"
+        run.worktree_dir.as_ref().is_some_and(|p| p.exists()),
+        "worktree kept while compose parked"
     );
 
     kill_daemon(&home);

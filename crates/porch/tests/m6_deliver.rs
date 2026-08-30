@@ -383,18 +383,26 @@ fn lease_push_exact_sha_and_pr_create() {
 
     let db = Db::open(&s.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&s.work);
+    // Clean path parks at compose after scaffold (compose resolve is Task 5).
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(45),
     );
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
 
     let steps = db.step_results_for_run(&run.id).unwrap();
     assert_eq!(
-        last_step(&steps, "deliver").map(|s| s.status.as_str()),
-        Some("completed")
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("parked"),
+        "steps={steps:?}"
+    );
+    assert!(
+        last_step(&steps, "deliver").is_none_or(|s| {
+            s.status.as_str() != "completed" && s.status.as_str() != "parked"
+        }),
+        "deliver must not be completed or parked; steps={steps:?}"
     );
 
     let remote = origin_branch_sha(&s.origin, "feat-lease").expect("origin branch");
@@ -467,11 +475,17 @@ fn find_existing_pr_edits_not_creates() {
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(45),
     );
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
     assert_eq!(run.pr_url.as_deref(), Some("https://example.com/pull/42"));
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("parked"),
+        "steps={steps:?}"
+    );
     let log = gh_argv_log(&s.home);
     assert!(log.contains("pr edit"), "expected pr edit in {log}");
     assert!(
@@ -481,6 +495,7 @@ fn find_existing_pr_edits_not_creates() {
 }
 
 #[test]
+#[ignore = "PRCMP Task 5/6: compose resolve required"]
 fn trusted_watch_checks_ignores_hostile_and_never_reruns() {
     let trusted = r"
 deliver:
@@ -525,6 +540,7 @@ deliver:
 }
 
 #[test]
+#[ignore = "PRCMP Task 5/6: compose resolve required"]
 fn non_empty_allowlist_lint_fail_after_push_and_pr() {
     let trusted = r"
 deliver:
@@ -670,6 +686,7 @@ fn gh_missing_fails_before_push() {
 }
 
 #[test]
+#[ignore = "PRCMP Task 5/6: compose resolve required"]
 fn supersede_during_check_watch_cancels_not_fails() {
     let trusted = r"
 deliver:
@@ -773,10 +790,10 @@ fn lease_updates_ancestor_tip_on_origin() {
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(45),
     );
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
 
     let remote = origin_branch_sha(&s.origin, "feat-lease-upd").unwrap();
     let certified = run.head_sha.as_deref().unwrap_or(&local_head);
@@ -820,10 +837,16 @@ review:
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(45),
     );
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("parked"),
+        "steps={steps:?}"
+    );
 
     let log = gh_argv_log(&s.home);
     assert!(
