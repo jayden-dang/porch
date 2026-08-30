@@ -52,6 +52,24 @@ reviews it, so that every attempted judgment is on the record even when the atte
 - **ROUND-1.16** WHEN permanent removal of retained round data leaves no round referencing
   a `trusted_config_sha` THE SYSTEM SHALL remove the porch-owned ref retained solely for
   that commit.
+- **ROUND-1.17** WHEN a producer is resolved THE SYSTEM SHALL record one immutable
+  invocation plan before the round is opened.
+- **ROUND-1.18** WHEN the producer is spawned THE SYSTEM SHALL spawn exactly the absolute
+  target and argv recorded in that plan, without re-resolving PATH or configuration.
+- **ROUND-1.19** WHERE a porch-owned wrapper is the spawned target THE SYSTEM SHALL derive
+  the observed version identity from the wrapper digest, the known backend digest, and the
+  effective argv prefix together.
+- **ROUND-1.20** THE SYSTEM SHALL NOT derive an observed version identity from a
+  porch-owned wrapper's digest alone.
+- **ROUND-1.21** WHERE porch can observe only an opaque entrypoint THE SYSTEM SHALL record
+  that it observed the entrypoint artifact alone and not its dependency closure.
+- **ROUND-1.22** THE SYSTEM SHALL record `reported_version` as audit metadata outside the
+  applicability binding, neither establishing nor rescuing descriptor equivalence.
+- **ROUND-1.23** THE SYSTEM SHALL base descriptor equivalence on adapter semantics,
+  effective argv, observed artifact identity, and the consumed-context declaration.
+- **ROUND-1.24** WHERE two invocations differ only in `selection_source` or
+  `declared_engine_kind` THE SYSTEM SHALL NOT treat that difference as invalidating
+  descriptor equivalence.
 
 ## 2. A finalized round is all-or-nothing
 
