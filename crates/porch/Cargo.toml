@@ -42,6 +42,7 @@ porch-gate.workspace = true
 porch-git.workspace = true
 porch-review.workspace = true
 predicates.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 

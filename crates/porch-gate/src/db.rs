@@ -2,10 +2,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
+use rusqlite::functions::FunctionFlags;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use ulid::Ulid;
 
-use crate::Result;
+use crate::{Error, Result};
 
 const RUN_SELECT_FROM: &str =
     "SELECT id, repo_id, branch, sha, status, worktree_dir, head_sha, base_sha,
@@ -92,6 +93,7 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        register_writer_protocol(&conn)?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS repos (
@@ -159,6 +161,8 @@ impl Db {
             ",
         )?;
         crate::rounds::migrate(&conn)?;
+        install_writer_fence(&conn)?;
+        reject_stale_writer(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1038,6 +1042,93 @@ fn now_secs() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or_else(|_| "0".into(), |d| d.as_secs().to_string())
+}
+
+fn register_writer_protocol(conn: &Connection) -> Result<()> {
+    // Triggers invoke this function, so it must be innocuous and never DIRECTONLY.
+    conn.create_scalar_function(
+        "porch_writer_protocol",
+        0,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |_| Ok(crate::rounds::PROTOCOL_SCHEMA_VERSION),
+    )?;
+    Ok(())
+}
+
+fn writer_fence_present(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'porch_state_meta'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+fn install_writer_fence(conn: &Connection) -> Result<()> {
+    if writer_fence_present(conn)? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if writer_fence_present(&tx)? {
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS porch_state_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            min_writer_protocol INTEGER NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS porch_runs_writer_insert
+        BEFORE INSERT ON runs
+        BEGIN
+            SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
+            WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
+        END;
+        CREATE TRIGGER IF NOT EXISTS porch_runs_writer_approve
+        BEFORE UPDATE OF review_approved_head_sha ON runs
+        BEGIN
+            SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
+            WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
+        END;
+        ",
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO porch_state_meta (id, min_writer_protocol) VALUES (1, ?1)",
+        [crate::rounds::PROTOCOL_SCHEMA_VERSION],
+    )?;
+    tx.execute(
+        "UPDATE runs
+         SET status = 'failed',
+             error = 'state root upgraded to the mandatory-floor regime; start a fresh run',
+             review_approved_head_sha = NULL
+         WHERE status IN ('pending', 'running', 'parked')
+           AND NOT EXISTS (
+               SELECT 1 FROM review_rounds
+               WHERE review_rounds.run_id = runs.id
+                 AND review_rounds.protocol_schema_version >= ?1
+           )",
+        [crate::rounds::PROTOCOL_SCHEMA_VERSION],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn reject_stale_writer(conn: &Connection) -> Result<()> {
+    let min: i64 = conn.query_row(
+        "SELECT min_writer_protocol FROM porch_state_meta WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let have = crate::rounds::PROTOCOL_SCHEMA_VERSION;
+    if have < min {
+        return Err(Error::Other(format!(
+            "this porch state root requires writer protocol {min}; this binary understands {have}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

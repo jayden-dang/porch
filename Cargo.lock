@@ -772,6 +772,7 @@ dependencies = [
  "porch-run",
  "predicates",
  "ratatui",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tracing",

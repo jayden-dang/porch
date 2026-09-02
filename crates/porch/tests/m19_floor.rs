@@ -1065,3 +1065,45 @@ fn missing_judgment_is_incomplete_not_a_floor_only_round() {
     );
     kill_daemon(&h.home);
 }
+
+#[test]
+fn a_pre_floor_client_cannot_create_or_approve_on_an_upgraded_state_root() {
+    let h = setup_quality("clean");
+    let path = h.home.join("state.sqlite");
+    let repo_id = repo_id_for(&h.work);
+    let db = Db::open(&path).unwrap();
+    let run = db
+        .insert_run(&repo_id, "feat-fence", "deadbeef", None, None)
+        .expect("a current binary can still create a run");
+    db.set_review_approved_head_sha(&run.id, Some("approved-sha"))
+        .expect("a current binary can still write an approval");
+    drop(db);
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let insert_err = conn
+        .execute(
+            "INSERT INTO runs (id, repo_id, branch, sha, status, created_at)
+             VALUES ('old-client-run', ?1, 'feat-old', 'deadbeef', 'pending', '9')",
+            rusqlite::params![repo_id],
+        )
+        .expect_err("a pre-floor client must not create a run on an upgraded state root");
+    let insert_msg = insert_err.to_string();
+    assert!(
+        insert_msg.contains("porch_writer_protocol"),
+        "absence must fail closed, got {insert_msg}"
+    );
+
+    let approve_err = conn
+        .execute(
+            "UPDATE runs SET review_approved_head_sha = 'sneak' WHERE id = ?1",
+            [&run.id],
+        )
+        .expect_err("a pre-floor client must not approve a run on an upgraded state root");
+    let approve_msg = approve_err.to_string();
+    assert!(
+        approve_msg.contains("porch_writer_protocol"),
+        "absence must fail closed, got {approve_msg}"
+    );
+
+    kill_daemon(&h.home);
+}

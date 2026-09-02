@@ -2,8 +2,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
-use porch_gate::db_path;
 use porch_gate::rounds::retention::{self, config_ref_name};
 use porch_gate::rounds::{
     self, Applicability, AssuranceCompletion, ContextApplication, ContextElement, ContextSource,
@@ -14,7 +16,7 @@ use porch_gate::rounds::{
     applicable_round_for_run, capture_context_element, context_applicability_digest,
     descriptor_equivalence_digest, required_set_digest, run_required_set_digest, sha256_hex,
 };
-use porch_gate::{Db, Error};
+use porch_gate::{Db, Error, RunExecutor, db_path, run_daemon, wait_for_health};
 use porch_git::GitDir;
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -115,7 +117,12 @@ fn opening_legacy_database_adds_round_tables_and_keeps_existing_rows() {
     let db = Db::open(&path).unwrap();
 
     let run = db.run_by_id("run-legacy").unwrap().expect("legacy run");
-    assert_eq!(run.status, "parked");
+    assert_eq!(run.status, "failed");
+    assert!(
+        run.error.as_deref().is_some_and(|e| e.contains("upgraded")),
+        "legacy active runs must be terminalized, got {:?}",
+        run.error
+    );
     assert_eq!(run.branch, "feat");
 
     db.set_run_status("run-legacy", "pending", None).unwrap();
@@ -2582,7 +2589,7 @@ fn opening_an_older_database_adds_duration_storage_and_keeps_invocations() {
     );
 
     let run = db.run_by_id("run-old").unwrap().expect("legacy run");
-    assert_eq!(run.status, "parked");
+    assert_eq!(run.status, "failed");
     let rounds = rounds::rounds_for_run(&db, "run-old").unwrap();
     assert_eq!(rounds.len(), 1);
     assert_eq!(rounds[0].ordinal, 1);
@@ -2739,5 +2746,401 @@ fn authorization_requires_the_recorded_required_set_to_match_the_run_pin() {
                 "a round whose required-set digest differs from the run pin must not authorize, got {id}"
             )
         }
+    }
+}
+
+#[test]
+fn a_connection_without_the_writer_function_cannot_create_or_approve_a_run() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    db.set_review_approved_head_sha(&run_id, Some("approved-sha"))
+        .expect("a registered connection can write an approval");
+    let created = db
+        .insert_run("repo1", "feat-2", "cafebabe", None, None)
+        .expect("a registered connection can create a run");
+    assert_eq!(created.status, "pending");
+
+    let conn = Connection::open(db_path(home)).unwrap();
+    let insert_err = conn
+        .execute(
+            "INSERT INTO runs (id, repo_id, branch, sha, status, created_at)
+             VALUES ('old-writer', 'repo1', 'feat-old', 'deadbeef', 'pending', '9')",
+            [],
+        )
+        .expect_err("an unregistered connection must not create a run");
+    let insert_msg = insert_err.to_string();
+    assert!(
+        insert_msg.contains("porch_writer_protocol"),
+        "absence must fail closed, got {insert_msg}"
+    );
+
+    let approve_err = conn
+        .execute(
+            "UPDATE runs SET review_approved_head_sha = 'sneak' WHERE id = ?1",
+            [&run_id],
+        )
+        .expect_err("an unregistered connection must not write an approval");
+    let approve_msg = approve_err.to_string();
+    assert!(
+        approve_msg.contains("porch_writer_protocol"),
+        "absence must fail closed, got {approve_msg}"
+    );
+
+    let sha: Option<String> = conn
+        .query_row(
+            "SELECT review_approved_head_sha FROM runs WHERE id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sha.as_deref(), Some("approved-sha"));
+}
+
+fn seed_active_legacy_runs(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "
+        CREATE TABLE repos (
+            id TEXT PRIMARY KEY,
+            worktree_path TEXT NOT NULL,
+            bare_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            default_branch TEXT NOT NULL DEFAULT 'main'
+        );
+        CREATE TABLE runs (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            sha TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            review_approved_head_sha TEXT,
+            FOREIGN KEY(repo_id) REFERENCES repos(id)
+        );
+        INSERT INTO repos (id, worktree_path, bare_path, created_at, default_branch)
+        VALUES ('repo-legacy', '/tmp/wt', '/tmp/bare.git', '1', 'main');
+        INSERT INTO runs (id, repo_id, branch, sha, status, created_at, review_approved_head_sha)
+        VALUES
+          ('run-parked', 'repo-legacy', 'feat-parked', 'aaa', 'parked', '2', 'approved-before'),
+          ('run-pending', 'repo-legacy', 'feat-pending', 'bbb', 'pending', '3', NULL),
+          ('run-running', 'repo-legacy', 'feat-running', 'ccc', 'running', '4', NULL),
+          ('run-done', 'repo-legacy', 'feat-done', 'ddd', 'completed', '5', 'keep-me');
+        ",
+    )
+    .unwrap();
+}
+
+fn trigger_exists(conn: &Connection, name: &str) -> bool {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    count == 1
+}
+
+fn writer_fence_installed(conn: &Connection) -> bool {
+    table_exists(conn, "porch_state_meta")
+        && trigger_exists(conn, "porch_runs_writer_insert")
+        && trigger_exists(conn, "porch_runs_writer_approve")
+}
+
+fn run_status_and_approval(conn: &Connection, id: &str) -> (String, Option<String>) {
+    conn.query_row(
+        "SELECT status, review_approved_head_sha FROM runs WHERE id = ?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap()
+}
+
+fn min_writer_protocol(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT min_writer_protocol FROM porch_state_meta WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn set_upgrade_poison(path: &Path, install: bool) {
+    let conn = Connection::open(path).unwrap();
+    if install {
+        conn.execute_batch(
+            "
+            CREATE TRIGGER poison_upgrade BEFORE UPDATE ON runs
+            BEGIN
+                SELECT RAISE(ABORT, 'forced mid-upgrade failure');
+            END;
+            ",
+        )
+        .unwrap();
+    } else {
+        conn.execute_batch("DROP TRIGGER IF EXISTS poison_upgrade;")
+            .unwrap();
+    }
+}
+
+fn assert_legacy_runs_untouched(conn: &Connection) {
+    assert!(
+        !writer_fence_installed(conn),
+        "marker and triggers must be absent after a rolled-back upgrade"
+    );
+    assert_eq!(
+        run_status_and_approval(conn, "run-parked"),
+        ("parked".into(), Some("approved-before".into()))
+    );
+    assert_eq!(
+        run_status_and_approval(conn, "run-pending"),
+        ("pending".into(), None)
+    );
+    assert_eq!(
+        run_status_and_approval(conn, "run-running"),
+        ("running".into(), None)
+    );
+    assert_eq!(
+        run_status_and_approval(conn, "run-done"),
+        ("completed".into(), Some("keep-me".into()))
+    );
+}
+
+fn assert_legacy_runs_terminalized(db: &Db) {
+    let parked = db.run_by_id("run-parked").unwrap().unwrap();
+    assert_eq!(parked.status, "failed");
+    assert!(
+        parked
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("upgraded")),
+        "legacy active runs must name the upgrade, got {:?}",
+        parked.error
+    );
+    assert!(parked.review_approved_head_sha.is_none());
+    let pending = db.run_by_id("run-pending").unwrap().unwrap();
+    assert_eq!(pending.status, "failed");
+    assert!(pending.review_approved_head_sha.is_none());
+    assert_eq!(
+        db.run_by_id("run-running").unwrap().unwrap().status,
+        "failed"
+    );
+    let done = db.run_by_id("run-done").unwrap().unwrap();
+    assert_eq!(done.status, "completed");
+    assert_eq!(done.review_approved_head_sha.as_deref(), Some("keep-me"));
+}
+
+#[test]
+fn upgrading_the_state_root_is_atomic_and_idempotent() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home).unwrap();
+    let path = db_path(home);
+    seed_active_legacy_runs(&path);
+    set_upgrade_poison(&path, true);
+
+    assert!(
+        Db::open(&path).is_err(),
+        "a forced mid-upgrade failure must abort the open"
+    );
+    assert_legacy_runs_untouched(&Connection::open(&path).unwrap());
+    set_upgrade_poison(&path, false);
+
+    let db = Db::open(&path).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    assert!(
+        writer_fence_installed(&conn),
+        "upgrade must install the marker and both run triggers"
+    );
+    assert_eq!(min_writer_protocol(&conn), 2);
+    assert_legacy_runs_terminalized(&db);
+
+    let live = db
+        .insert_run("repo-legacy", "feat-live", "eeee", None, None)
+        .unwrap();
+    rounds::open_round(&db, &sample_plan(&live.id), &sample_bindings(b"live.rs\n")).unwrap();
+    db.set_run_status(&live.id, "parked", None).unwrap();
+    db.set_review_approved_head_sha(&live.id, Some("live-approved"))
+        .unwrap();
+    let admitted = db
+        .insert_run("repo-legacy", "feat-admitted", "ffff", None, None)
+        .unwrap();
+    let snapshot = (
+        min_writer_protocol(&conn),
+        db.run_by_id("run-parked").unwrap().unwrap().status,
+        db.run_by_id(&live.id)
+            .unwrap()
+            .unwrap()
+            .review_approved_head_sha,
+    );
+    drop(conn);
+    drop(db);
+
+    let db_again = Db::open(&path).unwrap();
+    let conn_again = Connection::open(&path).unwrap();
+    assert!(writer_fence_installed(&conn_again));
+    assert_eq!(min_writer_protocol(&conn_again), snapshot.0);
+    assert_eq!(
+        db_again.run_by_id("run-parked").unwrap().unwrap().status,
+        snapshot.1
+    );
+    let live_again = db_again.run_by_id(&live.id).unwrap().unwrap();
+    assert_eq!(live_again.status, "parked");
+    assert_eq!(live_again.review_approved_head_sha, snapshot.2);
+    assert_eq!(
+        db_again.run_by_id(&admitted.id).unwrap().unwrap().status,
+        "pending"
+    );
+}
+
+#[test]
+fn opening_a_state_root_above_this_binary_fails_with_a_readable_message() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let path = db_path(home);
+    let _db = fixture_db(home);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE porch_state_meta SET min_writer_protocol = 99 WHERE id = 1",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let Err(err) = Db::open(&path) else {
+        panic!("a too-old binary must not open this state root");
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("99") && msg.contains("understands"),
+        "open must name the incompatibility, got {msg}"
+    );
+}
+
+#[test]
+fn contending_runs_still_count_only_pending_running_and_parked() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    db.upsert_repo("repo1", home, &home.join("bare.git"), "main")
+        .unwrap();
+
+    let pending = db.insert_run("repo1", "feat", "aaa", None, None).unwrap();
+    let running = db.insert_run("repo1", "feat", "bbb", None, None).unwrap();
+    db.set_run_status(&running.id, "running", None).unwrap();
+    let parked = db.insert_run("repo1", "feat", "ccc", None, None).unwrap();
+    db.set_run_status(&parked.id, "parked", None).unwrap();
+    let failed = db.insert_run("repo1", "feat", "ddd", None, None).unwrap();
+    db.set_run_status(&failed.id, "failed", None).unwrap();
+    let completed = db.insert_run("repo1", "feat", "eee", None, None).unwrap();
+    db.set_run_status(&completed.id, "completed", None).unwrap();
+    let interrupted = db.insert_run("repo1", "feat", "fff", None, None).unwrap();
+    db.set_run_status(&interrupted.id, "ci_monitor_interrupted", None)
+        .unwrap();
+
+    let active: Vec<String> = db
+        .active_runs(Some("repo1"), Some("feat"))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert!(active.contains(&pending.id));
+    assert!(active.contains(&running.id));
+    assert!(active.contains(&parked.id));
+    assert!(!active.contains(&failed.id));
+    assert!(!active.contains(&completed.id));
+    assert!(!active.contains(&interrupted.id));
+
+    let inflight: Vec<String> = db
+        .in_flight_same_branch("repo1", "feat", &pending.id)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert!(inflight.contains(&running.id));
+    assert!(inflight.contains(&parked.id));
+    assert!(!inflight.contains(&pending.id));
+    assert!(!inflight.contains(&failed.id));
+    assert!(!inflight.contains(&completed.id));
+    assert!(!inflight.contains(&interrupted.id));
+}
+
+struct RecoveringExecutor;
+
+impl RunExecutor for RecoveringExecutor {
+    fn execute(&self, _home: &Path, _run_id: &str, _cancel: &AtomicBool) {}
+
+    fn recover_stale(&self, home: &Path) -> std::result::Result<(), String> {
+        let db = Db::open(&db_path(home)).map_err(|e| e.to_string())?;
+        db.fail_stale_running("daemon restarted while run was in progress")
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+struct FailingRecoverExecutor;
+
+impl RunExecutor for FailingRecoverExecutor {
+    fn execute(&self, _home: &Path, _run_id: &str, _cancel: &AtomicBool) {}
+
+    fn recover_stale(&self, _home: &Path) -> std::result::Result<(), String> {
+        Err("test recover_stale failure".into())
+    }
+}
+
+#[test]
+fn daemon_startup_still_recovers_stale_runs_and_refuses_when_recovery_fails() {
+    {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&home).unwrap();
+        let db = Db::open(&db_path(&home)).unwrap();
+        db.upsert_repo("repo1", &home, &home.join("bare.git"), "main")
+            .unwrap();
+        let run = db.insert_run("repo1", "feat", "abc", None, None).unwrap();
+        db.set_run_status(&run.id, "running", None).unwrap();
+        drop(db);
+
+        let home_t = home.clone();
+        let _handle = std::thread::spawn(move || {
+            let exec: Arc<dyn RunExecutor> = Arc::new(RecoveringExecutor);
+            let _ = run_daemon(&home_t, &exec);
+        });
+        wait_for_health(&home, Duration::from_secs(5)).unwrap();
+        let recovered = Db::open(&db_path(&home))
+            .unwrap()
+            .run_by_id(&run.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, "failed");
+        assert!(
+            recovered
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("daemon restarted")),
+            "error={:?}",
+            recovered.error
+        );
+    }
+
+    {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&home).unwrap();
+        let _ = Db::open(&db_path(&home)).unwrap();
+        let home_t = home.clone();
+        let handle = std::thread::spawn(move || {
+            let exec: Arc<dyn RunExecutor> = Arc::new(FailingRecoverExecutor);
+            let _ = run_daemon(&home_t, &exec);
+        });
+        let health = wait_for_health(&home, Duration::from_secs(2));
+        assert!(
+            health.is_err(),
+            "daemon must refuse to serve when recovery fails"
+        );
+        let _ = handle.join();
     }
 }
