@@ -261,10 +261,7 @@ impl SetupWizard {
                 }
                 KeyCode::Enter => {
                     if self.engines.is_empty() {
-                        self.error = Some(
-                            "no review engine on PATH — install porch-quality (M16) or claude/codex, or legacy ocr / review"
-                                .into(),
-                        );
+                        self.error = Some(NO_JUDGMENT_ENGINE.into());
                         return WizardAction::None;
                     }
                     self.error = None;
@@ -379,14 +376,16 @@ impl SetupWizard {
 
     fn select_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        lines.push(Line::from("Review engine"));
+        lines.push(Line::from(
+            "Judgment layer (floor always runs via porch-quality sibling)",
+        ));
         if self.engines.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (none detected)",
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(
-                "  install porch-quality (M16) or claude/codex; legacy ocr / `review` also ok",
+                "  install claude/codex for agent; quality is floor-only and still needs the sibling",
             ));
         } else {
             for (i, eng) in self.engines.iter().enumerate() {
@@ -401,7 +400,10 @@ impl SetupWizard {
                 };
                 let label = match eng.kind {
                     EngineKind::Quality => {
-                        format!("  {marker} quality ({}){rec}", eng.bin.display())
+                        format!(
+                            "  {marker} quality — floor-only ({}){rec}",
+                            eng.bin.display()
+                        )
                     }
                     EngineKind::Agent => {
                         format!("  {marker} agent ({}){rec}", eng.bin.display())
@@ -528,13 +530,14 @@ fn format_tools_line(tools: &porch_review::ToolsConfig) -> String {
     format!("biome bun cargo just moon   {det} / {miss}")
 }
 
+const NO_JUDGMENT_ENGINE: &str = "no judgment engine on PATH — install claude/codex \
+(`engine: agent` still requires the porch-quality sibling of porch); \
+`engine: quality` is floor-only. Legacy ocr / `review` also ok";
+
 fn run_wizard(home: &Path) -> Result<ExitCode> {
     let mut wizard = SetupWizard::detect();
     if wizard.engines.is_empty() {
-        wizard.error = Some(
-            "no review engine on PATH — install porch-quality (M16) or claude/codex, or legacy ocr / `review`, then re-open"
-                .into(),
-        );
+        wizard.error = Some(NO_JUDGMENT_ENGINE.into());
     }
     let mut term = WizardTerminal::enter()?;
     loop {
@@ -845,5 +848,40 @@ mod tests {
         );
         let s = render_to_string(&w, 100, 28);
         assert!(s.contains("LaunchAgents"), "buffer={s}");
+    }
+
+    fn empty_wizard() -> SetupWizard {
+        SetupWizard {
+            screen: WizardScreen::Select,
+            engines: vec![],
+            focus: 0,
+            gh: None,
+            fixer: None,
+            tools_line: String::new(),
+            error: None,
+            success_wrapper: None,
+            success_engine: None,
+            install_daemon: false,
+            success_daemon_service: None,
+            apply_hook: None,
+            daemon_hook: None,
+        }
+    }
+
+    #[test]
+    fn empty_engines_name_the_floor_sibling_not_a_path_quality_engine() {
+        let mut w = empty_wizard();
+        let s = render_to_string(&w, 100, 24);
+        assert!(s.contains("sibling"), "buffer={s}");
+        assert!(
+            s.contains("floor-only") || s.contains("floor"),
+            "buffer={s}"
+        );
+        assert!(!s.contains("install porch-quality (M16)"), "buffer={s}");
+        assert_eq!(w.handle_key(KeyCode::Enter), WizardAction::None);
+        let err = w.error.as_deref().expect("inline error");
+        assert!(err.contains("sibling"), "{err}");
+        assert!(err.contains("floor-only"), "{err}");
+        assert!(!err.contains("install porch-quality (M16)"), "{err}");
     }
 }

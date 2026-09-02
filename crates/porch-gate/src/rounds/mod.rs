@@ -10,8 +10,8 @@ pub use applicability::{
     applicable_round_for_run, descriptor_equivalence_digest,
 };
 pub use requirements::{
-    RequirementRow, RequirementSpec, Resolution, Role, required_set_digest, requirements_for_round,
-    run_required_set_digest,
+    RequirementRow, RequirementSpec, Resolution, Role, assurance_shape, digest_for_specs,
+    required_set_digest, requirements_for_round, run_required_set_digest,
 };
 
 use std::cell::Cell;

@@ -12,7 +12,7 @@ use crate::db::{Db, RunRow, StepResultRow};
 use crate::events::{Event, EventHub};
 use crate::home::socket_path;
 use crate::rounds::{
-    self, Applicability, AssuranceCompletion, FindingInstanceRecord, RequirementRow, Role, RoundId,
+    self, Applicability, AssuranceCompletion, FindingInstanceRecord, RequirementRow, RoundId,
 };
 
 /// Soft cap for on-demand finding hunk / diff payloads (bytes).
@@ -151,11 +151,7 @@ fn shape_from_requirements(rows: &[RequirementRow]) -> Option<String> {
     if rows.is_empty() {
         return None;
     }
-    Some(if rows.iter().any(|row| row.role == Role::Judgment) {
-        "floor+judgment".into()
-    } else {
-        "floor-only".into()
-    })
+    Some(rounds::assurance_shape(rows.iter().map(|row| row.role)).to_string())
 }
 
 impl Default for AssuranceRecord {

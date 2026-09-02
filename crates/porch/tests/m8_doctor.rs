@@ -65,6 +65,70 @@ fn doctor_ok_when_git_present_even_if_review_missing() {
 }
 
 #[test]
+fn doctor_ok_floor_sibling_is_distinct_from_judgment_review() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    install_fake_git(&bin);
+    let home = tmp.path().join("home");
+    let _quality = assert_cmd::cargo::cargo_bin("porch-quality");
+
+    Command::cargo_bin("porch")
+        .unwrap()
+        .env("PATH", &bin)
+        .env("PORCH_HOME", &home)
+        .env("HOME", tmp.path())
+        .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_GH_BIN")
+        .env_remove("PORCH_FIXER_BIN")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("[ok  ] floor:"))
+        .stdout(predicates::str::contains("porch-quality"))
+        .stdout(predicates::str::contains("deterministic floor"))
+        .stdout(predicates::str::contains("[warn] review:"))
+        .stdout(predicates::str::contains("judgment engine"));
+}
+
+#[test]
+fn doctor_warns_when_floor_sibling_is_missing() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    install_fake_git(&bin);
+    let home = tmp.path().join("home");
+    let isolated = tmp.path().join("isolated");
+    fs::create_dir_all(&isolated).unwrap();
+    let porch_src = assert_cmd::cargo::cargo_bin("porch");
+    let porch_copy = isolated.join("porch");
+    fs::copy(&porch_src, &porch_copy).unwrap();
+    chmod_755(&porch_copy);
+
+    let out = std::process::Command::new(&porch_copy)
+        .env("PATH", &bin)
+        .env("PORCH_HOME", &home)
+        .env("HOME", tmp.path())
+        .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_GH_BIN")
+        .env_remove("PORCH_FIXER_BIN")
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[warn] floor:"), "{stdout}");
+    assert!(stdout.contains("porch-quality"), "{stdout}");
+    assert!(
+        stdout.contains("not PATH") || stdout.contains("sibling"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[warn] review:"), "{stdout}");
+}
+
+#[test]
 fn init_prints_remote_and_next_steps() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();

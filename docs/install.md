@@ -7,7 +7,7 @@ One package installs **both** binaries:
 | Binary | Role |
 |---|---|
 | `porch` | Gate CLI and daemon |
-| `porch-quality` | Review engine (`porch setup --engine quality`) |
+| `porch-quality` | Mandatory **deterministic floor** sibling of `porch`. `engine: quality` is floor-only (no judgment); `engine: agent` still requires this sibling |
 
 Needs **Rust 1.85+** ([rustup](https://rustup.rs)) and **git**. Default bindir is `~/.cargo/bin` — add it to `PATH` if `porch doctor` warns.
 

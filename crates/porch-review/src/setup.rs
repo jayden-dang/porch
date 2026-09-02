@@ -171,8 +171,10 @@ pub fn setup_yes(porch_home: &Path, engine: Option<EngineKind>) -> Result<SetupR
     let detected = detect_engines();
     let Some(kind) = engine.or_else(|| default_engine(&detected)) else {
         return Ok(SetupResult::fail(
-            "no review engine on PATH — install `porch-quality` (M16), a coding agent \
-             (`claude` or `codex`), or legacy `ocr` / a binary named `review`, then re-run `porch setup`",
+            "no judgment engine on PATH — install a coding agent (`claude` or `codex`) \
+             (`engine: agent` still requires the porch-quality sibling of porch); \
+             `engine: quality` is floor-only. Legacy `ocr` / a binary named `review` also ok. \
+             Then re-run `porch setup`",
             warnings,
         ));
     };

@@ -2,7 +2,7 @@
 
 use std::env;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use porch_gate::{health_check, porch_home, socket_path};
@@ -81,6 +81,7 @@ fn collect_checks() -> Vec<Check> {
     }
     checks.push(check_git());
     checks.extend(check_home_and_daemon());
+    checks.push(check_floor());
     checks.push(check_review());
     checks.push(check_gh());
     checks.push(check_fixer());
@@ -185,6 +186,57 @@ fn check_home_and_daemon() -> Vec<Check> {
     out
 }
 
+fn floor_executable_name() -> String {
+    format!("porch-quality{}", std::env::consts::EXE_SUFFIX)
+}
+
+fn floor_sibling_of(exe: &Path) -> Option<PathBuf> {
+    exe.parent()
+        .map(|parent| parent.join(floor_executable_name()))
+}
+
+fn check_floor() -> Check {
+    match env::current_exe() {
+        Ok(exe) => match floor_sibling_of(&exe) {
+            Some(sibling) => {
+                if is_executable(&sibling) {
+                    Check::new(
+                        Level::Ok,
+                        "floor",
+                        format!(
+                            "{} (mandatory deterministic floor sibling)",
+                            sibling.display()
+                        ),
+                    )
+                } else {
+                    Check::new(
+                        Level::Warn,
+                        "floor",
+                        format!(
+                            "`{}` missing or not executable — `cargo install porch --locked` \
+installs both binaries next to each other; every run requires this sibling (not PATH)",
+                            sibling.display()
+                        ),
+                    )
+                }
+            }
+            None => Check::new(
+                Level::Warn,
+                "floor",
+                format!(
+                    "running executable {} has no parent directory; cannot locate porch-quality",
+                    exe.display()
+                ),
+            ),
+        },
+        Err(e) => Check::new(
+            Level::Warn,
+            "floor",
+            format!("could not resolve current_exe: {e}"),
+        ),
+    }
+}
+
 fn check_review() -> Check {
     let home = porch_home();
     let from_env = env::var_os(REVIEW_BIN_ENV).is_some();
@@ -258,7 +310,7 @@ fn check_review() -> Check {
         Level::Warn,
         "review",
         format!(
-            "review not configured — run `porch setup` (quality or agent) or set {REVIEW_BIN_ENV}; needed for a complete run"
+            "judgment engine not configured — run `porch setup` (`quality` is floor-only; `agent` still needs the porch-quality sibling) or set {REVIEW_BIN_ENV}"
         ),
     )
 }
@@ -365,4 +417,27 @@ pub fn current_branch(work: &Path) -> String {
         }
     })
     .unwrap_or_else(|| "HEAD".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::floor_sibling_of;
+    use std::path::PathBuf;
+
+    #[test]
+    fn floor_sibling_is_porch_quality_next_to_the_running_exe() {
+        let exe = PathBuf::from("/opt/porch/bin/porch");
+        let sibling = floor_sibling_of(&exe).expect("parent directory");
+        let expected = PathBuf::from(format!(
+            "/opt/porch/bin/porch-quality{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        assert_eq!(sibling, expected);
+    }
+
+    #[test]
+    fn floor_sibling_is_none_when_the_exe_has_no_parent() {
+        let exe = PathBuf::from("/");
+        assert!(floor_sibling_of(&exe).is_none());
+    }
 }

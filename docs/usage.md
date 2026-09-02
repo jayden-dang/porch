@@ -10,10 +10,11 @@ Install: [install.md](install.md). This page is the operator loop after the bina
 
 | Need | Why |
 |---|---|
-| `porch` 0.2.2+ on `PATH` | Gate CLI (`cargo install porch --locked` also installs `porch-quality`) |
+| `porch` 0.2.2+ on `PATH` | Gate CLI (`cargo install porch --locked` also installs the floor sibling) |
+| `porch-quality` next to `porch` | Mandatory **deterministic floor**. Not PATH-selected, not optional. `porch doctor` checks the sibling of `current_exe` |
 | `git` | Gate operations shell out to git |
 | `gh` logged in | Deliver (PR). `porch doctor` checks it |
-| A review engine | `porch-quality` (preferred), or `claude` / `codex` |
+| A judgment engine (optional) | `claude` / `codex` for `engine: agent`. `engine: quality` is floor-only (no judgment) and still requires the sibling |
 | Optional fixer | `PORCH_FIXER_BIN` (for `respond fix`) |
 | Repo tools on `PATH` | Certify runs in a **cold** worktree (no `node_modules`). `biome`, `just`, `moon`, etc. must be on `PATH` |
 
@@ -37,20 +38,20 @@ porch setup --yes           # headless JSON
 porch doctor
 ```
 
-`porch setup` writes `$PORCH_HOME/config.yaml` and, for `quality` / `ocr` / `generic`, a porch-owned `$PORCH_HOME/bin/review` wrapper.
+`porch setup` writes `$PORCH_HOME/config.yaml` and, for `quality` / `ocr` / `generic`, a porch-owned `$PORCH_HOME/bin/review` wrapper. That wrapper is the **judgment** selection. The floor is always the `porch-quality` sibling of the running `porch` binary — setup cannot turn it off.
 
 | Engine | When |
 |---|---|
-| `quality` | `porch-quality` is on `PATH` (default after `cargo install porch`) |
-| `agent` | coding agent (`claude` / `codex`) — session-free review turn |
-| `generic` | a binary already named `review` that speaks `--from --to --format json --output` |
-| `ocr` | legacy only: `porch setup --engine ocr` |
+| `quality` | Floor-only (no judgment). Default after `cargo install porch`. Still requires the `porch-quality` sibling, not a PATH lookup |
+| `agent` | Coding agent (`claude` / `codex`) for the judgment layer — session-free review turn. Still requires the floor sibling |
+| `generic` | a binary already named `review` that speaks `--from --to --format json --output` (judgment). Floor sibling still required |
+| `ocr` | legacy only: `porch setup --engine ocr` (judgment). Floor sibling still required |
 
-Do **not** set `PORCH_REVIEW_BIN=ocr` (missing the `review` subcommand). Env still overrides config: `PORCH_REVIEW_BIN`, `PORCH_REVIEW_AGENT_BIN`, `PORCH_FIXER_BIN`, `PORCH_GH_BIN`, `PORCH_HOME`.
+Do **not** set `PORCH_REVIEW_BIN=ocr` (missing the `review` subcommand). Env still overrides config: `PORCH_REVIEW_BIN`, `PORCH_REVIEW_AGENT_BIN`, `PORCH_FIXER_BIN`, `PORCH_GH_BIN`, `PORCH_HOME`. None of those env vars relocates the floor.
 
 Re-apply after editing `config.yaml`: `porch setup --apply`. Re-check: `porch setup --verify`. Optional login service: `porch setup --yes --install-daemon`.
 
-`porch doctor` must show review **ok** (engine `quality` or `agent`) and `git` **ok**. Exit 1 only if a hard check fails (`git` missing).
+`porch doctor` must show **floor** ok (`porch-quality` next to `porch`), judgment **review** ok when you selected `agent` / `generic` / `ocr`, and `git` **ok**. Exit 1 only if a hard check fails (`git` missing).
 
 ## D. Trusted repo config
 
@@ -274,7 +275,8 @@ porch agent sync                    # if local branch lags pipeline
 | Symptom | What to try |
 |---|---|
 | `porch: command not found` | `export PATH="$HOME/.cargo/bin:$PATH"` then `porch doctor` |
-| doctor warns review | `porch setup --yes` (need `porch-quality` or `claude`/`codex`) |
+| doctor warns floor | Install so `porch-quality` sits next to `porch` (`cargo install porch --locked`); restart the daemon |
+| doctor warns review | `porch setup --yes` (judgment: `agent` / `claude`/`codex`; `quality` is floor-only and still needs the sibling) |
 | certify `biome: not found` | Put biome on `PATH`; `porch daemon stop --force && porch daemon start` so the daemon inherits it |
 | lefthook/e2e on every push | `git push --no-verify porch …` |
 | rebase conflict | TUI/`respond` **fix** or **abort** |
@@ -291,22 +293,27 @@ Not CI. Not deploy. Not a merge bot. Not team governance. It sits **in front of*
 
 ## R. Upgrading porch (review round identity and the mandatory floor)
 
-Finish parked runs before upgrading when you can. An upgrade **preserves** a parked legacy run
-(`runs.findings_json`) so approve / fix / skip / abort, notes, and hunk lookup still work, but it
-**cannot** give that run round identity retroactively. A **fresh run after upgrade** is how a
-change gets a durable review round.
+**Back up `$PORCH_HOME` before upgrading.** Finish parked legacy runs first, or lose them:
+the first open of an upgraded `$PORCH_HOME` installs a **database-resident compatibility
+fence** (protocol 2). That transaction **terminalizes** every still-active (`pending` /
+`running` / `parked`) run that has no protocol-2 round and **clears undelivered**
+`review_approved_head_sha`. Those runs become `failed`. They are **not** still approvable —
+recover with `porch rerun --run-id <ULID>` (new run, new worktree, nothing carries forward).
 
-This release also installs a **database-resident compatibility fence** (protocol 2). The first
-open of an upgraded `$PORCH_HOME` terminalizes any still-active run that has no protocol-2
-round and clears undelivered legacy approvals. New runs after that point always require the
-deterministic floor.
+A parked run that still has **no round rows** (a stripped-round leftover, not a post-upgrade
+park) can still answer approve / fix / skip / abort, notes, and hunk lookup through its
+legacy snapshot. That serve path is not the upgrade path: after the fence, a real pre-floor
+park is already `failed`.
+
+New runs after upgrade always require the deterministic floor. An upgrade **cannot** give a
+legacy run round identity retroactively.
 
 **Rollback** to a pre-floor (`0.2.x`) binary against an upgraded state root is **unsupported**.
 The fence refuses new runs and approvals from a writer that does not understand protocol 2.
 Restore a backup of `$PORCH_HOME` taken before the upgrade if you must run an older binary.
 
 **Recovery** after an unsatisfied floor or a shape mismatch: fix the cause (install
-`porch-quality` next to `porch`, or restore the review engine), **restart the porch daemon**
+`porch-quality` next to `porch`, or restore the judgment engine), **restart the porch daemon**
 when the recorded cause is resolution / missing executable, then:
 
 ```sh
@@ -316,6 +323,5 @@ porch rerun --run-id <ULID>
 That allocates a new run from the prior tip and intent. It does not reuse the failed run's
 authorization.
 
-Back up `$PORCH_HOME` before upgrading. **Downgrade** after new-format round rows exist is
-**unsupported**.
+**Downgrade** after new-format round rows exist is **unsupported**.
 

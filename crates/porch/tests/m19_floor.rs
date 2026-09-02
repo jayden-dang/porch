@@ -915,6 +915,15 @@ fn floor_operational_faults_finalize_incomplete_and_skip_judgment() {
         );
         assert_failed_closed(&db, &run);
         assert_incomplete_naming_floor(&db, &run.id);
+        let err = run.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("floor"),
+            "{mode}: operator error must name the floor, got {err:?}"
+        );
+        assert!(
+            !err.contains("review CLI timed out") && !err.contains("review timed out"),
+            "{mode}: floor fault must not look like a review CLI timeout, got {err:?}"
+        );
 
         let order = fs::read_to_string(h.home.join("producer-order")).unwrap_or_default();
         assert!(

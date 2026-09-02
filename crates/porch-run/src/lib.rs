@@ -22,9 +22,9 @@ use porch_gate::rounds::{
     self, AssuranceCompletion, ContextApplication, ContextApplicationState, ContextSource,
     EquivalenceInput, ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal,
     ObservedVersionForEquivalence, OpenRoundPlan, ProducerDuration, ProducerInvocation,
-    RequirementRow, RequirementSpec, Resolution, Role, RoundCoverageProposal, RoundId,
-    STALE_REVISION_RETRIES, capture_context_element, descriptor_equivalence_digest,
-    required_set_digest, run_required_set_digest, sha256_hex,
+    RequirementSpec, Resolution, Role, RoundCoverageProposal, RoundId, STALE_REVISION_RETRIES,
+    capture_context_element, descriptor_equivalence_digest, digest_for_specs,
+    run_required_set_digest, sha256_hex,
 };
 use porch_gate::{
     Db, RunExecutor, RunRow, StatusFindingDto, db_path, event_hub, load_finding_notes, repo_id_for,
@@ -442,40 +442,13 @@ fn producer_invocation(desc: &ProducerDescriptor) -> Result<ProducerInvocation> 
     })
 }
 
-fn digest_for_requirement_specs(protocol_version: i64, specs: &[RequirementSpec]) -> String {
-    let rows: Vec<RequirementRow> = specs
-        .iter()
-        .map(|spec| RequirementRow {
-            slot: spec.slot,
-            role: spec.role,
-            resolution: spec.resolution,
-            expected_equivalence_digest: spec.expected_equivalence_digest.clone(),
-            producer_invocation_id: None,
-            reason: spec.reason.clone(),
-        })
-        .collect();
-    required_set_digest(protocol_version, &rows)
-}
-
-fn assurance_shape(specs: &[RequirementSpec]) -> &'static str {
-    if specs.iter().any(|spec| spec.role == Role::Judgment) {
-        "floor+judgment"
-    } else {
-        "floor-only"
-    }
-}
-
 fn pinned_assurance_shape(db: &Db, run_id: &str) -> Result<&'static str> {
     let rounds = rounds::rounds_for_run(db, run_id)?;
     let Some(first) = rounds.first() else {
-        return Ok("floor-only");
+        return Ok(rounds::assurance_shape(std::iter::empty()));
     };
     let rows = rounds::requirements_for_round(db, &first.id)?;
-    Ok(if rows.iter().any(|row| row.role == Role::Judgment) {
-        "floor+judgment"
-    } else {
-        "floor-only"
-    })
+    Ok(rounds::assurance_shape(rows.iter().map(|row| row.role)))
 }
 
 fn refuse_shape_mismatch(
@@ -657,7 +630,7 @@ fn open_review_round(
     };
 
     let attempted_digest =
-        digest_for_requirement_specs(bindings.protocol_schema_version, &open_plan.requirements);
+        digest_for_specs(bindings.protocol_schema_version, &open_plan.requirements);
     if let Some(pinned) = run_required_set_digest(db, run_id)? {
         if pinned != attempted_digest {
             return refuse_shape_mismatch(
@@ -666,7 +639,7 @@ fn open_review_round(
                 &pinned,
                 pinned_assurance_shape(db, run_id)?,
                 &attempted_digest,
-                assurance_shape(&open_plan.requirements),
+                rounds::assurance_shape(open_plan.requirements.iter().map(|spec| spec.role)),
             );
         }
     }
@@ -719,10 +692,21 @@ struct SpawnReviewCtx<'a> {
     opened: &'a OpenedRound,
 }
 
-fn map_spawn_err(e: porch_review::Error) -> RunError {
-    match e {
-        porch_review::Error::Timeout(d) => RunError::Msg(format!("review timed out after {d:?}")),
-        other => RunError::Review(other),
+fn map_spawn_err(e: porch_review::Error, role: Role) -> RunError {
+    match role {
+        Role::Floor => RunError::Msg(match &e {
+            porch_review::Error::Timeout(d) => format!("floor timed out after {d:?}"),
+            porch_review::Error::Exit { status, stderr } => {
+                format!("floor exited {status}: {stderr}")
+            }
+            other => format!("floor: {other}"),
+        }),
+        Role::Judgment => match e {
+            porch_review::Error::Timeout(d) => {
+                RunError::Msg(format!("review timed out after {d:?}"))
+            }
+            other => RunError::Review(other),
+        },
     }
 }
 
@@ -733,7 +717,7 @@ fn abort_slot(
     role: Role,
 ) -> Result<SpawnedReview> {
     finalize_incomplete(db, round_id, incomplete_reason(&err, role))?;
-    Err(map_spawn_err(err))
+    Err(map_spawn_err(err, role))
 }
 
 fn coverage_proposals(
@@ -2604,6 +2588,45 @@ mod continuity_tests {
         // Documented contract: empty-diff skip_remaining never calls assert_head_continuity.
         // Smoke: execute path with empty diff is covered by m2_run integration.
         let _ = init_bare;
+    }
+}
+
+#[cfg(test)]
+mod spawn_err_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn floor_timeout_and_exit_name_the_floor_layer() {
+        let timeout = map_spawn_err(
+            porch_review::Error::Timeout(Duration::from_secs(2)),
+            Role::Floor,
+        )
+        .to_string();
+        assert!(timeout.contains("floor"), "{timeout}");
+        assert!(!timeout.contains("review CLI"), "{timeout}");
+        assert!(!timeout.contains("review timed out"), "{timeout}");
+
+        let exit = map_spawn_err(
+            porch_review::Error::Exit {
+                status: 1,
+                stderr: "boom".into(),
+            },
+            Role::Floor,
+        )
+        .to_string();
+        assert!(exit.contains("floor"), "{exit}");
+        assert!(!exit.contains("review CLI"), "{exit}");
+    }
+
+    #[test]
+    fn judgment_timeout_keeps_review_copy() {
+        let msg = map_spawn_err(
+            porch_review::Error::Timeout(Duration::from_secs(2)),
+            Role::Judgment,
+        )
+        .to_string();
+        assert_eq!(msg, "review timed out after 2s");
     }
 }
 

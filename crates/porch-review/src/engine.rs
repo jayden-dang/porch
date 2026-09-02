@@ -11,7 +11,7 @@ pub const AGENT_DETECT_BINS: &[&str] = &["claude", "codex"];
 pub enum EngineKind {
     /// Session-free coding-agent turn (claude/codex); workflow default when quality absent.
     Agent,
-    /// Porch-owned quality engine (`porch-quality`); M16 preferred when on PATH.
+    /// Floor-only shape (`engine: quality`). The floor itself is the `porch-quality` sibling of `porch`, not PATH.
     Quality,
     /// Binary already speaks porch argv (`--from --to --format json --output`).
     Generic,
