@@ -13,6 +13,7 @@ mod init;
 mod notes;
 mod notify;
 mod proc;
+pub mod rounds;
 mod rpc;
 mod service;
 mod skill;
