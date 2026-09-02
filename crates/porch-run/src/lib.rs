@@ -20,9 +20,10 @@ use porch_agent::{
 use porch_gate::rounds::{
     self, AssuranceCompletion, ContextApplication, ContextApplicationState, ContextSource,
     EquivalenceInput, ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal,
-    ObservedVersionForEquivalence, OpenRoundPlan, ProducerInvocation, RequirementSpec, Resolution,
-    Role, RoundCoverageProposal, RoundId, STALE_REVISION_RETRIES, capture_context_element,
-    descriptor_equivalence_digest, sha256_hex,
+    ObservedVersionForEquivalence, OpenRoundPlan, ProducerInvocation, RequirementRow,
+    RequirementSpec, Resolution, Role, RoundCoverageProposal, RoundId, STALE_REVISION_RETRIES,
+    capture_context_element, descriptor_equivalence_digest, required_set_digest,
+    run_required_set_digest, sha256_hex,
 };
 use porch_gate::{
     Db, RunExecutor, RunRow, StatusFindingDto, db_path, event_hub, load_finding_notes, repo_id_for,
@@ -292,7 +293,7 @@ fn run_review_phase(
     let changed = porch_git::diff_name_only(wt, &range)?;
 
     let opened = open_review_round(db, home, bare, &run, run_id, &from_sha, &head, &changed)?;
-    if let Some(reason) = opened.unsatisfied_floor.as_ref() {
+    if let Some(UnsatisfiedRequired::Floor { reason }) = &opened.unsatisfied {
         finalize_incomplete(db, &opened.round_id, "floor_unresolved")?;
         return Err(RunError::Review(porch_review::Error::FloorUnresolved {
             reason: reason.clone(),
@@ -310,6 +311,10 @@ fn run_review_phase(
             opened: &opened,
         },
     )?;
+    if let Some(UnsatisfiedRequired::Judgment { reason }) = &opened.unsatisfied {
+        finalize_incomplete(db, &opened.round_id, "judgment_unresolved")?;
+        return Err(RunError::Msg(reason.clone()));
+    }
     finalize_complete_round(db, run_id, &opened, &spawned)?;
     publish_run(run_id, "findings updated");
 
@@ -329,10 +334,15 @@ struct OpenedSlot {
     plan: porch_review::InvocationPlan,
 }
 
+enum UnsatisfiedRequired {
+    Floor { reason: String },
+    Judgment { reason: String },
+}
+
 struct OpenedRound {
     round_id: RoundId,
     slots: Vec<OpenedSlot>,
-    unsatisfied_floor: Option<String>,
+    unsatisfied: Option<UnsatisfiedRequired>,
 }
 
 struct SpawnedReview {
@@ -358,35 +368,46 @@ fn engine_is_quality(home: &Path) -> bool {
 
 enum ComposedRound {
     Prepared(Vec<PreparedInvocation>),
-    FloorUnresolved { reason: String },
+    FloorUnresolved {
+        reason: String,
+    },
+    JudgmentUnresolved {
+        floor: Box<PreparedInvocation>,
+        reason: String,
+    },
 }
 
 fn compose_prepared_invocations(
     home: &Path,
     intent: Option<&[u8]>,
     path_instructions: Option<&[u8]>,
-) -> Result<ComposedRound> {
+) -> ComposedRound {
     match porch_review::floor::resolve() {
         Ok(floor) => {
-            let mut prepared = vec![floor];
-            if !engine_is_quality(home) {
-                prepared.push(prepare(&PrepareOpts {
-                    porch_home: Some(home),
-                    review_bin: None,
-                    agent_bin: None,
-                    prefer_agent: None,
-                    intent,
-                    path_instructions,
-                })?);
+            if engine_is_quality(home) {
+                return ComposedRound::Prepared(vec![floor]);
             }
-            Ok(ComposedRound::Prepared(prepared))
+            match prepare(&PrepareOpts {
+                porch_home: Some(home),
+                review_bin: None,
+                agent_bin: None,
+                prefer_agent: None,
+                intent,
+                path_instructions,
+            }) {
+                Ok(judgment) => ComposedRound::Prepared(vec![floor, judgment]),
+                Err(e) => ComposedRound::JudgmentUnresolved {
+                    floor: Box::new(floor),
+                    reason: e.to_string(),
+                },
+            }
         }
         Err(porch_review::Error::FloorUnresolved { reason }) => {
-            Ok(ComposedRound::FloorUnresolved { reason })
+            ComposedRound::FloorUnresolved { reason }
         }
-        Err(e) => Ok(ComposedRound::FloorUnresolved {
+        Err(e) => ComposedRound::FloorUnresolved {
             reason: e.to_string(),
-        }),
+        },
     }
 }
 
@@ -400,6 +421,16 @@ fn unresolved_floor_requirement(reason: String) -> RequirementSpec {
     }
 }
 
+fn unresolved_judgment_requirement(reason: String) -> RequirementSpec {
+    RequirementSpec {
+        slot: 1,
+        role: Role::Judgment,
+        resolution: Resolution::Unresolved,
+        expected_equivalence_digest: None,
+        reason: Some(reason),
+    }
+}
+
 fn producer_invocation(desc: &ProducerDescriptor) -> Result<ProducerInvocation> {
     let descriptor_json = serde_json::to_string(desc)
         .map_err(|e| RunError::Msg(format!("serialize producer descriptor: {e}")))?;
@@ -407,6 +438,62 @@ fn producer_invocation(desc: &ProducerDescriptor) -> Result<ProducerInvocation> 
         descriptor_equivalence_digest: producer_equivalence_digest(desc),
         descriptor_json,
     })
+}
+
+fn digest_for_requirement_specs(protocol_version: i64, specs: &[RequirementSpec]) -> String {
+    let rows: Vec<RequirementRow> = specs
+        .iter()
+        .map(|spec| RequirementRow {
+            slot: spec.slot,
+            role: spec.role,
+            resolution: spec.resolution,
+            expected_equivalence_digest: spec.expected_equivalence_digest.clone(),
+            producer_invocation_id: None,
+            reason: spec.reason.clone(),
+        })
+        .collect();
+    required_set_digest(protocol_version, &rows)
+}
+
+fn assurance_shape(specs: &[RequirementSpec]) -> &'static str {
+    if specs.iter().any(|spec| spec.role == Role::Judgment) {
+        "floor+judgment"
+    } else {
+        "floor-only"
+    }
+}
+
+fn pinned_assurance_shape(db: &Db, run_id: &str) -> Result<&'static str> {
+    let rounds = rounds::rounds_for_run(db, run_id)?;
+    let Some(first) = rounds.first() else {
+        return Ok("floor-only");
+    };
+    let rows = rounds::requirements_for_round(db, &first.id)?;
+    Ok(if rows.iter().any(|row| row.role == Role::Judgment) {
+        "floor+judgment"
+    } else {
+        "floor-only"
+    })
+}
+
+fn refuse_shape_mismatch(
+    db: &Db,
+    run_id: &str,
+    pinned_digest: &str,
+    pinned_shape: &str,
+    attempted_digest: &str,
+    attempted_shape: &str,
+) -> Result<OpenedRound> {
+    let payload = serde_json::json!({
+        "kind": "assurance_shape_mismatch",
+        "pinned_digest": pinned_digest,
+        "pinned_shape": pinned_shape,
+        "attempted_digest": attempted_digest,
+        "attempted_shape": attempted_shape,
+    })
+    .to_string();
+    record_step(db, run_id, "review", "failed", Some(&payload))?;
+    Err(RunError::Msg(payload))
 }
 
 fn resolved_requirement(slot: i64, role: Role, desc: &ProducerDescriptor) -> RequirementSpec {
@@ -462,7 +549,7 @@ fn open_review_round(
         home,
         intent_bytes.as_deref(),
         path_instructions_bytes.as_deref(),
-    )?;
+    );
 
     let trusted_config_sha = run
         .trusted_config_sha
@@ -494,10 +581,16 @@ fn open_review_round(
         ),
     ];
     let mut context_applications = Vec::new();
-    if let ComposedRound::Prepared(prepared) = &composed {
-        for (slot, inv) in prepared.iter().enumerate() {
-            context_applications.extend(applications_for_prepared(slot, inv));
+    match &composed {
+        ComposedRound::Prepared(prepared) => {
+            for (slot, inv) in prepared.iter().enumerate() {
+                context_applications.extend(applications_for_prepared(slot, inv));
+            }
         }
+        ComposedRound::JudgmentUnresolved { floor, .. } => {
+            context_applications.extend(applications_for_prepared(0, floor));
+        }
+        ComposedRound::FloorUnresolved { .. } => {}
     }
 
     let mut bindings = rounds::RoundBindings {
@@ -517,7 +610,7 @@ fn open_review_round(
         bindings.inventory_digest = sha256_hex(b"porch-test-fail-round-open");
     }
 
-    let (open_plan, prepared, unsatisfied_floor) = match composed {
+    let (open_plan, prepared, unsatisfied) = match composed {
         ComposedRound::FloorUnresolved { reason } => (
             OpenRoundPlan {
                 run_id: run_id.to_string(),
@@ -525,7 +618,19 @@ fn open_review_round(
                 requirements: vec![unresolved_floor_requirement(reason.clone())],
             },
             Vec::new(),
-            Some(reason),
+            Some(UnsatisfiedRequired::Floor { reason }),
+        ),
+        ComposedRound::JudgmentUnresolved { floor, reason } => (
+            OpenRoundPlan {
+                run_id: run_id.to_string(),
+                producers: vec![producer_invocation(&floor.plan.descriptor)?],
+                requirements: vec![
+                    resolved_requirement(0, Role::Floor, &floor.plan.descriptor),
+                    unresolved_judgment_requirement(reason.clone()),
+                ],
+            },
+            vec![*floor],
+            Some(UnsatisfiedRequired::Judgment { reason }),
         ),
         ComposedRound::Prepared(prepared) => {
             let mut producers = Vec::with_capacity(prepared.len());
@@ -549,16 +654,31 @@ fn open_review_round(
         }
     };
 
+    let attempted_digest =
+        digest_for_requirement_specs(bindings.protocol_schema_version, &open_plan.requirements);
+    if let Some(pinned) = run_required_set_digest(db, run_id)? {
+        if pinned != attempted_digest {
+            return refuse_shape_mismatch(
+                db,
+                run_id,
+                &pinned,
+                pinned_assurance_shape(db, run_id)?,
+                &attempted_digest,
+                assurance_shape(&open_plan.requirements),
+            );
+        }
+    }
+
     let round_id = rounds::open_round(db, &open_plan, &bindings).map_err(|e| {
         RunError::Msg(format!(
             "failed to open review round before producer spawn: {e}"
         ))
     })?;
-    if unsatisfied_floor.is_some() {
+    if matches!(unsatisfied, Some(UnsatisfiedRequired::Floor { .. })) {
         return Ok(OpenedRound {
             round_id,
             slots: Vec::new(),
-            unsatisfied_floor,
+            unsatisfied,
         });
     }
     if std::env::var_os("PORCH_TEST_ABORT_AFTER_ROUND_OPEN").is_some() {
@@ -583,7 +703,7 @@ fn open_review_round(
     Ok(OpenedRound {
         round_id,
         slots,
-        unsatisfied_floor,
+        unsatisfied,
     })
 }
 

@@ -7,8 +7,11 @@ use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
-use porch_gate::rounds::{self, AssuranceCompletion, ExecutionState, Resolution, Role};
+use porch_gate::rounds::{
+    self, AssuranceCompletion, ExecutionState, Resolution, Role, run_required_set_digest,
+};
 use porch_gate::{Db, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_AGENT_BIN_ENV;
@@ -228,6 +231,41 @@ fi
     path
 }
 
+fn install_fake_fixer(bin_dir: &Path) -> PathBuf {
+    let path = bin_dir.join("fake-fixer");
+    write_exe(
+        &path,
+        r#"#!/bin/sh
+set -e
+PROMPT=""
+FINDINGS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prompt-file) PROMPT="$2"; shift 2 ;;
+    --findings-file) FINDINGS="$2"; shift 2 ;;
+    --session-id) shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -z "$PROMPT" ] || [ ! -f "$PROMPT" ]; then
+  echo "prompt file missing" >&2
+  exit 1
+fi
+if [ -z "$FINDINGS" ] || [ ! -f "$FINDINGS" ]; then
+  echo "findings file missing" >&2
+  exit 1
+fi
+TARGET=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[0]["path"] if d else "README")' "$FINDINGS" 2>/dev/null || echo README)
+if [ ! -f "$TARGET" ]; then TARGET=README; fi
+printf 'fixed\n' >> "$TARGET"
+git -c core.hooksPath=/dev/null -c user.email=porch@example.com -c user.name=Porch add -A >/dev/null
+git -c core.hooksPath=/dev/null -c user.email=porch@example.com -c user.name=Porch commit --no-verify -m "fix: address review findings" >/dev/null
+printf '{"summary":"address review findings","session_id":"sess-1"}\n'
+"#,
+    );
+    path
+}
+
 fn copy_porch_launch(install: &Path) -> PathBuf {
     fs::create_dir_all(install).unwrap();
     let src = assert_cmd::cargo::cargo_bin("porch");
@@ -243,7 +281,11 @@ struct Harness {
     home: PathBuf,
     origin: PathBuf,
     install: PathBuf,
+    porch_bin: PathBuf,
     path: String,
+    fake_gh: PathBuf,
+    fake_fixer: PathBuf,
+    fake_agent: Option<PathBuf>,
 }
 
 fn seed_origin_and_work(root: &Path) -> (PathBuf, PathBuf) {
@@ -296,6 +338,7 @@ fn setup_with(engine: &str, floor_mode: &str, review_timeout: &str) -> Harness {
         install_fake_floor(&install, floor_mode);
     }
     let fake_gh = install_noop_gh(&bin);
+    let fake_fixer = install_fake_fixer(&bin);
     let fake_agent = if engine == "agent" {
         Some(install_fake_claude(&bin))
     } else {
@@ -333,6 +376,7 @@ fn setup_with(engine: &str, floor_mode: &str, review_timeout: &str) -> Harness {
     let timeout: &std::ffi::OsStr = review_timeout.as_ref();
     let mut extra: Vec<(&str, &std::ffi::OsStr)> = vec![
         (GH_BIN_ENV, fake_gh.as_os_str()),
+        (FIXER_BIN_ENV, fake_fixer.as_os_str()),
         ("PATH", path.as_ref()),
         ("PORCH_REVIEW_TIMEOUT_SECS", timeout),
     ];
@@ -348,7 +392,11 @@ fn setup_with(engine: &str, floor_mode: &str, review_timeout: &str) -> Harness {
         home,
         origin,
         install,
+        porch_bin,
         path,
+        fake_gh,
+        fake_fixer,
+        fake_agent,
     }
 }
 
@@ -420,6 +468,100 @@ fn assert_incomplete_naming_floor(db: &Db, run_id: &str) -> porch_gate::rounds::
         "completion reason must name the floor, got {reason:?}"
     );
     round
+}
+
+fn set_home_engine(home: &Path, engine: &str) {
+    let path = home.join("config.yaml");
+    let body = fs::read_to_string(&path).unwrap();
+    let mut out = String::new();
+    let mut replaced = false;
+    for line in body.lines() {
+        if !replaced && line.trim_start().starts_with("engine:") {
+            let indent_len = line.len() - line.trim_start().len();
+            out.push_str(&line[..indent_len]);
+            out.push_str("engine: ");
+            out.push_str(engine);
+            out.push('\n');
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    assert!(replaced, "config.yaml missing engine:\n{body}");
+    fs::write(&path, out).unwrap();
+}
+
+fn respond_fix(
+    h: &Harness,
+    run_id: &str,
+    extra: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
+    let mut cmd = StdCommand::new(&h.porch_bin);
+    cmd.current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .env("PATH", &h.path)
+        .env(FIXER_BIN_ENV, &h.fake_fixer)
+        .env(GH_BIN_ENV, &h.fake_gh)
+        .env_remove("PORCH_REVIEW_BIN")
+        .args(["agent", "respond", "fix", "--run-id", run_id]);
+    if let Some(agent) = &h.fake_agent {
+        cmd.env(REVIEW_AGENT_BIN_ENV, agent);
+    } else {
+        cmd.env_remove(REVIEW_AGENT_BIN_ENV);
+    }
+    for (key, value) in extra {
+        cmd.env(*key, *value);
+    }
+    cmd.output().unwrap()
+}
+
+fn park_with_blocking_floor(h: &Harness, branch: &str) -> (Db, porch_gate::RunRow) {
+    push_branch(&h.work, &h.home, branch);
+    let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&h.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed", "completed"],
+        Duration::from_secs(30),
+    );
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
+    (db, run)
+}
+
+fn assert_shape_mismatch(
+    db: &Db,
+    run: &porch_gate::RunRow,
+    pinned_shape: &str,
+    attempted_shape: &str,
+) {
+    let run = db.run_by_id(&run.id).unwrap().expect("run");
+    assert_eq!(run.status, "failed", "err={:?}", run.error);
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    let review = steps
+        .iter()
+        .rev()
+        .find(|s| s.step == "review")
+        .expect("review step");
+    assert_eq!(review.status, "failed", "steps={steps:?}");
+    let payload: serde_json::Value =
+        serde_json::from_str(review.error.as_deref().expect("mismatch payload")).unwrap();
+    assert_eq!(payload["kind"], "assurance_shape_mismatch");
+    assert_eq!(payload["pinned_shape"], pinned_shape);
+    assert_eq!(payload["attempted_shape"], attempted_shape);
+    let pinned = payload["pinned_digest"].as_str().expect("pinned_digest");
+    let attempted = payload["attempted_digest"]
+        .as_str()
+        .expect("attempted_digest");
+    assert_ne!(pinned, attempted, "payload={payload}");
+    assert_eq!(run.error.as_deref(), review.error.as_deref());
+    let rounds = rounds::rounds_for_run(db, &run.id).unwrap();
+    assert_eq!(
+        rounds.len(),
+        1,
+        "a shape mismatch must not open a later round: {rounds:?}"
+    );
 }
 
 #[test]
@@ -804,5 +946,122 @@ fn rerun_after_unsatisfied_floor_starts_independent_run() {
         "new run must authorize independently: {second:?}"
     );
 
+    kill_daemon(&h.home);
+}
+
+#[test]
+fn matching_later_round_proceeds_and_a_shape_change_fails_closed() {
+    {
+        let h = setup_agent("blocking");
+        let (db, run) = park_with_blocking_floor(&h, "feat-pin-match");
+        let pinned = run_required_set_digest(&db, &run.id)
+            .unwrap()
+            .expect("first round pins the run");
+
+        let out = respond_fix(&h, &run.id, &[]);
+        assert!(
+            out.status.success(),
+            "matching later review failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let after = db.run_by_id(&run.id).unwrap().expect("run");
+        let rounds = rounds::rounds_for_run(&db, &run.id).unwrap();
+        assert_eq!(
+            rounds.len(),
+            2,
+            "a matching later review must open another round: status={} err={:?} rounds={rounds:?}",
+            after.status,
+            after.error
+        );
+        assert_eq!(
+            run_required_set_digest(&db, &run.id).unwrap().as_deref(),
+            Some(pinned.as_str())
+        );
+        kill_daemon(&h.home);
+    }
+
+    {
+        let h = setup_agent("blocking");
+        let (db, run) = park_with_blocking_floor(&h, "feat-pin-weaken");
+        set_home_engine(&h.home, "quality");
+        let _ = respond_fix(&h, &run.id, &[]);
+        assert_shape_mismatch(&db, &run, "floor+judgment", "floor-only");
+        kill_daemon(&h.home);
+    }
+
+    {
+        let h = setup_quality("blocking");
+        let (db, run) = park_with_blocking_floor(&h, "feat-pin-strengthen");
+        set_home_engine(&h.home, "agent");
+        let agent = install_fake_claude(&h.install);
+        let extra = [(REVIEW_AGENT_BIN_ENV, agent.as_os_str())];
+        let _ = respond_fix(&h, &run.id, &extra);
+        assert_shape_mismatch(&db, &run, "floor-only", "floor+judgment");
+        kill_daemon(&h.home);
+    }
+}
+
+#[test]
+fn changed_producer_artifact_is_a_mismatch_when_configuration_is_unchanged() {
+    let h = setup_agent("blocking");
+    let (db, run) = park_with_blocking_floor(&h, "feat-pin-artifact");
+    let floor = h
+        .install
+        .join(format!("porch-quality{}", std::env::consts::EXE_SUFFIX));
+    let mut body = fs::read(&floor).unwrap();
+    body.push(b'x');
+    fs::write(&floor, body).unwrap();
+    chmod_755(&floor);
+    let _ = respond_fix(&h, &run.id, &[]);
+    assert_shape_mismatch(&db, &run, "floor+judgment", "floor+judgment");
+    kill_daemon(&h.home);
+}
+
+#[test]
+fn missing_judgment_is_incomplete_not_a_floor_only_round() {
+    let h = setup_agent("clean");
+    let agent = h.fake_agent.as_ref().expect("agent bin");
+    fs::remove_file(agent).unwrap();
+    push_branch(&h.work, &h.home, "feat-missing-judgment");
+
+    let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&h.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed", "completed"],
+        Duration::from_secs(20),
+    );
+    assert_failed_closed(&db, &run);
+    let rounds = rounds::rounds_for_run(&db, &run.id).unwrap();
+    assert_eq!(rounds.len(), 1, "expected one round, got {rounds:?}");
+    let round = &rounds[0];
+    assert_eq!(round.execution, ExecutionState::Finished);
+    assert_eq!(round.assurance_completion, AssuranceCompletion::Incomplete);
+    let reqs = rounds::requirements_for_round(&db, &round.id).unwrap();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "missing judgment must not collapse to floor-only, got {reqs:?}"
+    );
+    assert_eq!(reqs[0].role, Role::Floor);
+    assert_eq!(reqs[0].resolution, Resolution::Resolved);
+    assert_eq!(reqs[1].role, Role::Judgment);
+    assert_eq!(reqs[1].resolution, Resolution::Unresolved);
+    assert!(reqs[1].producer_invocation_id.is_none());
+    assert!(
+        reqs[1]
+            .reason
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty()),
+        "unresolved judgment must carry a reason, got {:?}",
+        reqs[1].reason
+    );
+    let order = fs::read_to_string(h.home.join("producer-order")).unwrap_or_default();
+    assert!(
+        !order.lines().any(|l| l == "judgment-start"),
+        "missing judgment must not spawn, order={order}"
+    );
     kill_daemon(&h.home);
 }

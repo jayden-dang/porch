@@ -144,6 +144,7 @@ impl Db {
         )?;
         ensure_column(&conn, "runs", "trusted_config_sha", "TEXT")?;
         ensure_column(&conn, "runs", "pr_title_written", "TEXT")?;
+        ensure_column(&conn, "runs", "required_set_digest", "TEXT")?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (

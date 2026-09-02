@@ -11,6 +11,7 @@ pub use applicability::{
 };
 pub use requirements::{
     RequirementRow, RequirementSpec, Resolution, Role, required_set_digest, requirements_for_round,
+    run_required_set_digest,
 };
 
 use std::cell::Cell;
@@ -581,6 +582,11 @@ pub fn open_round(db: &Db, plan: &OpenRoundPlan, bindings: &RoundBindings) -> Re
     insert_review_round(&tx, &round_id, ordinal, plan, bindings)?;
     let producer_ids = insert_producers(&tx, &round_id, plan)?;
     requirements::insert_requirements(&tx, &round_id, &plan.requirements, &producer_ids)?;
+    requirements::pin_run_required_set(
+        &tx,
+        &plan.run_id,
+        &requirements::digest_for_specs(bindings.protocol_schema_version, &plan.requirements),
+    )?;
     insert_context_rows(&tx, &round_id, &elements, &producer_ids, bindings)?;
 
     tx.commit()?;

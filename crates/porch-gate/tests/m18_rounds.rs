@@ -12,7 +12,7 @@ use porch_gate::rounds::{
     RequirementRow, RequirementSpec, Resolution, Role, RoundBindings, RoundCoverageProposal,
     SNAPSHOT_CEILING_BYTES, STALE_REVISION_RETRIES, SnapshotState, SourceState, applicable_round,
     applicable_round_for_run, capture_context_element, context_applicability_digest,
-    descriptor_equivalence_digest, required_set_digest, sha256_hex,
+    descriptor_equivalence_digest, required_set_digest, run_required_set_digest, sha256_hex,
 };
 use porch_gate::{Db, Error};
 use porch_git::GitDir;
@@ -2195,5 +2195,92 @@ fn required_set_digest_tracks_role_resolution_and_expected_digest_not_reason() {
     assert_eq!(
         forward, reversed,
         "slots contribute in ascending requirement_slot order"
+    );
+}
+
+#[test]
+fn first_round_pins_the_assurance_contract_in_the_same_transaction() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-run-pin\n";
+    let bindings = sample_bindings(inventory);
+
+    let mut plan = sample_plan(&run_id);
+    plan.requirements = vec![resolved_floor_spec("equiv-digest-1")];
+    let round_id = rounds::open_round(&db, &plan, &bindings).unwrap();
+    let recorded = rounds::requirements_for_round(&db, &round_id).unwrap();
+    let expected = required_set_digest(bindings.protocol_schema_version, &recorded);
+    assert_eq!(
+        run_required_set_digest(&db, &run_id).unwrap().as_deref(),
+        Some(expected.as_str()),
+        "the first round must pin the required-set digest"
+    );
+
+    let run_fail = seed_run(&db, home);
+    let mut fail_plan = sample_plan(&run_fail);
+    fail_plan.requirements = vec![resolved_floor_spec("equiv-digest-1")];
+    let mut fail_bindings = sample_bindings(inventory);
+    fail_bindings.context_applications[0].effective_digest = None;
+    let err = rounds::open_round(&db, &fail_plan, &fail_bindings).unwrap_err();
+    match err {
+        Error::Sqlite(_) | Error::Other(_) => {}
+        other => panic!("expected a later constraint failure, got {other:?}"),
+    }
+    assert!(
+        rounds::rounds_for_run(&db, &run_fail).unwrap().is_empty(),
+        "a refused open must not leave a round"
+    );
+    assert_eq!(
+        run_required_set_digest(&db, &run_fail).unwrap(),
+        None,
+        "a refused open must not pin the run"
+    );
+}
+
+#[test]
+fn later_round_must_keep_the_pinned_required_set() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let bindings = sample_bindings(b"inv-pin-match\n");
+
+    let mut first = sample_plan(&run_id);
+    first.requirements = vec![resolved_floor_spec("equiv-digest-1")];
+    let first_id = rounds::open_round(&db, &first, &bindings).unwrap();
+    let pinned = run_required_set_digest(&db, &run_id)
+        .unwrap()
+        .expect("first round pins the run");
+
+    let mut matching = sample_plan(&run_id);
+    matching.requirements = vec![resolved_floor_spec("equiv-digest-1")];
+    let second_id = rounds::open_round(&db, &matching, &bindings)
+        .expect("a later round with the same required set must open");
+    assert_ne!(first_id.as_str(), second_id.as_str());
+    assert_eq!(
+        run_required_set_digest(&db, &run_id).unwrap().as_deref(),
+        Some(pinned.as_str()),
+        "a matching later round must not re-pin"
+    );
+
+    let mut different = sample_plan(&run_id);
+    different.requirements = vec![resolved_floor_spec("equiv-digest-other")];
+    let err = rounds::open_round(&db, &different, &bindings).unwrap_err();
+    match err {
+        Error::Sqlite(_) | Error::Other(_) => {}
+        other => panic!("expected a pin mismatch to refuse open, got {other:?}"),
+    }
+    let rounds = rounds::rounds_for_run(&db, &run_id).unwrap();
+    assert_eq!(
+        rounds.len(),
+        2,
+        "a mismatched open must not create a round, got {rounds:?}"
+    );
+    assert_eq!(
+        run_required_set_digest(&db, &run_id).unwrap().as_deref(),
+        Some(pinned.as_str()),
+        "a mismatched open must not re-pin"
     );
 }

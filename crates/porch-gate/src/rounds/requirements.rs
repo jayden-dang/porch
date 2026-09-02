@@ -101,6 +101,65 @@ pub fn required_set_digest(protocol_version: i64, rows: &[RequirementRow]) -> St
     super::sha256_hex(&super::length_delimited_join(&parts))
 }
 
+#[must_use]
+pub(super) fn digest_for_specs(protocol_version: i64, specs: &[RequirementSpec]) -> String {
+    let rows: Vec<RequirementRow> = specs
+        .iter()
+        .map(|spec| RequirementRow {
+            slot: spec.slot,
+            role: spec.role,
+            resolution: spec.resolution,
+            expected_equivalence_digest: spec.expected_equivalence_digest.clone(),
+            producer_invocation_id: None,
+            reason: spec.reason.clone(),
+        })
+        .collect();
+    required_set_digest(protocol_version, &rows)
+}
+
+/// The run's pinned required-set digest, if the first round has opened.
+///
+/// # Errors
+///
+/// Returns a storage error if the query fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn run_required_set_digest(db: &Db, run_id: &str) -> Result<Option<String>> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare("SELECT required_set_digest FROM runs WHERE id = ?1")?;
+    let mut rows = stmt.query([run_id])?;
+    match rows.next()? {
+        Some(row) => Ok(row.get(0)?),
+        None => Ok(None),
+    }
+}
+
+pub(super) fn pin_run_required_set(tx: &Transaction<'_>, run_id: &str, digest: &str) -> Result<()> {
+    let updated = tx.execute(
+        "UPDATE runs SET required_set_digest = ?1 WHERE id = ?2 AND required_set_digest IS NULL",
+        rusqlite::params![digest, run_id],
+    )?;
+    if updated == 1 {
+        return Ok(());
+    }
+    let existing: Option<String> = tx.query_row(
+        "SELECT required_set_digest FROM runs WHERE id = ?1",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    match existing {
+        Some(pin) if pin == digest => Ok(()),
+        Some(_) => Err(crate::Error::Other(
+            "required-set digest does not match the run pin".into(),
+        )),
+        None => Err(crate::Error::Other(
+            "cannot pin a required-set digest on a missing run".into(),
+        )),
+    }
+}
+
 /// Load the required producer set recorded for `round_id`, ordered by slot.
 ///
 /// # Errors
