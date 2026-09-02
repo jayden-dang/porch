@@ -124,5 +124,60 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     )?;
     conn.execute_batch(ROUND_DDL)?;
     ensure_column(conn, "review_rounds", "intent_source", "TEXT")?;
+    rebuild_context_elements_without_snapshot_blob_fk(conn)?;
+    Ok(())
+}
+
+fn snapshot_digest_fk_targets_blobs(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_list('round_context_elements')")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let table: String = row.get(2)?;
+        let from: String = row.get(3)?;
+        if from == "snapshot_digest" && table == "content_blobs" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn rebuild_context_elements_without_snapshot_blob_fk(conn: &Connection) -> Result<()> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'round_context_elements'",
+        [],
+        |row| row.get(0),
+    )?;
+    if exists == 0 || !snapshot_digest_fk_targets_blobs(conn)? {
+        return Ok(());
+    }
+
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    conn.execute_batch(
+        "
+        CREATE TABLE round_context_elements__new (
+            round_id TEXT NOT NULL REFERENCES review_rounds(id) ON DELETE CASCADE,
+            element_name TEXT NOT NULL,
+            source_state TEXT NOT NULL
+                CHECK (source_state IN ('absent','present','unreadable')),
+            source_reason TEXT,
+            snapshot_state TEXT NOT NULL CHECK (snapshot_state IN ('stored','omitted')),
+            snapshot_reason TEXT,
+            snapshot_digest TEXT,
+            PRIMARY KEY (round_id, element_name)
+        );
+        INSERT INTO round_context_elements__new (
+            round_id, element_name, source_state, source_reason,
+            snapshot_state, snapshot_reason, snapshot_digest
+        )
+        SELECT
+            round_id, element_name, source_state, source_reason,
+            snapshot_state, snapshot_reason, snapshot_digest
+        FROM round_context_elements;
+        DROP TABLE round_context_elements;
+        ALTER TABLE round_context_elements__new RENAME TO round_context_elements;
+        ",
+    )?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
 }

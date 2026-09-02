@@ -4,9 +4,9 @@ use std::path::Path;
 
 use porch_gate::db_path;
 use porch_gate::rounds::{
-    self, AssuranceCompletion, ContextApplication, ContextSource, ExecutionState, OpenRoundPlan,
-    ProducerInvocation, RoundBindings, SNAPSHOT_CEILING_BYTES, SnapshotState, SourceState,
-    capture_context_element, context_applicability_digest, sha256_hex,
+    self, AssuranceCompletion, ContextApplication, ContextElement, ContextSource, ExecutionState,
+    OpenRoundPlan, ProducerInvocation, RoundBindings, SNAPSHOT_CEILING_BYTES, SnapshotState,
+    SourceState, capture_context_element, context_applicability_digest, sha256_hex,
 };
 use porch_gate::{Db, Error};
 use rusqlite::Connection;
@@ -499,4 +499,208 @@ fn unsupplied_context_element_is_not_applied_without_effective_digest() {
         rounds::ContextApplicationState::NotApplied
     );
     assert_eq!(by_element["path_instructions"].effective_digest, None);
+}
+
+fn seed_task1_round_schema_with_snapshot_blob_fk(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE repos (
+            id TEXT PRIMARY KEY,
+            worktree_path TEXT NOT NULL,
+            bare_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            default_branch TEXT NOT NULL DEFAULT 'main'
+        );
+        CREATE TABLE runs (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            sha TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(repo_id) REFERENCES repos(id)
+        );
+        CREATE TABLE content_blobs (
+            digest TEXT PRIMARY KEY,
+            byte_length INTEGER NOT NULL,
+            bytes BLOB NOT NULL,
+            CHECK (byte_length = length(bytes))
+        );
+        CREATE TABLE review_rounds (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            from_sha TEXT NOT NULL,
+            to_sha TEXT NOT NULL,
+            inventory_digest TEXT NOT NULL REFERENCES content_blobs(digest),
+            execution TEXT NOT NULL CHECK (execution IN ('running','finished','interrupted')),
+            assurance_completion TEXT NOT NULL
+                CHECK (assurance_completion IN ('pending','complete','incomplete')),
+            completion_reason TEXT,
+            trusted_config_sha TEXT NOT NULL,
+            protocol_schema_version INTEGER NOT NULL,
+            fingerprint_version INTEGER NOT NULL,
+            opened_at TEXT NOT NULL,
+            finalized_at TEXT,
+            UNIQUE (run_id, ordinal)
+        );
+        CREATE TABLE round_producers (
+            id TEXT PRIMARY KEY,
+            round_id TEXT NOT NULL REFERENCES review_rounds(id) ON DELETE CASCADE,
+            slot INTEGER NOT NULL,
+            descriptor_json TEXT NOT NULL,
+            descriptor_equivalence_digest TEXT NOT NULL,
+            UNIQUE (round_id, slot),
+            UNIQUE (round_id, id)
+        );
+        CREATE TABLE round_context_elements (
+            round_id TEXT NOT NULL REFERENCES review_rounds(id) ON DELETE CASCADE,
+            element_name TEXT NOT NULL,
+            source_state TEXT NOT NULL
+                CHECK (source_state IN ('absent','present','unreadable')),
+            source_reason TEXT,
+            snapshot_state TEXT NOT NULL CHECK (snapshot_state IN ('stored','omitted')),
+            snapshot_reason TEXT,
+            snapshot_digest TEXT REFERENCES content_blobs(digest),
+            PRIMARY KEY (round_id, element_name)
+        );
+        CREATE TABLE round_context_applications (
+            round_id TEXT NOT NULL,
+            element_name TEXT NOT NULL,
+            producer_invocation_id TEXT NOT NULL,
+            application TEXT NOT NULL CHECK (application IN ('applied','not_applied')),
+            effective_digest TEXT,
+            PRIMARY KEY (round_id, element_name, producer_invocation_id),
+            FOREIGN KEY (round_id, element_name)
+                REFERENCES round_context_elements(round_id, element_name) ON DELETE CASCADE,
+            FOREIGN KEY (round_id, producer_invocation_id)
+                REFERENCES round_producers(round_id, id) ON DELETE CASCADE,
+            CHECK ((application = 'applied') = (effective_digest IS NOT NULL))
+        );
+        ",
+    )
+    .unwrap();
+
+    let fk_present = {
+        let mut stmt = conn
+            .prepare("PRAGMA foreign_key_list('round_context_elements')")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut found = false;
+        while let Some(row) = rows.next().unwrap() {
+            let table: String = row.get(2).unwrap();
+            let from: String = row.get(3).unwrap();
+            if from == "snapshot_digest" && table == "content_blobs" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    assert!(
+        fk_present,
+        "precondition: Task-1 schema must reference content_blobs from snapshot_digest"
+    );
+}
+
+#[test]
+fn migrate_clears_task1_snapshot_digest_fk_so_oversized_omit_commits() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home).unwrap();
+    let path = db_path(home);
+    seed_task1_round_schema_with_snapshot_blob_fk(&path);
+
+    let db = Db::open(&path).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let fk_remaining = {
+        let mut stmt = conn
+            .prepare("PRAGMA foreign_key_list('round_context_elements')")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut found = false;
+        while let Some(row) = rows.next().unwrap() {
+            let table: String = row.get(2).unwrap();
+            let from: String = row.get(3).unwrap();
+            if from == "snapshot_digest" && table == "content_blobs" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    assert!(
+        !fk_remaining,
+        "migrate must drop snapshot_digest → content_blobs FK"
+    );
+
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-task1-migrate\n";
+    let oversized = vec![b'y'; SNAPSHOT_CEILING_BYTES + 1];
+    let digest = sha256_hex(&oversized);
+
+    let mut bindings = sample_bindings(inventory);
+    bindings.context_elements = vec![capture_context_element(
+        "intent",
+        ContextSource::Present {
+            bytes: oversized.clone(),
+        },
+    )];
+    bindings.context_applications = vec![ContextApplication {
+        element_name: "intent".into(),
+        producer_slot: 0,
+        application: rounds::ContextApplicationState::Applied,
+        effective_digest: Some(context_applicability_digest(
+            "intent", "present", &oversized,
+        )),
+    }];
+
+    let round_id = rounds::open_round(&db, &sample_plan(&run_id), &bindings)
+        .expect("oversized omit must commit after FK rebuild");
+    let elements = rounds::context_elements_for_round(&db, &round_id).unwrap();
+    assert_eq!(elements[0].snapshot_state, SnapshotState::Omitted);
+    assert_eq!(
+        elements[0].snapshot_digest.as_deref(),
+        Some(digest.as_str())
+    );
+    assert!(elements[0].snapshot_bytes.is_none());
+}
+
+#[test]
+fn stored_context_snapshot_without_bytes_is_refused() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-stored-incomplete\n";
+    let digest = sha256_hex(b"ghost");
+
+    let mut bindings = sample_bindings(inventory);
+    bindings.context_elements = vec![ContextElement {
+        element_name: "intent".into(),
+        source_state: SourceState::Present,
+        source_reason: None,
+        snapshot_state: SnapshotState::Stored,
+        snapshot_reason: None,
+        snapshot_digest: Some(digest),
+        snapshot_bytes: None,
+    }];
+    bindings.context_applications = vec![ContextApplication {
+        element_name: "intent".into(),
+        producer_slot: 0,
+        application: rounds::ContextApplicationState::NotApplied,
+        effective_digest: None,
+    }];
+
+    let err = rounds::open_round(&db, &sample_plan(&run_id), &bindings).unwrap_err();
+    match err {
+        Error::Other(msg) => assert!(
+            msg.contains("stored") && msg.contains("bytes"),
+            "unexpected message: {msg}"
+        ),
+        other => panic!("expected refuse, got {other:?}"),
+    }
+    assert!(rounds::rounds_for_run(&db, &run_id).unwrap().is_empty());
 }

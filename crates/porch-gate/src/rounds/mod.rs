@@ -408,10 +408,15 @@ pub fn open_round(db: &Db, plan: &OpenRoundPlan, bindings: &RoundBindings) -> Re
 
 fn ensure_stored_snapshots(tx: &Transaction<'_>, elements: &[ContextElement]) -> Result<()> {
     for element in elements {
-        if element.snapshot_state == SnapshotState::Stored {
-            if let (Some(digest), Some(bytes)) = (&element.snapshot_digest, &element.snapshot_bytes)
-            {
-                ensure_blob(tx, digest, bytes)?;
+        if element.snapshot_state != SnapshotState::Stored {
+            continue;
+        }
+        match (&element.snapshot_digest, &element.snapshot_bytes) {
+            (Some(digest), Some(bytes)) => ensure_blob(tx, digest, bytes)?,
+            _ => {
+                return Err(Error::Other(
+                    "stored context snapshot requires both digest and bytes".into(),
+                ));
             }
         }
     }
