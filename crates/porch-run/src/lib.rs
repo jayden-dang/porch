@@ -421,6 +421,7 @@ fn open_review_round(
             descriptor_equivalence_digest: producer_equivalence_digest(&prepared.plan.descriptor),
             descriptor_json,
         }],
+        requirements: vec![],
     };
 
     let round_id = rounds::open_round(db, &open_plan, &bindings).map_err(|e| {

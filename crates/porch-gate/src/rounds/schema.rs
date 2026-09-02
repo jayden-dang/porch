@@ -113,6 +113,29 @@ CREATE INDEX IF NOT EXISTS finding_instances_fp
     ON finding_instances(fingerprint, fingerprint_version);
 CREATE INDEX IF NOT EXISTS finding_instances_round
     ON finding_instances(round_id);
+
+CREATE TABLE IF NOT EXISTS round_required_producers (
+    round_id TEXT NOT NULL REFERENCES review_rounds(id) ON DELETE CASCADE,
+    requirement_slot INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('floor','judgment')),
+    resolution TEXT NOT NULL CHECK (resolution IN ('resolved','unresolved')),
+    expected_equivalence_digest TEXT,
+    producer_invocation_id TEXT,
+    resolution_reason TEXT,
+    PRIMARY KEY (round_id, requirement_slot),
+    FOREIGN KEY (round_id, producer_invocation_id)
+        REFERENCES round_producers(round_id, id),
+    CHECK (
+        (resolution = 'resolved'
+            AND expected_equivalence_digest IS NOT NULL
+            AND producer_invocation_id IS NOT NULL)
+     OR (resolution = 'unresolved'
+            AND expected_equivalence_digest IS NULL
+            AND producer_invocation_id IS NULL
+            AND resolution_reason IS NOT NULL
+            AND length(trim(resolution_reason)) > 0)
+    )
+);
 ";
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {

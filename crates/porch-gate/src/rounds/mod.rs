@@ -1,12 +1,16 @@
 //! Durable review-round store.
 
 mod applicability;
+mod requirements;
 pub mod retention;
 mod schema;
 
 pub use applicability::{
     Applicability, EquivalenceInput, ObservedVersionForEquivalence, applicable_round,
     applicable_round_for_run, descriptor_equivalence_digest,
+};
+pub use requirements::{
+    RequirementRow, RequirementSpec, Resolution, Role, required_set_digest, requirements_for_round,
 };
 
 use std::cell::Cell;
@@ -318,6 +322,7 @@ pub struct ProducerInvocation {
 pub struct OpenRoundPlan {
     pub run_id: String,
     pub producers: Vec<ProducerInvocation>,
+    pub requirements: Vec<RequirementSpec>,
 }
 
 /// Review-context element binding captured at open.
@@ -575,6 +580,7 @@ pub fn open_round(db: &Db, plan: &OpenRoundPlan, bindings: &RoundBindings) -> Re
     let round_id = Ulid::new().to_string();
     insert_review_round(&tx, &round_id, ordinal, plan, bindings)?;
     let producer_ids = insert_producers(&tx, &round_id, plan)?;
+    requirements::insert_requirements(&tx, &round_id, &plan.requirements, &producer_ids)?;
     insert_context_rows(&tx, &round_id, &elements, &producer_ids, bindings)?;
 
     tx.commit()?;

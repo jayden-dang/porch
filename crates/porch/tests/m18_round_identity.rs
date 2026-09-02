@@ -839,6 +839,7 @@ fn open_stale_round(db: &Db, run_id: &str) -> rounds::RoundId {
             descriptor_json: r#"{"adapter_kind":"porch_json_cli"}"#.into(),
             descriptor_equivalence_digest: "equiv-stale".into(),
         }],
+        requirements: vec![],
     };
     let bindings = RoundBindings {
         from_sha: "from".into(),

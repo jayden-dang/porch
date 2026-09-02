@@ -9,9 +9,10 @@ use porch_gate::rounds::{
     self, Applicability, AssuranceCompletion, ContextApplication, ContextElement, ContextSource,
     CoverageState, EquivalenceInput, ExecutionState, FinalizeOutcome, FinalizeProposal,
     FindingInstanceProposal, ObservedVersionForEquivalence, OpenRoundPlan, ProducerInvocation,
-    RoundBindings, RoundCoverageProposal, SNAPSHOT_CEILING_BYTES, STALE_REVISION_RETRIES,
-    SnapshotState, SourceState, applicable_round, capture_context_element,
-    context_applicability_digest, descriptor_equivalence_digest, sha256_hex,
+    RequirementRow, RequirementSpec, Resolution, Role, RoundBindings, RoundCoverageProposal,
+    SNAPSHOT_CEILING_BYTES, STALE_REVISION_RETRIES, SnapshotState, SourceState, applicable_round,
+    capture_context_element, context_applicability_digest, descriptor_equivalence_digest,
+    required_set_digest, sha256_hex,
 };
 use porch_gate::{Db, Error};
 use porch_git::GitDir;
@@ -72,6 +73,7 @@ fn sample_plan(run_id: &str) -> OpenRoundPlan {
             .to_string(),
             descriptor_equivalence_digest: "equiv-digest-1".into(),
         }],
+        requirements: vec![],
     }
 }
 
@@ -132,6 +134,7 @@ fn opening_legacy_database_adds_round_tables_and_keeps_existing_rows() {
         "round_coverage",
         "finding_instances",
         "content_blobs",
+        "round_required_producers",
     ] {
         let exists: i64 = conn
             .query_row(
@@ -150,6 +153,15 @@ fn opening_legacy_database_adds_round_tables_and_keeps_existing_rows() {
         )
         .unwrap();
     assert_eq!(revision, 0);
+    let required: i64 = conn
+        .query_row("SELECT COUNT(*) FROM round_required_producers", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        required, 0,
+        "opening an existing database must not invent requirement rows"
+    );
 }
 
 fn sqlite_paths_under(root: &Path) -> Vec<std::path::PathBuf> {
@@ -1017,6 +1029,7 @@ fn plan_with_digests(run_id: &str, digests: &[&str]) -> OpenRoundPlan {
                 descriptor_equivalence_digest: (*digest).to_string(),
             })
             .collect(),
+        requirements: vec![],
     }
 }
 
@@ -1582,5 +1595,355 @@ fn removing_last_referencing_round_sweeps_ref_after_db_commit() {
     assert!(
         porch_git::rev_parse(&bare, &refname).is_err(),
         "last reference gone → config ref removed"
+    );
+}
+
+struct RequirementInsert<'a> {
+    slot: i64,
+    role: &'a str,
+    resolution: &'a str,
+    digest: Option<&'a str>,
+    invocation: Option<&'a str>,
+    reason: Option<&'a str>,
+}
+
+fn insert_requirement_row(
+    conn: &Connection,
+    round_id: &str,
+    row: &RequirementInsert<'_>,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO round_required_producers (
+            round_id, requirement_slot, role, resolution,
+            expected_equivalence_digest, producer_invocation_id, resolution_reason
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            round_id,
+            row.slot,
+            row.role,
+            row.resolution,
+            row.digest,
+            row.invocation,
+            row.reason
+        ],
+    )
+}
+
+fn assert_constraint_rejected(result: rusqlite::Result<usize>, detail: &str) {
+    match result {
+        Err(rusqlite::Error::SqliteFailure(err, msg)) => {
+            assert_eq!(
+                err.code,
+                rusqlite::ErrorCode::ConstraintViolation,
+                "{detail}: expected a table constraint, got {err:?} {msg:?}"
+            );
+        }
+        other => panic!("{detail}: expected a table constraint, got {other:?}"),
+    }
+}
+
+fn requirement_insert<'a>(
+    slot: i64,
+    role: &'a str,
+    resolution: &'a str,
+    digest: Option<&'a str>,
+    invocation: Option<&'a str>,
+    reason: Option<&'a str>,
+) -> RequirementInsert<'a> {
+    RequirementInsert {
+        slot,
+        role,
+        resolution,
+        digest,
+        invocation,
+        reason,
+    }
+}
+
+fn reject_requirement(
+    conn: &Connection,
+    round_id: &str,
+    row: &RequirementInsert<'_>,
+    detail: &str,
+) {
+    assert_constraint_rejected(insert_requirement_row(conn, round_id, row), detail);
+}
+
+fn assert_inconsistent_requirement_rows_rejected(
+    conn: &Connection,
+    round_id: &str,
+    invocation: &str,
+) {
+    let rejected = [
+        (
+            requirement_insert(10, "floor", "resolved", Some("equiv-digest-1"), None, None),
+            "resolved without an invocation reference",
+        ),
+        (
+            requirement_insert(11, "floor", "resolved", None, Some(invocation), None),
+            "resolved without an expected digest",
+        ),
+        (
+            requirement_insert(
+                12,
+                "floor",
+                "unresolved",
+                None,
+                Some(invocation),
+                Some("floor binary missing"),
+            ),
+            "unresolved carrying an invocation reference",
+        ),
+        (
+            requirement_insert(
+                13,
+                "floor",
+                "unresolved",
+                Some("equiv-digest-1"),
+                None,
+                Some("floor binary missing"),
+            ),
+            "unresolved carrying an expected digest",
+        ),
+        (
+            requirement_insert(14, "floor", "unresolved", None, None, None),
+            "unresolved without a reason",
+        ),
+        (
+            requirement_insert(15, "floor", "unresolved", None, None, Some("")),
+            "unresolved with a blank reason",
+        ),
+        (
+            requirement_insert(16, "floor", "unresolved", None, None, Some("   ")),
+            "unresolved with a whitespace-only reason",
+        ),
+    ];
+    for (row, detail) in &rejected {
+        reject_requirement(conn, round_id, row, detail);
+    }
+
+    insert_requirement_row(
+        conn,
+        round_id,
+        &requirement_insert(
+            20,
+            "floor",
+            "resolved",
+            Some("equiv-digest-1"),
+            Some(invocation),
+            None,
+        ),
+    )
+    .expect("resolved row with invocation and digest must be accepted");
+    insert_requirement_row(
+        conn,
+        round_id,
+        &requirement_insert(
+            21,
+            "judgment",
+            "unresolved",
+            None,
+            None,
+            Some("judgment not selected"),
+        ),
+    )
+    .expect("unresolved row with a non-empty reason must be accepted");
+}
+
+#[test]
+fn table_rejects_inconsistent_requirement_rows() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let round_id = rounds::open_round(
+        &db,
+        &sample_plan(&run_id),
+        &sample_bindings(b"inv-req-check\n"),
+    )
+    .unwrap();
+    let producer = producer_id(&db, &round_id);
+
+    let conn = Connection::open(db_path(home)).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    assert_inconsistent_requirement_rows_rejected(&conn, round_id.as_str(), producer.as_str());
+}
+
+fn resolved_floor_spec(digest: &str) -> RequirementSpec {
+    RequirementSpec {
+        slot: 0,
+        role: Role::Floor,
+        resolution: Resolution::Resolved,
+        expected_equivalence_digest: Some(digest.to_string()),
+        reason: None,
+    }
+}
+
+#[test]
+fn open_round_records_requirements_in_the_same_transaction() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-req-open\n";
+
+    let mut plan = sample_plan(&run_id);
+    plan.requirements = vec![resolved_floor_spec("equiv-digest-1")];
+    let round_id = rounds::open_round(&db, &plan, &sample_bindings(inventory)).unwrap();
+    let producer = producer_id(&db, &round_id);
+    let recorded = rounds::requirements_for_round(&db, &round_id).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].slot, 0);
+    assert_eq!(recorded[0].role, Role::Floor);
+    assert_eq!(recorded[0].resolution, Resolution::Resolved);
+    assert_eq!(
+        recorded[0].expected_equivalence_digest.as_deref(),
+        Some("equiv-digest-1")
+    );
+    assert_eq!(
+        recorded[0].producer_invocation_id.as_deref(),
+        Some(producer.as_str())
+    );
+    assert_eq!(recorded[0].reason, None);
+
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+    rounds::finalize_round(&db, &round_id, &sample_complete_proposal(&producer), rev).unwrap();
+    let after_finalize = rounds::requirements_for_round(&db, &round_id).unwrap();
+    assert_eq!(
+        after_finalize, recorded,
+        "finalization must not rewrite the required set"
+    );
+
+    let run_fail = seed_run(&db, home);
+    let mut bad_plan = sample_plan(&run_fail);
+    bad_plan.requirements = vec![RequirementSpec {
+        slot: 0,
+        role: Role::Floor,
+        resolution: Resolution::Resolved,
+        expected_equivalence_digest: None,
+        reason: None,
+    }];
+    let err = rounds::open_round(&db, &bad_plan, &sample_bindings(inventory)).unwrap_err();
+    match err {
+        Error::Sqlite(_) | Error::Other(_) => {}
+        other => panic!("expected open to refuse an inconsistent requirement, got {other:?}"),
+    }
+    assert!(
+        rounds::rounds_for_run(&db, &run_fail).unwrap().is_empty(),
+        "a refused open must not leave a round"
+    );
+    let conn = Connection::open(db_path(home)).unwrap();
+    let leftover: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM round_required_producers rp
+             JOIN review_rounds r ON r.id = rp.round_id
+             WHERE r.run_id = ?1",
+            [&run_fail],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        leftover, 0,
+        "a refused open must not leave requirement rows"
+    );
+
+    let run_later = seed_run(&db, home);
+    let mut later_plan = sample_plan(&run_later);
+    later_plan.requirements = vec![resolved_floor_spec("equiv-digest-1")];
+    let mut later_bindings = sample_bindings(inventory);
+    later_bindings.context_applications[0].effective_digest = None;
+    let later_err = rounds::open_round(&db, &later_plan, &later_bindings).unwrap_err();
+    match later_err {
+        Error::Sqlite(_) | Error::Other(_) => {}
+        other => panic!("expected a later constraint failure, got {other:?}"),
+    }
+    assert!(rounds::rounds_for_run(&db, &run_later).unwrap().is_empty());
+    let leftover_later: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM round_required_producers rp
+             JOIN review_rounds r ON r.id = rp.round_id
+             WHERE r.run_id = ?1",
+            [&run_later],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(leftover_later, 0);
+}
+
+fn sample_requirement_row(reason: Option<&str>) -> RequirementRow {
+    RequirementRow {
+        slot: 0,
+        role: Role::Floor,
+        resolution: Resolution::Resolved,
+        expected_equivalence_digest: Some("equiv-a".into()),
+        producer_invocation_id: Some("inv-a".into()),
+        reason: reason.map(str::to_string),
+    }
+}
+
+#[test]
+fn required_set_digest_tracks_role_resolution_and_expected_digest_not_reason() {
+    let base = sample_requirement_row(Some("daemon cannot spawn floor"));
+    let protocol = 2;
+
+    let baseline = required_set_digest(protocol, std::slice::from_ref(&base));
+
+    let mut role_changed = base.clone();
+    role_changed.role = Role::Judgment;
+    assert_ne!(
+        required_set_digest(protocol, &[role_changed]),
+        baseline,
+        "role is part of required-set identity"
+    );
+
+    let mut resolution_changed = base.clone();
+    resolution_changed.resolution = Resolution::Unresolved;
+    resolution_changed.expected_equivalence_digest = None;
+    resolution_changed.producer_invocation_id = None;
+    assert_ne!(
+        required_set_digest(protocol, &[resolution_changed]),
+        baseline,
+        "resolution is part of required-set identity"
+    );
+
+    let mut digest_changed = base.clone();
+    digest_changed.expected_equivalence_digest = Some("equiv-b".into());
+    assert_ne!(
+        required_set_digest(protocol, &[digest_changed]),
+        baseline,
+        "expected digest is part of required-set identity"
+    );
+
+    let reason_changed = sample_requirement_row(Some("different diagnostic text"));
+    assert_eq!(
+        required_set_digest(protocol, &[reason_changed]),
+        baseline,
+        "resolution reason must not perturb required-set identity"
+    );
+    assert_eq!(
+        required_set_digest(protocol, &[sample_requirement_row(None)]),
+        baseline,
+        "absent reason must not perturb required-set identity"
+    );
+
+    assert_ne!(
+        required_set_digest(1, std::slice::from_ref(&base)),
+        baseline,
+        "protocol version is part of required-set identity"
+    );
+
+    let judgment = RequirementRow {
+        slot: 1,
+        role: Role::Judgment,
+        resolution: Resolution::Resolved,
+        expected_equivalence_digest: Some("equiv-j".into()),
+        producer_invocation_id: Some("inv-j".into()),
+        reason: None,
+    };
+    let forward = required_set_digest(protocol, &[base.clone(), judgment.clone()]);
+    let reversed = required_set_digest(protocol, &[judgment, base]);
+    assert_eq!(
+        forward, reversed,
+        "slots contribute in ascending requirement_slot order"
     );
 }
