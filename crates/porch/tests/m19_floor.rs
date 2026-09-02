@@ -532,6 +532,82 @@ fn park_with_blocking_floor(h: &Harness, branch: &str) -> (Db, porch_gate::RunRo
     (db, run)
 }
 
+fn push_named(h: &Harness, branch: &str, file: &str) {
+    fs::write(h.work.join(file), "boom\n").unwrap();
+    git(&h.work, &["add", file]);
+    git(&h.work, &["commit", "-m", file]);
+    let out = StdCommand::new("git")
+        .current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .args(["push", "porch", &format!("HEAD:refs/heads/{branch}")])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn wait_branch_status(
+    db: &Db,
+    repo_id: &str,
+    branch: &str,
+    want: &[&str],
+    timeout: Duration,
+) -> porch_gate::RunRow {
+    let start = Instant::now();
+    loop {
+        let runs = db.runs_for_repo(repo_id).unwrap();
+        if let Some(run) = runs.iter().rev().find(|r| r.branch == branch) {
+            if want.contains(&run.status.as_str()) {
+                return run.clone();
+            }
+        }
+        assert!(
+            start.elapsed() <= timeout,
+            "wanted {want:?} on {branch}, got {:?}",
+            db.runs_for_repo(repo_id).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn respond_verb(h: &Harness, run_id: &str, verb: &str) -> std::process::Output {
+    let mut cmd = StdCommand::new(&h.porch_bin);
+    cmd.current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .env("PATH", &h.path)
+        .env(FIXER_BIN_ENV, &h.fake_fixer)
+        .env(GH_BIN_ENV, &h.fake_gh)
+        .env_remove("PORCH_REVIEW_BIN")
+        .args(["agent", "respond", verb, "--run-id", run_id]);
+    if let Some(agent) = &h.fake_agent {
+        cmd.env(REVIEW_AGENT_BIN_ENV, agent);
+    } else {
+        cmd.env_remove(REVIEW_AGENT_BIN_ENV);
+    }
+    cmd.output().unwrap()
+}
+
+fn respond_json(out: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "respond json: {e}; exit={:?} stdout={} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+fn last_step<'a>(
+    steps: &'a [porch_gate::StepResultRow],
+    name: &str,
+) -> Option<&'a porch_gate::StepResultRow> {
+    steps.iter().rev().find(|s| s.step == name)
+}
+
 fn agent_status_json(h: &Harness, run_id: &str) -> serde_json::Value {
     let out = Command::cargo_bin("porch")
         .unwrap()
@@ -1325,6 +1401,194 @@ fn pin_mismatch_reports_both_shapes_and_setup_is_unchanged() {
         .args(["setup", "--verify"])
         .assert()
         .success();
+
+    kill_daemon(&h.home);
+}
+
+#[test]
+fn review_park_accepts_approve_fix_skip_and_abort() {
+    let h = setup_quality("blocking");
+    let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&h.work);
+
+    push_named(&h, "feat-abort", "abort.txt");
+    let run = wait_branch_status(
+        &db,
+        &repo_id,
+        "feat-abort",
+        &["parked"],
+        Duration::from_secs(30),
+    );
+    let out = respond_verb(&h, &run.id, "abort");
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "abort must not be a usage error: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let v = respond_json(&out);
+    assert_eq!(v["status"], "cancelled", "{v}");
+    assert_eq!(db.run_by_id(&run.id).unwrap().unwrap().status, "cancelled");
+
+    push_named(&h, "feat-skip", "skip.txt");
+    let run = wait_branch_status(
+        &db,
+        &repo_id,
+        "feat-skip",
+        &["parked"],
+        Duration::from_secs(30),
+    );
+    let out = respond_verb(&h, &run.id, "skip");
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let v = respond_json(&out);
+    assert_eq!(v["status"], "completed", "{v}");
+    assert!(
+        db.run_by_id(&run.id)
+            .unwrap()
+            .unwrap()
+            .review_approved_head_sha
+            .is_none()
+    );
+
+    push_named(&h, "feat-approve", "approve.txt");
+    let run = wait_branch_status(
+        &db,
+        &repo_id,
+        "feat-approve",
+        &["parked"],
+        Duration::from_secs(30),
+    );
+    let out = respond_verb(&h, &run.id, "approve");
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let v = respond_json(&out);
+    assert!(
+        v["review_approved_head_sha"]
+            .as_str()
+            .is_some_and(|s| s.len() >= 7),
+        "{v}"
+    );
+
+    push_named(&h, "feat-fix", "fix.txt");
+    let run = wait_branch_status(
+        &db,
+        &repo_id,
+        "feat-fix",
+        &["parked"],
+        Duration::from_secs(30),
+    );
+    let out = respond_verb(&h, &run.id, "fix");
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "fix failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    kill_daemon(&h.home);
+}
+
+#[test]
+fn compose_park_offers_respond_skip_and_abort_before_review_skip() {
+    let h = setup_quality("clean");
+    push_branch(&h.work, &h.home, "feat-compose-park");
+    let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&h.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed", "completed"],
+        Duration::from_secs(30),
+    );
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
+    assert!(
+        run.review_approved_head_sha
+            .as_ref()
+            .is_some_and(|s| !s.is_empty()),
+        "compose park follows a recorded review approval: {run:?}"
+    );
+
+    let status = agent_status_json(&h, &run.id);
+    assert_eq!(status["phase"], "compose", "{status}");
+    let actions = status["allowed_actions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let actions: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        actions,
+        ["respond", "skip", "abort"],
+        "compose park must offer only respond, skip, abort: {status}"
+    );
+
+    for verb in ["approve", "fix"] {
+        let out = respond_verb(&h, &run.id, verb);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "verb={verb} stdout={}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let v = respond_json(&out);
+        assert_eq!(v["code"], "usage", "verb={verb} {v}");
+    }
+    let still = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(still.status, "parked");
+
+    let out = respond_verb(&h, &run.id, "skip");
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.status.success(),
+        "compose skip failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("skipped"),
+        "steps={steps:?}"
+    );
+    assert_eq!(
+        last_step(&steps, "deliver").map(|s| s.status.as_str()),
+        Some("completed"),
+        "compose skip must continue deliver, not review-skip; steps={steps:?}"
+    );
+    assert_ne!(
+        last_step(&steps, "certify").map(|s| s.status.as_str()),
+        Some("skipped"),
+        "must not take the review skip path; steps={steps:?}"
+    );
+    assert_ne!(
+        last_step(&steps, "review").map(|s| s.status.as_str()),
+        Some("skipped"),
+        "must not take the review skip path; steps={steps:?}"
+    );
 
     kill_daemon(&h.home);
 }
