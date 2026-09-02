@@ -97,6 +97,7 @@ pub enum SelectionSource {
     HomeConfigAgent,
     PathDetection,
     DefaultPathName,
+    CanonicalSibling,
 }
 
 /// Requested vs absolute spawn target and wrapper argv prefix.
@@ -485,7 +486,7 @@ fn observe_wrapper_invocation(
     }
 }
 
-fn observe_opaque_entrypoint(
+pub(crate) fn observe_opaque_entrypoint(
     adapter: AdapterKind,
     entrypoint: &Path,
     argv_prefix: &[String],
@@ -628,7 +629,7 @@ fn context_digest(element_name: &str, effective_bytes: &[u8]) -> String {
     sha256_hex(&preimage)
 }
 
-fn stamp_path(path: &Path) -> Result<ArtifactStamp, std::io::Error> {
+pub(crate) fn stamp_path(path: &Path) -> Result<ArtifactStamp, std::io::Error> {
     let meta = fs::metadata(path)?;
     let bytes = fs::read(path)?;
     let (dev, ino, mtime_ns) = {
@@ -677,7 +678,7 @@ fn length_delimited_join(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_best_effort(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -685,7 +686,7 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     a == b
 }
 
-fn path_to_utf8(path: &Path) -> Result<String, Error> {
+pub(crate) fn path_to_utf8(path: &Path) -> Result<String, Error> {
     path.to_str()
         .map(str::to_string)
         .ok_or_else(|| Error::Msg(format!("non-utf8 path {}", path.display())))

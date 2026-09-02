@@ -6,6 +6,7 @@
 mod agent_review;
 mod coverage_state;
 mod engine;
+pub mod floor;
 mod home_config;
 mod identity;
 mod pathutil;
@@ -277,6 +278,8 @@ pub enum Error {
     PromptRefuse(String),
     #[error("producer artifact changed after plan resolution")]
     ProducerArtifactChanged,
+    #[error("floor unresolved: {reason}")]
+    FloorUnresolved { reason: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("{0}")]
