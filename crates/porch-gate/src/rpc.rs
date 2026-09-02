@@ -148,10 +148,7 @@ impl AssuranceRecord {
 }
 
 fn shape_from_requirements(rows: &[RequirementRow]) -> Option<String> {
-    if rows.is_empty() {
-        return None;
-    }
-    Some(rounds::assurance_shape(rows.iter().map(|row| row.role)).to_string())
+    rounds::assurance_shape_for_rows(rows).map(str::to_string)
 }
 
 impl Default for AssuranceRecord {

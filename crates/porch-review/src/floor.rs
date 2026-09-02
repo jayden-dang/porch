@@ -14,6 +14,18 @@ use crate::plan::{
 
 const FLOOR_EXECUTABLE_STEM: &str = "porch-quality";
 
+/// File name of the mandatory floor binary (`porch-quality` plus `EXE_SUFFIX`).
+#[must_use]
+pub fn executable_name() -> String {
+    format!("{FLOOR_EXECUTABLE_STEM}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Sibling path of `launch` (parent + [`executable_name`]), if `launch` has a parent.
+#[must_use]
+pub fn sibling_of(launch: &Path) -> Option<PathBuf> {
+    launch.parent().map(|parent| parent.join(executable_name()))
+}
+
 #[cfg(test)]
 thread_local! {
     static LAUNCH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
@@ -46,13 +58,12 @@ impl Drop for LaunchOverride {
 /// be established. Never searches `PATH`.
 pub fn resolve() -> Result<PreparedInvocation, Error> {
     let launch = crate::plan::canonicalize_best_effort(&launch_path()?);
-    let Some(parent) = launch.parent() else {
+    let Some(sibling) = sibling_of(&launch) else {
         return Err(unresolved(format!(
             "running executable {} has no parent directory",
             launch.display()
         )));
     };
-    let sibling = parent.join(floor_executable_name());
     if !is_executable(&sibling) {
         return Err(unresolved(format!(
             "canonical sibling {} is missing or not executable",
@@ -65,10 +76,6 @@ pub fn resolve() -> Result<PreparedInvocation, Error> {
 
 fn unresolved(reason: String) -> Error {
     Error::FloorUnresolved { reason }
-}
-
-fn floor_executable_name() -> String {
-    format!("{FLOOR_EXECUTABLE_STEM}{}", std::env::consts::EXE_SUFFIX)
 }
 
 fn launch_path() -> Result<PathBuf, Error> {
@@ -125,7 +132,7 @@ mod tests {
     use std::process::Command;
 
     fn quality_name() -> String {
-        format!("porch-quality{}", std::env::consts::EXE_SUFFIX)
+        super::executable_name()
     }
 
     fn install_exe(dir: &Path, name: &str, marker: &str) -> PathBuf {

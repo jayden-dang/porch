@@ -1,7 +1,9 @@
-//! External review CLI / coding-agent review adapter: spawn, parse JSON, map to findings.
+//! Review adapter: mandatory floor resolver, judgment CLI / coding-agent spawn,
+//! JSON parse, and map to findings.
 //!
 //! Also owns operator `$PORCH_HOME/config.yaml` load + review-engine setup
-//! (wrapper write/verify). Gate must not depend on this crate.
+//! (wrapper write/verify). The floor is a canonical `porch-quality` sibling of
+//! the running executable, never PATH. Gate must not depend on this crate.
 
 mod agent_review;
 mod coverage_state;

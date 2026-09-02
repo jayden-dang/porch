@@ -292,7 +292,7 @@ fn run_review_phase(
     let range = format!("{from_sha}..{head}");
     let changed = porch_git::diff_name_only(wt, &range)?;
 
-    let opened = open_review_round(db, home, bare, &run, run_id, &from_sha, &head, &changed)?;
+    let opened = open_review_round(db, home, bare, &run, &from_sha, &head, &changed)?;
     if let Some(UnsatisfiedRequired::Floor { reason }) = &opened.unsatisfied {
         finalize_incomplete(db, &opened.round_id, "floor_unresolved")?;
         return Err(RunError::Review(porch_review::Error::FloorUnresolved {
@@ -332,6 +332,7 @@ struct OpenedSlot {
     producer_invocation_id: String,
     artifact_dir: PathBuf,
     plan: porch_review::InvocationPlan,
+    role: Role,
 }
 
 enum UnsatisfiedRequired {
@@ -368,8 +369,13 @@ fn engine_is_quality(home: &Path) -> bool {
         == Some(EngineKind::Quality)
 }
 
+struct ComposedProducer {
+    role: Role,
+    invocation: PreparedInvocation,
+}
+
 enum ComposedRound {
-    Prepared(Vec<PreparedInvocation>),
+    Prepared(Vec<ComposedProducer>),
     FloorUnresolved {
         reason: String,
     },
@@ -387,7 +393,10 @@ fn compose_prepared_invocations(
     match porch_review::floor::resolve() {
         Ok(floor) => {
             if engine_is_quality(home) {
-                return ComposedRound::Prepared(vec![floor]);
+                return ComposedRound::Prepared(vec![ComposedProducer {
+                    role: Role::Floor,
+                    invocation: floor,
+                }]);
             }
             match prepare(&PrepareOpts {
                 porch_home: Some(home),
@@ -397,7 +406,16 @@ fn compose_prepared_invocations(
                 intent,
                 path_instructions,
             }) {
-                Ok(judgment) => ComposedRound::Prepared(vec![floor, judgment]),
+                Ok(judgment) => ComposedRound::Prepared(vec![
+                    ComposedProducer {
+                        role: Role::Floor,
+                        invocation: floor,
+                    },
+                    ComposedProducer {
+                        role: Role::Judgment,
+                        invocation: judgment,
+                    },
+                ]),
                 Err(e) => ComposedRound::JudgmentUnresolved {
                     floor: Box::new(floor),
                     reason: e.to_string(),
@@ -445,10 +463,29 @@ fn producer_invocation(desc: &ProducerDescriptor) -> Result<ProducerInvocation> 
 fn pinned_assurance_shape(db: &Db, run_id: &str) -> Result<&'static str> {
     let rounds = rounds::rounds_for_run(db, run_id)?;
     let Some(first) = rounds.first() else {
-        return Ok(rounds::assurance_shape(std::iter::empty()));
+        return Err(RunError::Msg(
+            "run pin exists without a recorded round to name the pinned assurance shape".into(),
+        ));
     };
     let rows = rounds::requirements_for_round(db, &first.id)?;
-    Ok(rounds::assurance_shape(rows.iter().map(|row| row.role)))
+    rounds::assurance_shape_for_rows(&rows).ok_or_else(|| {
+        RunError::Msg(
+            "run pin exists without recorded requirements to name the pinned assurance shape"
+                .into(),
+        )
+    })
+}
+
+fn recorded_role(requirements: &[RequirementSpec], producer_slot: i64) -> Result<Role> {
+    requirements
+        .iter()
+        .find(|spec| spec.slot == producer_slot && spec.resolution == Resolution::Resolved)
+        .map(|spec| spec.role)
+        .ok_or_else(|| {
+            RunError::Msg(format!(
+                "opened producer slot {producer_slot} has no recorded requirement role"
+            ))
+        })
 }
 
 fn refuse_shape_mismatch(
@@ -501,17 +538,17 @@ fn applications_for_prepared(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)] // compose, pin, and record one round before spawn
 fn open_review_round(
     db: &Db,
     home: &Path,
     bare: &GitDir,
     run: &RunRow,
-    run_id: &str,
     from_sha: &str,
     head: &str,
     changed: &[String],
 ) -> Result<OpenedRound> {
+    let run_id = run.id.as_str();
     let intent_bytes = run.intent.as_ref().map(|s| s.as_bytes().to_vec());
     let path_instructions_path = run_artifact_dir(home, run_id).join("path_instructions.json");
     let path_instructions_bytes = if path_instructions_path.is_file() {
@@ -558,8 +595,8 @@ fn open_review_round(
     let mut context_applications = Vec::new();
     match &composed {
         ComposedRound::Prepared(prepared) => {
-            for (slot, inv) in prepared.iter().enumerate() {
-                context_applications.extend(applications_for_prepared(slot, inv));
+            for (slot, producer) in prepared.iter().enumerate() {
+                context_applications.extend(applications_for_prepared(slot, &producer.invocation));
             }
         }
         ComposedRound::JudgmentUnresolved { floor, .. } => {
@@ -604,18 +641,24 @@ fn open_review_round(
                     unresolved_judgment_requirement(reason.clone()),
                 ],
             },
-            vec![*floor],
+            vec![ComposedProducer {
+                role: Role::Floor,
+                invocation: *floor,
+            }],
             Some(UnsatisfiedRequired::Judgment { reason }),
         ),
         ComposedRound::Prepared(prepared) => {
             let mut producers = Vec::with_capacity(prepared.len());
             let mut requirements = Vec::with_capacity(prepared.len());
-            for (i, inv) in prepared.iter().enumerate() {
+            for (i, producer) in prepared.iter().enumerate() {
                 let slot = i64::try_from(i)
                     .map_err(|_| RunError::Msg("producer slot exceeds i64".into()))?;
-                let role = if i == 0 { Role::Floor } else { Role::Judgment };
-                producers.push(producer_invocation(&inv.plan.descriptor)?);
-                requirements.push(resolved_requirement(slot, role, &inv.plan.descriptor));
+                producers.push(producer_invocation(&producer.invocation.plan.descriptor)?);
+                requirements.push(resolved_requirement(
+                    slot,
+                    producer.role,
+                    &producer.invocation.plan.descriptor,
+                ));
             }
             (
                 OpenRoundPlan {
@@ -666,13 +709,14 @@ fn open_review_round(
         ));
     }
     let mut slots = Vec::with_capacity(prepared.len());
-    for (inv, rec) in prepared.iter().zip(recorded) {
+    for (producer, rec) in prepared.iter().zip(recorded) {
         let artifact_dir = producer_artifact_dir(home, run_id, round_id.as_str(), &rec.id);
         std::fs::create_dir_all(&artifact_dir)?;
         slots.push(OpenedSlot {
             producer_invocation_id: rec.id,
             artifact_dir,
-            plan: inv.plan.clone(),
+            plan: producer.invocation.plan.clone(),
+            role: recorded_role(&open_plan.requirements, rec.slot)?,
         });
     }
     Ok(OpenedRound {
@@ -767,12 +811,8 @@ fn spawn_review_for_round(db: &Db, ctx: &SpawnReviewCtx<'_>) -> Result<SpawnedRe
     let mut coverage = Vec::new();
     let mut producer_durations = Vec::new();
     let review_started = Instant::now();
-    for (index, slot) in opened.slots.iter().enumerate() {
-        let role = if index == 0 {
-            Role::Floor
-        } else {
-            Role::Judgment
-        };
+    for slot in &opened.slots {
+        let role = slot.role;
         if let Err(e) = check_artifacts_stable(&slot.plan) {
             return abort_slot(db, &opened.round_id, e, role);
         }

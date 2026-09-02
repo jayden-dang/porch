@@ -7,7 +7,7 @@ use std::process::{Command, ExitCode};
 
 use porch_gate::{health_check, porch_home, socket_path};
 use porch_review::{
-    REVIEW_BIN_ENV, is_executable, load_home_config, resolve_bin, review_bin, which,
+    REVIEW_BIN_ENV, floor, is_executable, load_home_config, resolve_bin, review_bin, which,
 };
 
 const GH_BIN_ENV: &str = "PORCH_GH_BIN";
@@ -186,13 +186,8 @@ fn check_home_and_daemon() -> Vec<Check> {
     out
 }
 
-fn floor_executable_name() -> String {
-    format!("porch-quality{}", std::env::consts::EXE_SUFFIX)
-}
-
 fn floor_sibling_of(exe: &Path) -> Option<PathBuf> {
-    exe.parent()
-        .map(|parent| parent.join(floor_executable_name()))
+    floor::sibling_of(exe)
 }
 
 fn check_floor() -> Check {

@@ -90,6 +90,16 @@ pub fn assurance_shape(roles: impl IntoIterator<Item = Role>) -> &'static str {
     }
 }
 
+/// Presentation label for recorded requirement rows. An empty set has no shape.
+#[must_use]
+pub fn assurance_shape_for_rows(rows: &[RequirementRow]) -> Option<&'static str> {
+    if rows.is_empty() {
+        None
+    } else {
+        Some(assurance_shape(rows.iter().map(|row| row.role)))
+    }
+}
+
 /// Canonical digest of a required producer set.
 #[must_use]
 pub fn required_set_digest(protocol_version: i64, rows: &[RequirementRow]) -> String {
