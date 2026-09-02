@@ -1,14 +1,15 @@
 //! Whether a recorded round may authorize the current change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ulid::Ulid;
 
 use super::{
     AssuranceCompletion, ContextApplication, ContextApplicationRecord, ContextElement,
-    CoverageState, ExecutionState, RoundBindings, RoundId, capture_context_element,
-    context_applications_for_round, context_elements_for_round, coverage_for_round, get_round,
-    producers_for_round, rounds_for_run, sha256_hex,
+    CoverageState, ExecutionState, RequirementRow, Resolution, RoundBindings, RoundId,
+    capture_context_element, context_applications_for_round, context_elements_for_round,
+    coverage_for_round, get_round, producers_for_round, requirements_for_round, rounds_for_run,
+    sha256_hex,
 };
 use super::{ContextSource, SnapshotState};
 use crate::Result;
@@ -84,12 +85,12 @@ pub fn applicable_round(
     db: &Db,
     run_id: &str,
     bindings: &RoundBindings,
-    required_producer_digests: &[String],
+    required: &[RequirementRow],
 ) -> Result<Applicability> {
     let rounds = rounds_for_run(db, run_id)?;
     // Newest ordinal first (store returns ascending).
     for round in rounds.into_iter().rev() {
-        if round_is_applicable(db, &round.id, bindings, required_producer_digests)? {
+        if round_is_applicable(db, &round.id, bindings, required)? {
             return Ok(Applicability::Applicable(round.id));
         }
     }
@@ -101,10 +102,10 @@ pub fn applicable_round(
 /// Serve/authorize helper: reconstruct decision bindings from the run tip and ask
 /// [`applicable_round`].
 ///
-/// Inventory, producer digests, and context applications come from the newest
-/// tip-matching finished/complete round (seed). Live run fields that can drift
-/// (`head_sha`, `trusted_config_sha`, intent presence) are taken from `run` so a
-/// mismatched parked decision fails closed.
+/// Inventory, the recorded required set, and context applications come from the
+/// newest tip-matching finished/complete round (seed). Live run fields that can
+/// drift (`head_sha`, `trusted_config_sha`, intent presence) are taken from `run`
+/// so a mismatched parked decision fails closed.
 ///
 /// # Errors
 ///
@@ -122,11 +123,11 @@ pub fn applicable_round_for_run(db: &Db, run: &RunRow) -> Result<Applicability> 
     applicable_round(db, &run.id, &bindings, &required)
 }
 
-/// Build current decision bindings + required producer digests for serve/authorize.
+/// Build current decision bindings and the seed's recorded required set.
 fn decision_bindings_for_run(
     db: &Db,
     run: &RunRow,
-) -> Result<Option<(RoundBindings, Vec<String>)>> {
+) -> Result<Option<(RoundBindings, Vec<RequirementRow>)>> {
     let Some(seed) = tip_complete_seed(db, run)? else {
         return Ok(None);
     };
@@ -136,10 +137,7 @@ fn decision_bindings_for_run(
     if producers.is_empty() {
         return Ok(None);
     }
-    let required: Vec<String> = producers
-        .iter()
-        .map(|p| p.descriptor_equivalence_digest.clone())
-        .collect();
+    let required = requirements_for_round(db, &seed.id)?;
 
     let id_to_slot: BTreeMap<&str, usize> = producers
         .iter()
@@ -269,7 +267,7 @@ fn round_is_applicable(
     db: &Db,
     round_id: &RoundId,
     bindings: &RoundBindings,
-    required_producer_digests: &[String],
+    required: &[RequirementRow],
 ) -> Result<bool> {
     let Some(round) = get_round(db, round_id)? else {
         return Ok(false);
@@ -316,7 +314,11 @@ fn round_is_applicable(
     }
 
     let producers = producers_for_round(db, round_id)?;
-    let Some(bijection) = producer_bijection(&producers, required_producer_digests) else {
+    let recorded = requirements_for_round(db, round_id)?;
+    if !recorded_set_matches_invocations(&producers, &recorded) {
+        return Ok(false);
+    }
+    let Some(bijection) = producer_bijection(&producers, required) else {
         return Ok(false);
     };
 
@@ -328,12 +330,54 @@ fn round_is_applicable(
     Ok(true)
 }
 
+fn recorded_set_matches_invocations(
+    producers: &[super::ProducerRecord],
+    recorded: &[RequirementRow],
+) -> bool {
+    if recorded.is_empty() {
+        return false;
+    }
+    if recorded
+        .iter()
+        .any(|row| row.resolution != Resolution::Resolved)
+    {
+        return false;
+    }
+    if recorded.len() != producers.len() {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    for row in recorded {
+        let Some(expected) = row.expected_equivalence_digest.as_deref() else {
+            return false;
+        };
+        let Some(invocation_id) = row.producer_invocation_id.as_deref() else {
+            return false;
+        };
+        let Some(producer) = producers.iter().find(|p| p.id == invocation_id) else {
+            return false;
+        };
+        if producer.descriptor_equivalence_digest != expected {
+            return false;
+        }
+        if !seen.insert(invocation_id) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Map required producer slot → recorded producer invocation id.
 fn producer_bijection(
     producers: &[super::ProducerRecord],
-    required_digests: &[String],
+    required: &[RequirementRow],
 ) -> Option<BTreeMap<usize, String>> {
-    if producers.len() != required_digests.len() {
+    if required.is_empty()
+        || required
+            .iter()
+            .any(|row| row.resolution != Resolution::Resolved)
+        || producers.len() != required.len()
+    {
         return None;
     }
 
@@ -346,9 +390,11 @@ fn producer_bijection(
     }
 
     let mut map = BTreeMap::new();
-    for (slot, digest) in required_digests.iter().enumerate() {
-        let bucket = by_digest.get_mut(digest.as_str())?;
+    for row in required {
+        let digest = row.expected_equivalence_digest.as_deref()?;
+        let bucket = by_digest.get_mut(digest)?;
         let producer = bucket.pop()?;
+        let slot = usize::try_from(row.slot).ok()?;
         map.insert(slot, producer.id.clone());
     }
     if by_digest.values().any(|v| !v.is_empty()) {

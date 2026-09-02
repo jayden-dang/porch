@@ -11,8 +11,8 @@ use porch_gate::rounds::{
     FindingInstanceProposal, ObservedVersionForEquivalence, OpenRoundPlan, ProducerInvocation,
     RequirementRow, RequirementSpec, Resolution, Role, RoundBindings, RoundCoverageProposal,
     SNAPSHOT_CEILING_BYTES, STALE_REVISION_RETRIES, SnapshotState, SourceState, applicable_round,
-    capture_context_element, context_applicability_digest, descriptor_equivalence_digest,
-    required_set_digest, sha256_hex,
+    applicable_round_for_run, capture_context_element, context_applicability_digest,
+    descriptor_equivalence_digest, required_set_digest, sha256_hex,
 };
 use porch_gate::{Db, Error};
 use porch_git::GitDir;
@@ -1018,6 +1018,34 @@ fn judgment_equiv_digest() -> String {
     })
 }
 
+fn matching_requirements(digests: &[&str]) -> Vec<RequirementSpec> {
+    digests
+        .iter()
+        .enumerate()
+        .map(|(i, digest)| RequirementSpec {
+            slot: i64::try_from(i).unwrap_or(i64::MAX),
+            role: if i == 0 { Role::Floor } else { Role::Judgment },
+            resolution: Resolution::Resolved,
+            expected_equivalence_digest: Some((*digest).to_string()),
+            reason: None,
+        })
+        .collect()
+}
+
+fn required_rows(digests: &[&str]) -> Vec<RequirementRow> {
+    matching_requirements(digests)
+        .into_iter()
+        .map(|spec| RequirementRow {
+            slot: spec.slot,
+            role: spec.role,
+            resolution: spec.resolution,
+            expected_equivalence_digest: spec.expected_equivalence_digest,
+            producer_invocation_id: None,
+            reason: spec.reason,
+        })
+        .collect()
+}
+
 fn plan_with_digests(run_id: &str, digests: &[&str]) -> OpenRoundPlan {
     OpenRoundPlan {
         run_id: run_id.to_string(),
@@ -1029,7 +1057,7 @@ fn plan_with_digests(run_id: &str, digests: &[&str]) -> OpenRoundPlan {
                 descriptor_equivalence_digest: (*digest).to_string(),
             })
             .collect(),
-        requirements: vec![],
+        requirements: matching_requirements(digests),
     }
 }
 
@@ -1102,6 +1130,49 @@ fn finalize_complete_with_coverage(
     );
 }
 
+fn finish_round(db: &Db, round_id: &rounds::RoundId, run_id: &str) {
+    let producers = rounds::producers_for_round(db, round_id).unwrap();
+    let coverage = producers
+        .iter()
+        .map(|p| RoundCoverageProposal {
+            producer_invocation_id: p.id.clone(),
+            path: "a.rs".into(),
+            state: CoverageState::Completed,
+            reason: None,
+            authority: None,
+            completion_evidence: Some("reviewed".into()),
+        })
+        .collect();
+    finalize_complete_with_coverage(db, round_id, run_id, coverage);
+}
+
+fn open_and_finish(
+    db: &Db,
+    plan: &OpenRoundPlan,
+    producer_count: usize,
+    inventory: &[u8],
+) -> rounds::RoundId {
+    let round_id =
+        rounds::open_round(db, plan, &bindings_for_producers(inventory, producer_count)).unwrap();
+    finish_round(db, &round_id, &plan.run_id);
+    round_id
+}
+
+fn run_applicability(db: &Db, run_id: &str) -> Applicability {
+    let run = db.run_by_id(run_id).unwrap().expect("run");
+    applicable_round_for_run(db, &run).unwrap()
+}
+
+fn unresolved_floor() -> RequirementSpec {
+    RequirementSpec {
+        slot: 0,
+        role: Role::Floor,
+        resolution: Resolution::Unresolved,
+        expected_equivalence_digest: None,
+        reason: Some("floor binary missing".into()),
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)] // four authorization refusal paths in one case
 fn pending_incomplete_interrupted_or_under_covered_round_never_authorizes() {
@@ -1110,7 +1181,7 @@ fn pending_incomplete_interrupted_or_under_covered_round_never_authorizes() {
     let db = fixture_db(home);
     let inventory = b"inv-never-auth\n";
     let digest = floor_equiv_digest();
-    let required = [digest.clone()];
+    let required = required_rows(&[digest.as_str()]);
 
     // Pending (open, not finalized).
     let run_pending = seed_run(&db, home);
@@ -1306,7 +1377,7 @@ fn differing_only_in_selection_source_or_declared_engine_kind_stays_applicable()
         &db,
         &run_id,
         &bindings_for_producers(inventory, 1),
-        &[digest_b],
+        &required_rows(&[digest_b.as_str()]),
     )
     .unwrap()
     {
@@ -1367,7 +1438,14 @@ fn unavailable_producer_version_never_establishes_equivalence() {
         }],
     );
 
-    match applicable_round(&db, &run_id, &bindings_for_producers(inventory, 1), &[b]).unwrap() {
+    match applicable_round(
+        &db,
+        &run_id,
+        &bindings_for_producers(inventory, 1),
+        &required_rows(&[b.as_str()]),
+    )
+    .unwrap()
+    {
         Applicability::RequiresNew { .. } => {}
         Applicability::Applicable(id) => {
             panic!("unavailable digests must not authorize via {id}")
@@ -1421,7 +1499,7 @@ fn floor_plus_judgment_round_is_not_equivalent_to_judgment_only() {
         &db,
         &run_id,
         &bindings_for_producers(inventory, 1),
-        std::slice::from_ref(&judgment),
+        &required_rows(&[judgment.as_str()]),
     )
     .unwrap()
     {
@@ -1436,13 +1514,185 @@ fn floor_plus_judgment_round_is_not_equivalent_to_judgment_only() {
         &db,
         &run_id,
         &bindings_for_producers(inventory, 2),
-        &[floor, judgment],
+        &required_rows(&[floor.as_str(), judgment.as_str()]),
     )
     .unwrap()
     {
         Applicability::Applicable(id) => assert_eq!(id, round_id),
         Applicability::RequiresNew { reason } => {
             panic!("matching producer multiset must apply: {reason}")
+        }
+    }
+}
+
+#[test]
+fn producers_and_resolved_requirements_must_correspond_one_to_one() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let inventory = b"inv-req-bijection\n";
+    let floor = floor_equiv_digest();
+    let judgment = judgment_equiv_digest();
+
+    let extra_producer_run = seed_run(&db, home);
+    let mut extra_producer_plan =
+        plan_with_digests(&extra_producer_run, &[floor.as_str(), judgment.as_str()]);
+    extra_producer_plan.requirements = vec![resolved_floor_spec(&floor)];
+    let extra_producer_round = open_and_finish(&db, &extra_producer_plan, 2, inventory);
+    match run_applicability(&db, &extra_producer_run) {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => {
+            panic!("extra producer without a requirement must not authorize via {id}")
+        }
+    }
+    assert_eq!(
+        rounds::producers_for_round(&db, &extra_producer_round)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        rounds::requirements_for_round(&db, &extra_producer_round)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let extra_requirement_run = {
+        db.upsert_repo(
+            "repo-extra-req",
+            home,
+            &home.join("bare-extra-req.git"),
+            "main",
+        )
+        .unwrap();
+        db.insert_run(
+            "repo-extra-req",
+            "feat",
+            "deadbeef",
+            Some("intent"),
+            Some("flag"),
+        )
+        .unwrap()
+        .id
+    };
+    let mut extra_requirement_plan = plan_with_digests(&extra_requirement_run, &[floor.as_str()]);
+    extra_requirement_plan.requirements = vec![resolved_floor_spec(&floor)];
+    let extra_requirement_round = rounds::open_round(
+        &db,
+        &extra_requirement_plan,
+        &bindings_for_producers(inventory, 1),
+    )
+    .unwrap();
+    let invocation = producer_id(&db, &extra_requirement_round);
+    let conn = Connection::open(db_path(home)).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    insert_requirement_row(
+        &conn,
+        extra_requirement_round.as_str(),
+        &requirement_insert(
+            1,
+            "judgment",
+            "resolved",
+            Some(floor.as_str()),
+            Some(invocation.as_str()),
+            None,
+        ),
+    )
+    .expect("second resolved requirement may share the same-round invocation FK");
+    finish_round(&db, &extra_requirement_round, &extra_requirement_run);
+    match run_applicability(&db, &extra_requirement_run) {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => {
+            panic!("extra requirement without its own invocation must not authorize via {id}")
+        }
+    }
+}
+
+#[test]
+fn expected_digest_must_match_the_referenced_invocation() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let inventory = b"inv-req-digest\n";
+    let recorded = floor_equiv_digest();
+    let expected = judgment_equiv_digest();
+    assert_ne!(recorded, expected);
+
+    let run_id = seed_run(&db, home);
+    let mut plan = plan_with_digests(&run_id, &[recorded.as_str()]);
+    plan.requirements = vec![resolved_floor_spec(&expected)];
+    let round_id = open_and_finish(&db, &plan, 1, inventory);
+    let recorded_rows = rounds::requirements_for_round(&db, &round_id).unwrap();
+    let producers = rounds::producers_for_round(&db, &round_id).unwrap();
+    assert_eq!(recorded_rows.len(), 1);
+    assert_eq!(producers.len(), 1);
+    assert_eq!(
+        recorded_rows[0].producer_invocation_id.as_deref(),
+        Some(producers[0].id.as_str())
+    );
+    assert_eq!(
+        recorded_rows[0].expected_equivalence_digest.as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(producers[0].descriptor_equivalence_digest, recorded);
+    match run_applicability(&db, &run_id) {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => {
+            panic!("digest mismatch on a valid FK must not authorize via {id}")
+        }
+    }
+}
+
+#[test]
+fn unresolved_or_unrecorded_required_set_never_authorizes() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let inventory = b"inv-req-unresolved\n";
+    let floor = floor_equiv_digest();
+
+    let unresolved_run = seed_run(&db, home);
+    let mut unresolved_plan = plan_with_digests(&unresolved_run, &[floor.as_str()]);
+    unresolved_plan.requirements = vec![unresolved_floor()];
+    open_and_finish(&db, &unresolved_plan, 1, inventory);
+    match run_applicability(&db, &unresolved_run) {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => {
+            panic!("an unresolved requirement must not authorize via {id}")
+        }
+    }
+
+    let unrecorded_run = {
+        db.upsert_repo(
+            "repo-unrecorded",
+            home,
+            &home.join("bare-unrecorded.git"),
+            "main",
+        )
+        .unwrap();
+        db.insert_run(
+            "repo-unrecorded",
+            "feat",
+            "deadbeef",
+            Some("intent"),
+            Some("flag"),
+        )
+        .unwrap()
+        .id
+    };
+    let mut unrecorded_plan = plan_with_digests(&unrecorded_run, &[floor.as_str()]);
+    unrecorded_plan.requirements = vec![];
+    let unrecorded_round = open_and_finish(&db, &unrecorded_plan, 1, inventory);
+    assert!(
+        rounds::requirements_for_round(&db, &unrecorded_round)
+            .unwrap()
+            .is_empty()
+    );
+    match run_applicability(&db, &unrecorded_run) {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => {
+            panic!("a round with zero requirement rows must not authorize via {id}")
         }
     }
 }
