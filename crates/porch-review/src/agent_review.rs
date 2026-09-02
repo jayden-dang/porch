@@ -14,8 +14,26 @@ use crate::{Action, Error, Finding, ReviewComment, ReviewOutcome, Severity, asse
 /// Env override for the review agent binary (`claude` / `codex` / PATH fake).
 pub const REVIEW_AGENT_BIN_ENV: &str = "PORCH_REVIEW_AGENT_BIN";
 
-/// Relative review artifact dir under `$PORCH_HOME/runs/<id>/`.
+/// Relative review artifact dir under `$PORCH_HOME/runs/<id>/` (legacy flat path).
 pub const REVIEW_ARTIFACT_REL: &str = "review";
+
+/// Per-invocation artifact directory:
+/// `$PORCH_HOME/runs/<run>/rounds/<round>/producers/<invocation>/`.
+#[must_use]
+pub fn producer_artifact_dir(
+    porch_home: &Path,
+    run_id: &str,
+    round_id: &str,
+    invocation_id: &str,
+) -> PathBuf {
+    porch_home
+        .join("runs")
+        .join(run_id)
+        .join("rounds")
+        .join(round_id)
+        .join("producers")
+        .join(invocation_id)
+}
 
 /// Porch-owned reviewer prompt body (written under `$PORCH_HOME`, outside the worktree).
 pub const REVIEWER_PROMPT: &str = "\
@@ -51,6 +69,8 @@ pub struct RunAgentReviewOpts<'a> {
     pub timeout: Duration,
     /// When set, spawn uses this plan's absolute target without re-resolving.
     pub plan: Option<&'a crate::plan::InvocationPlan>,
+    /// When set, `result.json` is written here (invocation namespace).
+    pub artifact_dir: Option<&'a Path>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,14 +395,7 @@ pub fn review_uses_agent(porch_home: Option<&Path>) -> bool {
 pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
     assert_prompt_under_home(opts.prompt_file, opts.porch_home)?;
 
-    let out_file = opts
-        .prompt_file
-        .parent()
-        .unwrap_or(opts.porch_home)
-        .join("result.json");
-    if out_file.exists() {
-        let _ = fs::remove_file(&out_file);
-    }
+    let out_file = prepare_result_json(opts)?;
     let out_s = abs_str(&out_file)?;
     let prompt_s = abs_str(opts.prompt_file)?;
 
@@ -487,6 +500,20 @@ pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, 
 
     restore_neutralized(&neutralized);
     result
+}
+
+fn prepare_result_json(opts: &RunAgentReviewOpts<'_>) -> Result<PathBuf, Error> {
+    let prompt_parent = opts.prompt_file.parent();
+    let out_dir: &Path = match opts.artifact_dir {
+        Some(d) => d,
+        None => prompt_parent.unwrap_or(opts.porch_home),
+    };
+    fs::create_dir_all(out_dir)?;
+    let out_file = out_dir.join("result.json");
+    if out_file.exists() {
+        let _ = fs::remove_file(&out_file);
+    }
+    Ok(out_file)
 }
 
 fn spawn_bin_path<'a>(opts: &'a RunAgentReviewOpts<'a>) -> &'a Path {
@@ -818,6 +845,7 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_secs(5),
             plan: None,
+            artifact_dir: None,
         })
         .unwrap();
         assert!(out.findings.is_empty());
@@ -858,6 +886,7 @@ printf '%s\n' '{"findings":[],"files":["a.rs"]}' > "$OUT"
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_secs(5),
             plan: None,
+            artifact_dir: None,
         })
         .unwrap_err();
         assert!(matches!(err, Error::Coverage(ref p) if p == "b.rs"));
@@ -896,6 +925,7 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_secs(5),
             plan: None,
+            artifact_dir: None,
         })
         .unwrap_err();
         assert!(
@@ -922,6 +952,7 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             bin: "true",
             timeout: Duration::from_secs(1),
             plan: None,
+            artifact_dir: None,
         })
         .unwrap_err();
         assert!(matches!(err, Error::PromptRefuse(_)));
@@ -950,6 +981,7 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_millis(200),
             plan: None,
+            artifact_dir: None,
         })
         .unwrap_err();
         assert!(matches!(err, Error::Timeout(_)));

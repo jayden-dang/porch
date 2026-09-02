@@ -760,6 +760,7 @@ printf '%s\n' '{"comments":[],"files":["a.rs"]}' > "$OUT"
             run_id: None,
             intent: None,
             plan: Some(&prepared.plan),
+            artifact_dir: None,
         })
         .unwrap();
         assert_eq!(outcome.covered_files, vec!["a.rs"]);

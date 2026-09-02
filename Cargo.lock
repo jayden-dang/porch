@@ -872,6 +872,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+ "ulid",
 ]
 
 [[package]]

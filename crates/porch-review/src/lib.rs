@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 pub use agent_review::{
     REVIEW_AGENT_BIN_ENV, REVIEW_ARTIFACT_REL, REVIEWER_PROMPT, RunAgentReviewOpts,
     agent_review_bin, assert_prompt_under_home, build_reviewer_prompt, parse_agent_review_json,
-    review_uses_agent, run_agent_review, write_reviewer_prompt,
+    producer_artifact_dir, review_uses_agent, run_agent_review, write_reviewer_prompt,
 };
 pub use coverage_state::{
     CoverageEntry, CoverageState, PathSignal, ProducerOutput, StatusRow, derive_states,
@@ -488,6 +488,8 @@ pub struct RunReviewOpts<'a> {
     pub intent: Option<&'a str>,
     /// When set, spawn uses this plan's absolute target without re-resolving.
     pub plan: Option<&'a plan::InvocationPlan>,
+    /// When set, prompt/result artifacts land under this invocation namespace.
+    pub artifact_dir: Option<&'a Path>,
 }
 
 /// Spawn review: agent path when configured (`PORCH_REVIEW_BIN` unset); else CLI.
@@ -522,10 +524,14 @@ fn run_review_via_agent(
     let run_id = opts.run_id.ok_or_else(|| {
         Error::Msg("agent review requires run_id for prompt artifacts under PORCH_HOME".into())
     })?;
-    let review_dir = porch_home
+    let legacy_dir = porch_home
         .join("runs")
         .join(run_id)
         .join(REVIEW_ARTIFACT_REL);
+    let review_dir: &Path = match opts.artifact_dir {
+        Some(d) => d,
+        None => legacy_dir.as_path(),
+    };
     let path_instructions = {
         let p = porch_home
             .join("runs")
@@ -538,7 +544,7 @@ fn run_review_via_agent(
         }
     };
     let prompt_file = write_reviewer_prompt(
-        &review_dir,
+        review_dir,
         opts.intent,
         path_instructions.as_deref(),
         opts.changed_files,
@@ -563,13 +569,18 @@ fn run_review_via_agent(
         bin,
         timeout: opts.timeout,
         plan: opts.plan,
+        artifact_dir: opts.artifact_dir,
     })
 }
 
 /// Spawn the review CLI in `work_tree`, parse JSON, enforce coverage.
 fn run_review_cli(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
-    let out_dir = opts.work_tree.join(".porch-review");
-    fs::create_dir_all(&out_dir)?;
+    let legacy_dir = opts.work_tree.join(".porch-review");
+    let out_dir: &Path = match opts.artifact_dir {
+        Some(d) => d,
+        None => legacy_dir.as_path(),
+    };
+    fs::create_dir_all(out_dir)?;
     let out_file = out_dir.join("result.json");
     if out_file.exists() {
         let _ = fs::remove_file(&out_file);
