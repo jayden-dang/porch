@@ -1,8 +1,10 @@
 //! M18: review round store — migration and durable open.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use porch_gate::db_path;
+use porch_gate::rounds::retention::{self, config_ref_name};
 use porch_gate::rounds::{
     self, Applicability, AssuranceCompletion, ContextApplication, ContextElement, ContextSource,
     CoverageState, EquivalenceInput, ExecutionState, FinalizeOutcome, FinalizeProposal,
@@ -12,6 +14,7 @@ use porch_gate::rounds::{
     context_applicability_digest, descriptor_equivalence_digest, sha256_hex,
 };
 use porch_gate::{Db, Error};
+use porch_git::GitDir;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
@@ -1429,4 +1432,155 @@ fn floor_plus_judgment_round_is_not_equivalent_to_judgment_only() {
             panic!("matching producer multiset must apply: {reason}")
         }
     }
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let st = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(st.success(), "git {args:?}");
+}
+
+fn git_out(cwd: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Bare repo with one commit reachable only after pinning (branch deleted later).
+fn bare_with_config_commit(root: &Path) -> (GitDir, PathBuf, String) {
+    let bare_path = root.join("bare.git");
+    porch_git::init_bare(&bare_path).unwrap();
+    let bare = GitDir::new(&bare_path).unwrap();
+
+    let seed = root.join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&seed, &["init"]);
+    git(&seed, &["config", "user.email", "porch@example.com"]);
+    git(&seed, &["config", "user.name", "Porch"]);
+    git(&seed, &["checkout", "-b", "main"]);
+    std::fs::write(seed.join("README"), "trusted-config\n").unwrap();
+    git(&seed, &["add", "README"]);
+    git(&seed, &["commit", "-m", "trusted"]);
+    let sha = git_out(&seed, &["rev-parse", "HEAD"]);
+    git(
+        &seed,
+        &["push", bare_path.to_str().unwrap(), "main:refs/heads/main"],
+    );
+    (bare, bare_path, sha)
+}
+
+#[test]
+fn opening_a_round_pins_trusted_config_and_survives_prune() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let (bare, bare_path, sha) = bare_with_config_commit(&root);
+    let db = fixture_db(&home);
+    db.upsert_repo("repo-ret", &root, &bare_path, "main")
+        .unwrap();
+    let run_id = db
+        .insert_run("repo-ret", "feat", "deadbeef", Some("intent"), None)
+        .unwrap()
+        .id;
+
+    // Open sequence: pin before the round row commits.
+    retention::pin_trusted_config(&bare, &sha).unwrap();
+    let mut bindings = sample_bindings(b"inv-retention-pin\n");
+    bindings.trusted_config_sha = sha.clone();
+    let round_id = rounds::open_round(&db, &sample_plan(&run_id), &bindings).unwrap();
+    let loaded = rounds::get_round(&db, &round_id).unwrap().unwrap();
+    assert_eq!(loaded.trusted_config_sha, sha);
+
+    let refname = config_ref_name(&sha);
+    assert_eq!(porch_git::rev_parse(&bare, &refname).unwrap(), sha);
+
+    // Drop every other ref so only the porch config pin keeps the object alive.
+    porch_git::delete_ref(&bare, "refs/heads/main").unwrap();
+    porch_git::run(&bare, &["gc", "--prune=now"]).unwrap();
+
+    assert_eq!(
+        porch_git::rev_parse(&bare, &refname).unwrap(),
+        sha,
+        "config pin must survive gc prune"
+    );
+    porch_git::run(&bare, &["cat-file", "-e", &sha]).unwrap();
+}
+
+#[test]
+fn removing_last_referencing_round_sweeps_ref_after_db_commit() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let (bare, bare_path, sha) = bare_with_config_commit(&root);
+    let db = fixture_db(&home);
+    db.upsert_repo("repo-sweep", &root, &bare_path, "main")
+        .unwrap();
+    let run_id = db
+        .insert_run("repo-sweep", "feat", "deadbeef", None, None)
+        .unwrap()
+        .id;
+
+    retention::pin_trusted_config(&bare, &sha).unwrap();
+    let mut bindings = sample_bindings(b"inv-retention-sweep\n");
+    bindings.trusted_config_sha = sha.clone();
+    let round_id = rounds::open_round(&db, &sample_plan(&run_id), &bindings).unwrap();
+    let refname = config_ref_name(&sha);
+    assert_eq!(porch_git::rev_parse(&bare, &refname).unwrap(), sha);
+
+    // Second round shares the same trusted SHA — deleting only the first must keep the pin.
+    let round_b = rounds::open_round(&db, &sample_plan(&run_id), &bindings).unwrap();
+    {
+        let conn = Connection::open(db_path(&home)).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute(
+            "DELETE FROM review_rounds WHERE id = ?1",
+            [round_id.as_str()],
+        )
+        .unwrap();
+    }
+    let removed_while_shared = retention::sweep_unreferenced(&bare, &db).unwrap();
+    assert_eq!(removed_while_shared, 0);
+    assert_eq!(porch_git::rev_parse(&bare, &refname).unwrap(), sha);
+
+    // Last referencing round: DB delete commits first; ref remains until sweep.
+    {
+        let conn = Connection::open(db_path(&home)).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute(
+            "DELETE FROM review_rounds WHERE id = ?1",
+            [round_b.as_str()],
+        )
+        .unwrap();
+    }
+    assert!(
+        rounds::get_round(&db, &round_b).unwrap().is_none(),
+        "row deletion must commit before ref removal"
+    );
+    assert_eq!(
+        porch_git::rev_parse(&bare, &refname).unwrap(),
+        sha,
+        "ref must still exist after DB commit and before sweep"
+    );
+
+    let removed = retention::sweep_unreferenced(&bare, &db).unwrap();
+    assert_eq!(removed, 1);
+    assert!(
+        porch_git::rev_parse(&bare, &refname).is_err(),
+        "last reference gone → config ref removed"
+    );
 }
