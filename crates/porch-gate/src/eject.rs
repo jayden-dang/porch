@@ -101,7 +101,7 @@ fn purge_repo_state(db: &Db, home: &Path, repo_id: &str, bare: &Path) -> Result<
     let wt_root = worktrees_dir(home).join(repo_id);
     let _ = std::fs::remove_dir_all(&wt_root);
 
-    // Commit row deletion before removing porch-owned refs / the bare (ROUND-1.29).
+    // Commit row deletion before removing porch-owned refs / the bare.
     db.delete_repo(repo_id)?;
 
     if let Ok(g) = GitDir::new(bare) {
