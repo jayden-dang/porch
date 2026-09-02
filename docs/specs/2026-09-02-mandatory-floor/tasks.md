@@ -131,8 +131,7 @@ _Requirements: FLOOR-2.1, FLOOR-2.2, FLOOR-2.3, FLOOR-2.4, FLOOR-2.9, FLOOR-5.1,
       stamping, and a test-only injection seam that is absent from production builds.
 - [ ] Run tests; expect pass. Commit: `feat(porch-review): resolve the mandatory floor as a sibling`
 
-_Requirements: FLOOR-1.2, FLOOR-4.1, FLOOR-4.2, FLOOR-4.3, FLOOR-4.4, FLOOR-4.5, FLOOR-8.10,
-FLOOR-8.11, FLOOR-9.2_
+_Requirements: FLOOR-1.2, FLOOR-4.1, FLOOR-4.2, FLOOR-4.3, FLOOR-4.4, FLOOR-4.5, FLOOR-8.10, FLOOR-8.11, FLOOR-9.2_
 
 ---
 
@@ -164,8 +163,7 @@ FLOOR-8.11, FLOOR-9.2_
       three existing suites that assert one review spawn per phase.
 - [ ] Run tests; expect pass. Commit: `feat(porch-run): compose the floor with the judgment layer`
 
-_Requirements: FLOOR-1.1, FLOOR-1.3, FLOOR-1.4, FLOOR-1.5, FLOOR-1.6, FLOOR-1.7, FLOOR-1.8,
-FLOOR-8.12, FLOOR-8.13, FLOOR-8.14_
+_Requirements: FLOOR-1.1, FLOOR-1.3, FLOOR-1.4, FLOOR-1.5, FLOOR-1.6, FLOOR-1.7, FLOOR-1.8, FLOOR-8.12, FLOOR-8.13, FLOOR-8.14_
 
 ---
 
@@ -292,8 +290,7 @@ _Requirements: FLOOR-5.2, FLOOR-5.3, FLOOR-5.4, FLOOR-5.5, FLOOR-5.6, FLOOR-5.7,
 - [ ] Implement the version gate, the duration tables, and the finalization writes.
 - [ ] Run tests; expect pass. Commit: `feat(porch-gate): protocol 2 rounds with recorded durations`
 
-_Requirements: FLOOR-6.1, FLOOR-6.2, FLOOR-6.3, FLOOR-8.1, FLOOR-8.2, FLOOR-8.3, FLOOR-8.4,
-FLOOR-8.7, FLOOR-8.9, FLOOR-9.1, FLOOR-9.4_
+_Requirements: FLOOR-6.1, FLOOR-6.2, FLOOR-6.3, FLOOR-8.1, FLOOR-8.2, FLOOR-8.3, FLOOR-8.4, FLOOR-8.7, FLOOR-8.9, FLOOR-9.1, FLOOR-9.4_
 
 ---
 
@@ -361,8 +358,7 @@ and the managed PR attestation block
       upgrade, rollback and recovery.
 - [ ] Run tests; expect pass. Commit: `feat(porch): surface the assurance shape to operators`
 
-_Requirements: FLOOR-3.4, FLOOR-3.6, FLOOR-3.7, FLOOR-7.1, FLOOR-7.2, FLOOR-7.3, FLOOR-7.4,
-FLOOR-8.15_
+_Requirements: FLOOR-3.4, FLOOR-3.6, FLOOR-3.7, FLOOR-7.1, FLOOR-7.2, FLOOR-7.3, FLOOR-7.4, FLOOR-8.15_
 
 ---
 
