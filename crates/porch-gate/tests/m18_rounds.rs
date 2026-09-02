@@ -4,11 +4,12 @@ use std::path::Path;
 
 use porch_gate::db_path;
 use porch_gate::rounds::{
-    self, AssuranceCompletion, ContextApplication, ContextElement, ContextSource, CoverageState,
-    ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal, OpenRoundPlan,
-    ProducerInvocation, RoundBindings, RoundCoverageProposal, SNAPSHOT_CEILING_BYTES,
-    STALE_REVISION_RETRIES, SnapshotState, SourceState, capture_context_element,
-    context_applicability_digest, sha256_hex,
+    self, Applicability, AssuranceCompletion, ContextApplication, ContextElement, ContextSource,
+    CoverageState, EquivalenceInput, ExecutionState, FinalizeOutcome, FinalizeProposal,
+    FindingInstanceProposal, ObservedVersionForEquivalence, OpenRoundPlan, ProducerInvocation,
+    RoundBindings, RoundCoverageProposal, SNAPSHOT_CEILING_BYTES, STALE_REVISION_RETRIES,
+    SnapshotState, SourceState, applicable_round, capture_context_element,
+    context_applicability_digest, descriptor_equivalence_digest, sha256_hex,
 };
 use porch_gate::{Db, Error};
 use rusqlite::Connection;
@@ -982,4 +983,450 @@ fn stale_retries_are_bounded_then_history_contention_closes() {
         Some("history_contention")
     );
     assert!(loaded.finalized_at.is_some());
+}
+
+fn floor_equiv_digest() -> String {
+    descriptor_equivalence_digest(&EquivalenceInput {
+        adapter_kind: "porch_json_cli",
+        argv_prefix: &["--engine".into(), "quality".into()],
+        observed_version: ObservedVersionForEquivalence::ArtifactSha256("floor-artifact".into()),
+        consumed_context: &["intent".into()],
+    })
+}
+
+fn judgment_equiv_digest() -> String {
+    descriptor_equivalence_digest(&EquivalenceInput {
+        adapter_kind: "native_agent",
+        argv_prefix: &[],
+        observed_version: ObservedVersionForEquivalence::ArtifactSha256("judgment-artifact".into()),
+        consumed_context: &["intent".into(), "path_instructions".into()],
+    })
+}
+
+fn plan_with_digests(run_id: &str, digests: &[&str]) -> OpenRoundPlan {
+    OpenRoundPlan {
+        run_id: run_id.to_string(),
+        producers: digests
+            .iter()
+            .enumerate()
+            .map(|(i, digest)| ProducerInvocation {
+                descriptor_json: format!(r#"{{"slot":{i}}}"#),
+                descriptor_equivalence_digest: (*digest).to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn bindings_for_producers(inventory: &[u8], producer_count: usize) -> RoundBindings {
+    let digest = sha256_hex(inventory);
+    let intent = capture_context_element(
+        "intent",
+        ContextSource::Present {
+            bytes: inventory.to_vec(),
+        },
+    );
+    let intent_digest = context_applicability_digest("intent", "present", inventory);
+    let mut context_applications = Vec::with_capacity(producer_count);
+    for slot in 0..producer_count {
+        context_applications.push(ContextApplication {
+            element_name: "intent".into(),
+            producer_slot: slot,
+            application: rounds::ContextApplicationState::Applied,
+            effective_digest: Some(intent_digest.clone()),
+        });
+    }
+    RoundBindings {
+        from_sha: "from".into(),
+        to_sha: "to".into(),
+        inventory_digest: digest,
+        inventory_bytes: inventory.to_vec(),
+        trusted_config_sha: "config".into(),
+        protocol_schema_version: 1,
+        fingerprint_version: 1,
+        intent_source: Some("flag".into()),
+        context_elements: vec![intent],
+        context_applications,
+    }
+}
+
+fn finalize_complete_with_coverage(
+    db: &Db,
+    round_id: &rounds::RoundId,
+    run_id: &str,
+    coverage: Vec<RoundCoverageProposal>,
+) {
+    let (rev, _) = rounds::read_history(db, run_id).unwrap();
+    let producer = producer_id(db, round_id);
+    let proposal = FinalizeProposal {
+        execution: ExecutionState::Finished,
+        assurance_completion: AssuranceCompletion::Complete,
+        completion_reason: None,
+        coverage,
+        instances: vec![FindingInstanceProposal {
+            producer_invocation_id: producer,
+            fingerprint: "fp-auth".into(),
+            fingerprint_version: 1,
+            candidate_key: "ck-auth".into(),
+            criterion_id: "rust/unwrap-in-lib".into(),
+            evidence: "e".into(),
+            consequence: "c".into(),
+            action: "must-fix".into(),
+            severity: "error".into(),
+            provenance_json: "{}".into(),
+            confidence_value: None,
+            confidence_kind: None,
+            path: "a.rs".into(),
+            anchor_kind: "symbol".into(),
+            anchor_value: "foo".into(),
+        }],
+    };
+    assert_eq!(
+        rounds::finalize_round(db, round_id, &proposal, rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // four authorization refusal paths in one case
+fn pending_incomplete_interrupted_or_under_covered_round_never_authorizes() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let inventory = b"inv-never-auth\n";
+    let digest = floor_equiv_digest();
+    let required = [digest.clone()];
+
+    // Pending (open, not finalized).
+    let run_pending = seed_run(&db, home);
+    let pending_id = rounds::open_round(
+        &db,
+        &plan_with_digests(&run_pending, &[digest.as_str()]),
+        &bindings_for_producers(inventory, 1),
+    )
+    .unwrap();
+    match applicable_round(
+        &db,
+        &run_pending,
+        &bindings_for_producers(inventory, 1),
+        &required,
+    )
+    .unwrap()
+    {
+        Applicability::RequiresNew { reason } => {
+            assert!(
+                reason.contains("pending")
+                    || reason.contains("applicable")
+                    || reason.contains("authorize"),
+                "unexpected reason: {reason}"
+            );
+        }
+        Applicability::Applicable(id) => panic!("pending must not authorize, got {id}"),
+    }
+    let pending = rounds::get_round(&db, &pending_id).unwrap().unwrap();
+    assert_eq!(pending.assurance_completion, AssuranceCompletion::Pending);
+
+    // Incomplete.
+    let run_incomplete = {
+        db.upsert_repo("repo-inc", home, &home.join("bare-inc.git"), "main")
+            .unwrap();
+        db.insert_run("repo-inc", "feat", "deadbeef", Some("intent"), Some("flag"))
+            .unwrap()
+            .id
+    };
+    let incomplete_id = rounds::open_round(
+        &db,
+        &plan_with_digests(&run_incomplete, &[digest.as_str()]),
+        &bindings_for_producers(inventory, 1),
+    )
+    .unwrap();
+    let producer = producer_id(&db, &incomplete_id);
+    let (rev, _) = rounds::read_history(&db, &run_incomplete).unwrap();
+    assert_eq!(
+        rounds::finalize_round(
+            &db,
+            &incomplete_id,
+            &FinalizeProposal {
+                execution: ExecutionState::Finished,
+                assurance_completion: AssuranceCompletion::Incomplete,
+                completion_reason: Some("coverage_shortfall".into()),
+                coverage: vec![],
+                instances: vec![],
+            },
+            rev,
+        )
+        .unwrap(),
+        FinalizeOutcome::Finalized
+    );
+    match applicable_round(
+        &db,
+        &run_incomplete,
+        &bindings_for_producers(inventory, 1),
+        &required,
+    )
+    .unwrap()
+    {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => panic!("incomplete must not authorize, got {id}"),
+    }
+    let _ = producer;
+
+    // Interrupted.
+    let run_interrupted = {
+        db.upsert_repo("repo-int", home, &home.join("bare-int.git"), "main")
+            .unwrap();
+        db.insert_run("repo-int", "feat", "deadbeef", Some("intent"), Some("flag"))
+            .unwrap()
+            .id
+    };
+    let interrupted_id = rounds::open_round(
+        &db,
+        &plan_with_digests(&run_interrupted, &[digest.as_str()]),
+        &bindings_for_producers(inventory, 1),
+    )
+    .unwrap();
+    rounds::abandon_for_history_contention(&db, &interrupted_id).unwrap();
+    match applicable_round(
+        &db,
+        &run_interrupted,
+        &bindings_for_producers(inventory, 1),
+        &required,
+    )
+    .unwrap()
+    {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => panic!("interrupted must not authorize, got {id}"),
+    }
+
+    // Under-covered: finished/complete but a path remains `selected`.
+    let run_under = {
+        db.upsert_repo("repo-under", home, &home.join("bare-under.git"), "main")
+            .unwrap();
+        db.insert_run(
+            "repo-under",
+            "feat",
+            "deadbeef",
+            Some("intent"),
+            Some("flag"),
+        )
+        .unwrap()
+        .id
+    };
+    let under_id = rounds::open_round(
+        &db,
+        &plan_with_digests(&run_under, &[digest.as_str()]),
+        &bindings_for_producers(inventory, 1),
+    )
+    .unwrap();
+    let under_producer = producer_id(&db, &under_id);
+    finalize_complete_with_coverage(
+        &db,
+        &under_id,
+        &run_under,
+        vec![RoundCoverageProposal {
+            producer_invocation_id: under_producer,
+            path: "a.rs".into(),
+            state: CoverageState::Selected,
+            reason: None,
+            authority: None,
+            completion_evidence: None,
+        }],
+    );
+    match applicable_round(
+        &db,
+        &run_under,
+        &bindings_for_producers(inventory, 1),
+        &required,
+    )
+    .unwrap()
+    {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => panic!("under-covered must not authorize, got {id}"),
+    }
+}
+
+#[test]
+fn differing_only_in_selection_source_or_declared_engine_kind_stays_applicable() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-selection\n";
+
+    let input = EquivalenceInput {
+        adapter_kind: "porch_json_cli",
+        argv_prefix: &["review".into()],
+        observed_version: ObservedVersionForEquivalence::ArtifactSha256("same-artifact".into()),
+        consumed_context: &["intent".into()],
+    };
+    let digest_a = descriptor_equivalence_digest(&input);
+    let digest_b = descriptor_equivalence_digest(&input);
+    assert_eq!(
+        digest_a, digest_b,
+        "equivalence digest must ignore selection_source / declared_engine_kind (absent from preimage)"
+    );
+
+    let round_id = rounds::open_round(
+        &db,
+        &plan_with_digests(&run_id, &[digest_a.as_str()]),
+        &bindings_for_producers(inventory, 1),
+    )
+    .unwrap();
+    let producer = producer_id(&db, &round_id);
+    finalize_complete_with_coverage(
+        &db,
+        &round_id,
+        &run_id,
+        vec![RoundCoverageProposal {
+            producer_invocation_id: producer,
+            path: "a.rs".into(),
+            state: CoverageState::Completed,
+            reason: None,
+            authority: None,
+            completion_evidence: Some("reviewed".into()),
+        }],
+    );
+
+    match applicable_round(
+        &db,
+        &run_id,
+        &bindings_for_producers(inventory, 1),
+        &[digest_b],
+    )
+    .unwrap()
+    {
+        Applicability::Applicable(id) => assert_eq!(id, round_id),
+        Applicability::RequiresNew { reason } => {
+            panic!("same equivalence digest must stay applicable: {reason}")
+        }
+    }
+}
+
+#[test]
+fn unavailable_producer_version_never_establishes_equivalence() {
+    let a = descriptor_equivalence_digest(&EquivalenceInput {
+        adapter_kind: "porch_json_cli",
+        argv_prefix: &["review".into()],
+        observed_version: ObservedVersionForEquivalence::Unavailable {
+            reason: "not_on_path".into(),
+        },
+        consumed_context: &["intent".into()],
+    });
+    let b = descriptor_equivalence_digest(&EquivalenceInput {
+        adapter_kind: "porch_json_cli",
+        argv_prefix: &["review".into()],
+        observed_version: ObservedVersionForEquivalence::Unavailable {
+            reason: "not_on_path".into(),
+        },
+        consumed_context: &["intent".into()],
+    });
+    assert_ne!(
+        a, b,
+        "unavailable observed identity must mint a per-invocation nonce"
+    );
+
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-unavail\n";
+
+    let round_id = rounds::open_round(
+        &db,
+        &plan_with_digests(&run_id, &[a.as_str()]),
+        &bindings_for_producers(inventory, 1),
+    )
+    .unwrap();
+    let producer = producer_id(&db, &round_id);
+    finalize_complete_with_coverage(
+        &db,
+        &round_id,
+        &run_id,
+        vec![RoundCoverageProposal {
+            producer_invocation_id: producer,
+            path: "a.rs".into(),
+            state: CoverageState::Completed,
+            reason: None,
+            authority: None,
+            completion_evidence: Some("reviewed".into()),
+        }],
+    );
+
+    match applicable_round(&db, &run_id, &bindings_for_producers(inventory, 1), &[b]).unwrap() {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => {
+            panic!("unavailable digests must not authorize via {id}")
+        }
+    }
+}
+
+#[test]
+fn floor_plus_judgment_round_is_not_equivalent_to_judgment_only() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-floor-judgment\n";
+    let floor = floor_equiv_digest();
+    let judgment = judgment_equiv_digest();
+
+    let round_id = rounds::open_round(
+        &db,
+        &plan_with_digests(&run_id, &[floor.as_str(), judgment.as_str()]),
+        &bindings_for_producers(inventory, 2),
+    )
+    .unwrap();
+    let producers = rounds::producers_for_round(&db, &round_id).unwrap();
+    assert_eq!(producers.len(), 2);
+    finalize_complete_with_coverage(
+        &db,
+        &round_id,
+        &run_id,
+        vec![
+            RoundCoverageProposal {
+                producer_invocation_id: producers[0].id.clone(),
+                path: "a.rs".into(),
+                state: CoverageState::Completed,
+                reason: None,
+                authority: None,
+                completion_evidence: Some("floor".into()),
+            },
+            RoundCoverageProposal {
+                producer_invocation_id: producers[1].id.clone(),
+                path: "a.rs".into(),
+                state: CoverageState::Completed,
+                reason: None,
+                authority: None,
+                completion_evidence: Some("judgment".into()),
+            },
+        ],
+    );
+
+    match applicable_round(
+        &db,
+        &run_id,
+        &bindings_for_producers(inventory, 1),
+        std::slice::from_ref(&judgment),
+    )
+    .unwrap()
+    {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => {
+            panic!("judgment-only must not match floor+judgment round {id}")
+        }
+    }
+
+    // Positive control: both producers required → applicable.
+    match applicable_round(
+        &db,
+        &run_id,
+        &bindings_for_producers(inventory, 2),
+        &[floor, judgment],
+    )
+    .unwrap()
+    {
+        Applicability::Applicable(id) => assert_eq!(id, round_id),
+        Applicability::RequiresNew { reason } => {
+            panic!("matching producer multiset must apply: {reason}")
+        }
+    }
 }
