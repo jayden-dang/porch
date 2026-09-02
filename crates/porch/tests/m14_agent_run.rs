@@ -116,6 +116,7 @@ set -e
 : "${PORCH_HOME:?}"
 STATE="$PORCH_HOME/gh-pr-state"
 BODYLOG="$PORCH_HOME/gh-pr-body.log"
+TITLELOG="$PORCH_HOME/gh-pr-title.log"
 for a in "$@"; do
   [ "$a" = "--version" ] && echo "gh version 2.50.0 (fake)" && exit 0
 done
@@ -129,11 +130,30 @@ case "$CMD" in
   list) if [ -f "$STATE" ]; then cat "$STATE"; else printf '[]\n'; fi ;;
   create)
     cat > "$BODYLOG"
-    printf '[{"number":1,"url":"https://example.com/pull/1","title":"t"}]\n' > "$STATE"
+    TITLE=""
+    PREV=""
+    for a in "$@"; do
+      if [ "$PREV" = "--title" ]; then TITLE="$a"; break; fi
+      PREV="$a"
+    done
+    printf '%s\n' "$TITLE" > "$TITLELOG"
+    printf '[{"number":1,"url":"https://example.com/pull/1","title":"%s"}]\n' "$TITLE" > "$STATE"
     echo "https://example.com/pull/1"
     ;;
   edit)
-    cat > "$BODYLOG"
+    HAS_BODY=0
+    PREV=""
+    for a in "$@"; do
+      if [ "$a" = "--body-file" ]; then HAS_BODY=1; fi
+      if [ "$PREV" = "--title" ]; then printf '%s\n' "$a" > "$TITLELOG"; fi
+      PREV="$a"
+    done
+    if [ "$HAS_BODY" -eq 1 ]; then
+      cat > "$BODYLOG"
+    fi
+    ;;
+  view)
+    printf '{"mergeable":"MERGEABLE","title":"t","body":""}\n'
     ;;
   checks) printf '[]\n' ;;
   *) echo "noop-gh: $*" >&2; exit 1 ;;
@@ -299,7 +319,8 @@ fn agent_run_intent_persists_on_push() {
 
     let db = Db::open(&h.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&h.work);
-    let run = wait_status(&db, &repo_id, &["completed"], Duration::from_secs(5));
+    // Deliver parks at compose after scaffold (PRCMP); intent is already persisted.
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(5));
     assert_eq!(run.branch, "feat-intent");
     assert_eq!(run.intent.as_deref(), Some("ship intent via agent run"));
     assert_eq!(run.intent_source.as_deref(), Some("env"));
@@ -327,10 +348,27 @@ fn agent_run_second_push_waits_for_new_run() {
 
     let db = Db::open(&h.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&h.work);
-    let first = wait_status(&db, &repo_id, &["completed"], Duration::from_secs(5));
+    // Clean path parks at compose after scaffold (not completed until compose resolves).
+    let first = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(5));
     assert_eq!(first.branch, "feat-second");
 
     commit_change(&h.work, "second.txt");
+    // Compose-parked runs stay ACTIVE for agent attach; push via git to supersede.
+    let out = StdCommand::new("git")
+        .current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .env(REVIEW_BIN_ENV, &h.fake_review)
+        .env(GH_BIN_ENV, &h.fake_gh)
+        .env("PATH", &h.path)
+        .args(["push", "porch", "HEAD:refs/heads/feat-second"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     let assert = Command::cargo_bin("porch")
         .unwrap()
         .current_dir(&h.work)
@@ -352,9 +390,9 @@ fn agent_run_second_push_waits_for_new_run() {
     let second_id = v["run_id"].as_str().expect("run_id");
     assert_ne!(
         second_id, first.id,
-        "second push must attach the new run, not the prior completed one; stdout={stdout}"
+        "second push must attach the new run, not the prior parked one; stdout={stdout}"
     );
-    assert_eq!(v["status"], "completed", "stdout={stdout}");
+    assert_eq!(v["status"], "parked", "stdout={stdout}");
     assert!(
         second_id > first.id.as_str(),
         "new run id should be newer ULID: {second_id} vs {}",
@@ -502,7 +540,7 @@ fn init_intent_prints_tip() {
 }
 
 #[test]
-fn deliver_pr_body_includes_intent_and_review_summary() {
+fn deliver_pr_body_is_scaffold_without_theater() {
     let h = setup("clean");
     git(&h.work, &["checkout", "-b", "feat-body"]);
     commit_change(&h.work, "body.txt");
@@ -522,17 +560,19 @@ fn deliver_pr_body_includes_intent_and_review_summary() {
 
     let db = Db::open(&h.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&h.work);
-    let run = wait_status(&db, &repo_id, &["completed"], Duration::from_secs(45));
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(45));
     assert_eq!(run.intent.as_deref(), Some("document the body enrichment"));
 
     let body = std::fs::read_to_string(h.home.join("gh-pr-body.log")).expect("gh body log");
-    assert!(body.contains("## Intent"), "{body}");
+    assert!(body.contains("<!-- porch-managed:begin -->"), "{body}");
+    assert!(body.contains("## Summary"), "{body}");
     assert!(body.contains("document the body enrichment"), "{body}");
-    assert!(body.contains("## What Changed"), "{body}");
-    assert!(body.contains("body.txt"), "{body}");
-    assert!(body.contains("## Review"), "{body}");
-    assert!(body.contains("## Certify"), "{body}");
     assert!(body.contains("porch-attestation"), "{body}");
+    assert!(!body.contains("## Intent"), "{body}");
+    assert!(!body.contains("## What Changed"), "{body}");
+    assert!(!body.contains("## Review"), "{body}");
+    assert!(!body.contains("## Certify"), "{body}");
+    assert!(!body.contains("## Pipeline"), "{body}");
 
     kill_daemon(&h.home);
 }

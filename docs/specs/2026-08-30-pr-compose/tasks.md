@@ -5,7 +5,7 @@
 > The chosen skill writes `Execution-mode:`.
 
 Feature code: PRCMP
-Status: In-progress
+Status: Implemented
 Date: 2026-08-30
 Execution-mode: continuous
 Max-concurrency: auto
@@ -60,11 +60,11 @@ Design: ./design.md
 
 **Depends-on:** none
 
-- [ ] Write failing units: default scaffold has Summary/Why/How tested/Links; no visible Review/Certify/Pipeline; managed markers present; attestation HTML still appended; redact still applies.
-- [ ] Run `cargo test -p porch-deliver` — expect fail on missing APIs / old sections.
-- [ ] Implement scaffold + merge helpers per design; keep marker `porch-attestation` + `head_sha`.
-- [ ] Run `cargo test -p porch-deliver` — expect pass.
-- [ ] Commit: `feat(porch-deliver): scaffold PR body without gate theater`
+- [x] Write failing units: default scaffold has Summary/Why/How tested/Links; no visible Review/Certify/Pipeline; managed markers present; attestation HTML still appended; redact still applies.
+- [x] Run `cargo test -p porch-deliver` — expect fail on missing APIs / old sections.
+- [x] Implement scaffold + merge helpers per design; keep marker `porch-attestation` + `head_sha`.
+- [x] Run `cargo test -p porch-deliver` — expect pass.
+- [x] Commit: `feat(porch-deliver): scaffold PR body without gate theater`
 
 _Requirements: PRCMP-1.2, PRCMP-1.3, PRCMP-1.4, PRCMP-1.5, PRCMP-5.3, PRCMP-6.1_
 
@@ -85,10 +85,10 @@ _Requirements: PRCMP-1.2, PRCMP-1.3, PRCMP-1.4, PRCMP-1.5, PRCMP-5.3, PRCMP-6.1_
 
 **Depends-on:** Task 1
 
-- [ ] Failing test: template at `.github/pull_request_template.md` on trusted SHA becomes managed interior; missing → porch default.
-- [ ] Run focused deliver/git tests — expect fail.
-- [ ] Implement pick order; never read feature tip alone.
-- [ ] Pass + commit: `feat(porch-deliver): load PR template from trusted SHA`
+- [x] Failing test: template at `.github/pull_request_template.md` on trusted SHA becomes managed interior; missing → porch default.
+- [x] Run focused deliver/git tests — expect fail.
+- [x] Implement pick order; never read feature tip alone.
+- [x] Pass + commit: `feat(porch-deliver): load PR template from trusted SHA`
 
 _Requirements: PRCMP-2.1, PRCMP-2.2, PRCMP-2.3, PRCMP-2.4_
 
@@ -109,9 +109,9 @@ _Requirements: PRCMP-2.1, PRCMP-2.2, PRCMP-2.3, PRCMP-2.4_
 
 **Depends-on:** Task 1
 
-- [ ] Failing tests: title not solely `porch: {branch}` when intent present; managed detection per design §8; human title not classified managed.
-- [ ] Implement + wire `edit_pr_title`; update deliver callers to the one chosen title symbol.
-- [ ] Pass + commit: `feat(porch-deliver): deterministic and managed PR titles`
+- [x] Failing tests: title not solely `porch: {branch}` when intent present; managed detection per design §8; human title not classified managed.
+- [x] Implement + wire `edit_pr_title`; update deliver callers to the one chosen title symbol.
+- [x] Pass + commit: `feat(porch-deliver): deterministic and managed PR titles`
 
 _Requirements: PRCMP-5.1, PRCMP-5.2_
 
@@ -132,12 +132,12 @@ _Requirements: PRCMP-5.1, PRCMP-5.2_
 
 **Depends-on:** Task 1, Task 2, Task 3
 
-- [ ] Failing integration: after certify path with fake gh, PR body is scaffold (no theater), run `parked` with phase `compose`, packet file exists with required keys.
-- [ ] Implement push→scaffold→packet→`compose` parked; if open PR exists and title still porch-managed, `edit_pr_title` as well as body merge; do not watch checks yet.
-- [ ] On deliver repair / later redeliver of an already-composed tip: refresh porch-managed body (+ title if managed) and **do not** re-enter compose park.
-- [ ] Update m14 assertions away from Intent/Review/Certify theater.
-- [ ] Pass `cargo test -p porch --test m17_pr_compose` (and m14 as touched).
-- [ ] Commit: `feat(porch-run): scaffold PR and park compose`
+- [x] Failing integration: after certify path with fake gh, PR body is scaffold (no theater), run `parked` with phase `compose`, packet file exists with required keys.
+- [x] Implement push→scaffold→packet→`compose` parked; if open PR exists and title still porch-managed, `edit_pr_title` as well as body merge; do not watch checks yet.
+- [x] On deliver repair / later redeliver of an already-composed tip: refresh porch-managed body (+ title if managed) and **do not** re-enter compose park.
+- [x] Update m14 assertions away from Intent/Review/Certify theater.
+- [x] Pass `cargo test -p porch --test m17_pr_compose` (and m14 as touched).
+- [x] Commit: `feat(porch-run): scaffold PR and park compose`
 
 _Requirements: PRCMP-1.1, PRCMP-3.1, PRCMP-3.2, PRCMP-3.3, PRCMP-3.5, PRCMP-5.4, PRCMP-7.1, PRCMP-7.2_
 
@@ -160,9 +160,9 @@ _Requirements: PRCMP-1.1, PRCMP-3.1, PRCMP-3.2, PRCMP-3.3, PRCMP-3.5, PRCMP-5.4,
 
 **Depends-on:** Task 4
 
-- [ ] Failing tests: respond merges body + refreshes attestation; skip leaves scaffold, completes deliver (does **not** hit review Skip arm); abort fails run and leaves PR open; invalid theater body rejected and stays parked; approve/fix on compose → usage error.
-- [ ] Implement respond/skip/abort + CLI flags; branch `parked_phase == "compose"` **before** review Skip; refresh attestation on skip/respond per design.
-- [ ] Pass + commit: `feat(porch): agent compose respond skip abort`
+- [x] Failing tests: respond merges body + refreshes attestation; skip leaves scaffold, completes deliver (does **not** hit review Skip arm); abort fails run and leaves PR open; invalid theater body rejected and stays parked; approve/fix on compose → usage error.
+- [x] Implement respond/skip/abort + CLI flags; branch `parked_phase == "compose"` **before** review Skip; refresh attestation on skip/respond per design.
+- [x] Pass + commit: `feat(porch): agent compose respond skip abort`
 
 _Requirements: PRCMP-3.4, PRCMP-4.1, PRCMP-4.2, PRCMP-4.3, PRCMP-4.4, PRCMP-6.2, PRCMP-7.5, PRCMP-7.6_
 
@@ -182,9 +182,9 @@ _Requirements: PRCMP-3.4, PRCMP-4.1, PRCMP-4.2, PRCMP-4.3, PRCMP-4.4, PRCMP-6.2,
 
 **Depends-on:** Task 5
 
-- [ ] Failing test: with `watch_checks` set, no check poll while `phase=compose`; after skip/respond, allowlisted watch runs.
-- [ ] Implement ordering; keep rerun_transient ignored.
-- [ ] Pass + commit: `feat(porch-run): babysit checks after compose`
+- [x] Failing test: with `watch_checks` set, no check poll while `phase=compose`; after skip/respond, allowlisted watch runs.
+- [x] Implement ordering; keep rerun_transient ignored.
+- [x] Pass + commit: `feat(porch-run): babysit checks after compose`
 
 _Requirements: PRCMP-7.3, PRCMP-7.3a, PRCMP-7.4_
 
@@ -206,9 +206,9 @@ _Requirements: PRCMP-7.3, PRCMP-7.3a, PRCMP-7.4_
 
 **Depends-on:** Task 5
 
-- [ ] Update CONTEXT Park; skill documents packet path + respond/skip/abort; TUI shows compose park actions.
-- [ ] `cargo test -p porch --test m17_pr_compose` still green; `cargo clippy --workspace --all-targets -- -D warnings`.
-- [ ] Commit: `docs(porch): compose park operator surface`
+- [x] Update CONTEXT Park; skill documents packet path + respond/skip/abort; TUI shows compose park actions.
+- [x] `cargo test -p porch --test m17_pr_compose` still green; `cargo clippy --workspace --all-targets -- -D warnings`.
+- [x] Commit: `docs(porch): compose park operator surface`
 
 _Requirements: PRCMP-3.4, PRCMP-7.5_ (docs/ops surface for already-tested behavior)
 

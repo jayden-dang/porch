@@ -76,6 +76,8 @@ fn install_noop_gh(bin_dir: &Path) -> PathBuf {
     write_exe(
         &path,
         r#"#!/bin/sh
+: "${PORCH_HOME:?PORCH_HOME required}"
+STATE="$PORCH_HOME/gh-pr-state"
 for a in "$@"; do [ "$a" = "--version" ] && echo "gh version 2.50.0 (fake)" && exit 0; done
 CMD=""; PREV=""
 for a in "$@"; do
@@ -83,9 +85,16 @@ for a in "$@"; do
   PREV="$a"
 done
 case "$CMD" in
-  list) printf '[]\n' ;;
-  create) cat >/dev/null; echo "https://example.com/pull/1" ;;
-  edit) cat >/dev/null ;;
+  list)
+    if [ -f "$STATE" ]; then /bin/cat "$STATE"; else printf '[]\n'; fi
+    ;;
+  create)
+    /bin/cat >/dev/null
+    printf '[{"number":1,"url":"https://example.com/pull/1","title":"porch: created"}]\n' > "$STATE"
+    echo "https://example.com/pull/1"
+    ;;
+  edit) /bin/cat >/dev/null ;;
+  view) printf '{"mergeable":"MERGEABLE","number":1,"url":"https://example.com/pull/1","title":"porch: created","body":""}\n' ;;
   checks) printf '[]\n' ;;
   *) echo "noop-gh: $*" >&2; exit 1 ;;
 esac
@@ -359,13 +368,14 @@ fn agent_review_push_writes_prompt_and_completes() {
 
     let db = Db::open(&home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&work);
+    // Clean path parks at compose after scaffold (compose resolve is Task 5).
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed", "parked"],
+        &["parked", "failed", "completed"],
         Duration::from_secs(30),
     );
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
 
     let prompt = home
         .join("runs")

@@ -26,6 +26,52 @@ const DEFAULT_CHECK_POLL_SECS: u64 = 2;
 
 const ATTESTATION_MARKER: &str = "porch-attestation";
 
+/// Start of the porch-owned visible body region.
+pub const MANAGED_BEGIN: &str = "<!-- porch-managed:begin -->";
+
+/// End of the porch-owned visible body region (attestation stays outside).
+pub const MANAGED_END: &str = "<!-- porch-managed:end -->";
+
+/// Fixed-path PR template candidates (trusted tree), in pick order.
+const PR_TEMPLATE_PATHS: &[&str] = &[
+    ".github/pull_request_template.md",
+    "pull_request_template.md",
+    "docs/pull_request_template.md",
+];
+
+/// Multi-template directory (lexicographic first `*.md` after fixed paths).
+const PR_TEMPLATE_DIR: &str = ".github/PULL_REQUEST_TEMPLATE";
+
+/// Which template source won when loading from the trusted SHA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateSource {
+    /// Consumer repo template blob at a trusted-tree path.
+    RepoTemplate,
+    /// No readable template at the trusted SHA — callers use porch default.
+    PorchDefault,
+}
+
+impl TemplateSource {
+    /// Packet / status string (`repo_template` | `porch_default`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RepoTemplate => "repo_template",
+            Self::PorchDefault => "porch_default",
+        }
+    }
+}
+
+/// Result of [`load_pr_template`]: bytes plus which path/source won.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateBytes {
+    /// Raw template file bytes when [`TemplateSource::RepoTemplate`].
+    pub bytes: Option<Vec<u8>>,
+    pub source: TemplateSource,
+    /// Trusted-tree path that won, or `None` for porch default.
+    pub path: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(
@@ -107,6 +153,18 @@ pub struct PullRequest {
     pub url: String,
     #[serde(default)]
     pub title: String,
+}
+
+/// PR fields from `gh pr view` (body included for managed merge).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrView {
+    pub number: u64,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
 }
 
 /// One check row from `gh pr checks --json`.
@@ -356,42 +414,258 @@ pub struct Attestation {
     pub steps: Vec<StepSnapshot>,
 }
 
-/// Build porch PR body sections + HTML attestation, then redact homes.
+/// Placeholder facts for the default scaffold (not a path-list dump).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScaffoldFacts {
+    /// Short prose for Summary (commit subjects / intent — not raw paths alone).
+    pub summary: String,
+    pub why: String,
+    pub how_tested: String,
+    pub links: String,
+}
+
+fn placeholder(s: &str) -> &str {
+    let t = s.trim();
+    if t.is_empty() { "…" } else { t }
+}
+
+/// Default visible interior when no consumer PR template is present.
 #[must_use]
-pub fn build_pr_body(
-    intent: Option<&str>,
-    what_changed: &str,
-    risk: &str,
-    review: &str,
-    certify: &str,
-    pipeline: &str,
-    attestation: &Attestation,
-) -> String {
-    let mut body = String::new();
-    body.push_str("## Intent\n\n");
-    body.push_str(intent.unwrap_or("_none_"));
-    body.push_str("\n\n## What Changed\n\n");
-    body.push_str(what_changed);
-    body.push_str("\n\n## Risk\n\n");
-    body.push_str(risk);
-    body.push_str("\n\n## Review\n\n");
-    body.push_str(review);
-    body.push_str("\n\n## Certify\n\n");
-    body.push_str(certify);
-    body.push_str("\n\n## Pipeline\n\n");
-    body.push_str(pipeline);
+pub fn default_scaffold_interior(facts: &ScaffoldFacts) -> String {
+    format!(
+        "## Summary\n\n{}\n\n## Why\n\n{}\n\n## How tested\n\n{}\n\n## Links\n\n{}\n",
+        placeholder(&facts.summary),
+        placeholder(&facts.why),
+        placeholder(&facts.how_tested),
+        placeholder(&facts.links),
+    )
+}
+
+fn wrap_managed(interior: &str) -> String {
+    let trimmed = interior.trim_end_matches('\n');
+    format!("{MANAGED_BEGIN}\n{trimmed}\n{MANAGED_END}\n")
+}
+
+fn format_attestation_comment(attestation: &Attestation) -> String {
+    match serde_json::to_string(attestation) {
+        Ok(json) => format!("<!-- {ATTESTATION_MARKER} {json} -->\n"),
+        Err(_) => String::new(),
+    }
+}
+
+fn strip_attestation_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    let open = format!("<!-- {ATTESTATION_MARKER}");
+    while let Some(idx) = rest.find(&open) {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + open.len()..];
+        match after.find("-->") {
+            Some(end) => rest = after[end + 3..].trim_start_matches('\n'),
+            None => {
+                // Unclosed marker — drop the rest of the comment opener.
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn finish_body(visible: &str, attestation: &Attestation) -> String {
+    let mut body = visible.trim_end().to_string();
     body.push('\n');
-    if let Ok(json) = serde_json::to_string(attestation) {
-        use std::fmt::Write as _;
-        let _ = write!(body, "\n<!-- {ATTESTATION_MARKER} {json} -->\n");
+    let comment = format_attestation_comment(attestation);
+    if !comment.is_empty() {
+        body.push('\n');
+        body.push_str(&comment);
     }
     redact_home_paths(&body)
 }
 
-/// Deterministic PR title (no agent).
+/// Load PR template bytes from the trusted default-branch SHA only.
+///
+/// Pick order: first existing among [`PR_TEMPLATE_PATHS`], then the lexicographically
+/// first `*.md` under [`PR_TEMPLATE_DIR`]. Never reads the feature tip alone.
+///
+/// # Errors
+///
+/// Returns [`Error::Msg`] when git cannot read the trusted commit or a chosen blob.
+pub fn load_pr_template(
+    bare: &porch_git::GitDir,
+    trusted_sha: &str,
+) -> Result<TemplateBytes, Error> {
+    for path in PR_TEMPLATE_PATHS {
+        if let Some(bytes) = porch_git::show_path_at(bare, trusted_sha, path)
+            .map_err(|e| Error::Msg(format!("read PR template {path} at {trusted_sha}: {e}")))?
+        {
+            return Ok(TemplateBytes {
+                bytes: Some(bytes),
+                source: TemplateSource::RepoTemplate,
+                path: Some((*path).to_string()),
+            });
+        }
+    }
+
+    let names = porch_git::list_tree_names_at(bare, trusted_sha, PR_TEMPLATE_DIR).map_err(|e| {
+        Error::Msg(format!(
+            "list PR templates under {PR_TEMPLATE_DIR} at {trusted_sha}: {e}"
+        ))
+    })?;
+    if let Some(names) = names {
+        let mut md: Vec<String> = names
+            .into_iter()
+            .filter(|name| {
+                !name.contains('/')
+                    && !name.contains('\\')
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            })
+            .collect();
+        md.sort();
+        if let Some(name) = md.first() {
+            let path = format!("{PR_TEMPLATE_DIR}/{name}");
+            if let Some(bytes) = porch_git::show_path_at(bare, trusted_sha, &path)
+                .map_err(|e| Error::Msg(format!("read PR template {path} at {trusted_sha}: {e}")))?
+            {
+                return Ok(TemplateBytes {
+                    bytes: Some(bytes),
+                    source: TemplateSource::RepoTemplate,
+                    path: Some(path),
+                });
+            }
+        }
+    }
+
+    Ok(TemplateBytes {
+        bytes: None,
+        source: TemplateSource::PorchDefault,
+        path: None,
+    })
+}
+
+/// Build scaffold PR body: managed markers + template or default skeleton + attestation.
+///
+/// `template_or_default`: `Some(template_bytes)` uses those as the managed interior;
+/// `None` uses [`default_scaffold_interior`].
+#[must_use]
+pub fn build_scaffold_body(
+    template_or_default: Option<&str>,
+    facts: &ScaffoldFacts,
+    attestation: &Attestation,
+) -> String {
+    let interior = match template_or_default {
+        Some(template) => {
+            let mut t = template.to_string();
+            if !t.ends_with('\n') {
+                t.push('\n');
+            }
+            t
+        }
+        None => default_scaffold_interior(facts),
+    };
+    finish_body(&wrap_managed(&interior), attestation)
+}
+
+/// Replace porch-managed region + refresh attestation; preserve human regions outside markers.
+///
+/// `new_visible` is the new managed **interior** (without begin/end markers).
+/// When existing body has no managed pair, the whole body is replaced by a fresh scaffold wrap.
+#[must_use]
+pub fn merge_porch_managed(
+    existing_body: &str,
+    new_visible: &str,
+    attestation: &Attestation,
+) -> String {
+    let cleaned = strip_attestation_comments(existing_body);
+    let wrapped = wrap_managed(new_visible);
+    let merged = match (cleaned.find(MANAGED_BEGIN), cleaned.find(MANAGED_END)) {
+        (Some(begin), Some(end)) if begin < end => {
+            let after_end = end + MANAGED_END.len();
+            let mut out = String::with_capacity(cleaned.len() + wrapped.len());
+            out.push_str(&cleaned[..begin]);
+            out.push_str(wrapped.trim_end());
+            out.push('\n');
+            out.push_str(cleaned[after_end..].trim_start_matches('\n'));
+            out
+        }
+        _ => wrapped,
+    };
+    finish_body(&merged, attestation)
+}
+
+/// Compatibility shim: builds the default scaffold (ignores theater section inputs).
+///
+/// Prefer [`build_scaffold_body`] / [`merge_porch_managed`]. Intent maps into Summary when present.
+#[must_use]
+pub fn build_pr_body(
+    intent: Option<&str>,
+    _what_changed: &str,
+    _risk: &str,
+    _review: &str,
+    _certify: &str,
+    _pipeline: &str,
+    attestation: &Attestation,
+) -> String {
+    let facts = ScaffoldFacts {
+        summary: intent.unwrap_or("").to_string(),
+        ..ScaffoldFacts::default()
+    };
+    build_scaffold_body(None, &facts, attestation)
+}
+
+/// Deterministic scaffold PR title (no agent).
+///
+/// Preference: first non-empty intent line, else commit subject, else
+/// `porch: {branch}` (legacy-compatible fallback).
+#[must_use]
+pub fn deterministic_pr_title(
+    branch: &str,
+    intent: Option<&str>,
+    commit_subject: Option<&str>,
+) -> String {
+    if let Some(line) = first_nonempty_line(intent) {
+        return line;
+    }
+    if let Some(line) = first_nonempty_line(commit_subject) {
+        return line;
+    }
+    format!("porch: {branch}")
+}
+
+/// Thin wrapper for the branch-only fallback. Prefer [`deterministic_pr_title`].
 #[must_use]
 pub fn pr_title(branch: &str) -> String {
-    format!("porch: {branch}")
+    deterministic_pr_title(branch, None, None)
+}
+
+/// Whether `current` is still porch-owned (design §8 title heuristic).
+///
+/// True when equal to `last_written`, matches `^porch: `, or equals the current
+/// scaffold deterministic title.
+#[must_use]
+pub fn is_porch_managed_title(
+    current: &str,
+    last_written: Option<&str>,
+    scaffold_title: &str,
+) -> bool {
+    if last_written.is_some_and(|last| current == last) {
+        return true;
+    }
+    if current.starts_with("porch: ") {
+        return true;
+    }
+    current == scaffold_title
+}
+
+fn first_nonempty_line(raw: Option<&str>) -> Option<String> {
+    raw.and_then(|text| {
+        text.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// Options for finding / creating / updating a PR.
@@ -490,6 +764,28 @@ pub fn edit_pr_body(
     Ok(())
 }
 
+/// Update an existing PR title via `gh pr edit --title`.
+///
+/// # Errors
+///
+/// Returns spawn / exit errors.
+pub fn edit_pr_title(
+    bin: &str,
+    timeout: Duration,
+    work_tree: &Path,
+    number: u64,
+    title: &str,
+) -> Result<(), Error> {
+    let num = number.to_string();
+    let _ = run_gh(
+        bin,
+        timeout,
+        work_tree,
+        &["pr", "edit", &num, "--title", title],
+    )?;
+    Ok(())
+}
+
 /// List PR checks JSON via `gh pr checks --json name,state,bucket,link`.
 ///
 /// # Errors
@@ -560,6 +856,142 @@ pub fn pr_mergeable(
         &["pr", "view", &num, "--json", "mergeable"],
     )?;
     parse_mergeable(&out.stdout)
+}
+
+/// Fetch title/body (and identity) for an open PR via `gh pr view`.
+///
+/// # Errors
+///
+/// Returns spawn / exit / JSON errors.
+pub fn view_pr(
+    bin: &str,
+    timeout: Duration,
+    work_tree: &Path,
+    number: u64,
+) -> Result<PrView, Error> {
+    let num = number.to_string();
+    let out = run_gh(
+        bin,
+        timeout,
+        work_tree,
+        &["pr", "view", &num, "--json", "number,url,title,body"],
+    )?;
+    let text =
+        std::str::from_utf8(&out.stdout).map_err(|e| Error::Msg(format!("pr view utf-8: {e}")))?;
+    Ok(serde_json::from_str(text.trim())?)
+}
+
+/// Structured theater-rejection rules shipped in the compose packet (design §8).
+#[must_use]
+pub fn theater_reject_rules() -> serde_json::Value {
+    serde_json::json!({
+        "forbid_pipeline_board": true,
+        "forbid_certify_transcript": true,
+        "forbid_review_findings_dump": true,
+        "forbid_approved_at_sha_line": true,
+        "forbid_visible_attestation_restatement": true,
+    })
+}
+
+/// Extract the managed interior from an Agent compose body (markers optional).
+#[must_use]
+pub fn compose_managed_interior(body: &str) -> String {
+    let cleaned = strip_attestation_comments(body);
+    match (cleaned.find(MANAGED_BEGIN), cleaned.find(MANAGED_END)) {
+        (Some(begin), Some(end)) if begin < end => {
+            let interior = cleaned[begin + MANAGED_BEGIN.len()..end].trim();
+            if interior.is_empty() {
+                String::new()
+            } else {
+                format!("{interior}\n")
+            }
+        }
+        _ => {
+            let trimmed = cleaned.trim();
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("{trimmed}\n")
+            }
+        }
+    }
+}
+
+/// Validate Agent compose body before merge.
+///
+/// # Errors
+///
+/// Returns a human-readable rejection when the body is empty or reintroduces
+/// porch self-review theater signatures.
+pub fn validate_compose_body(body: &str) -> Result<(), String> {
+    let interior = compose_managed_interior(body);
+    if interior.trim().is_empty() {
+        return Err("compose body is empty".into());
+    }
+
+    let visible = strip_attestation_comments(body);
+    if has_pipeline_board(&visible) {
+        return Err("compose body rejected: porch theater signature (Pipeline board)".into());
+    }
+    if has_approved_at_sha_line(&visible) {
+        return Err("compose body rejected: porch theater signature (approved-at SHA)".into());
+    }
+    if has_certify_transcript(&visible) {
+        return Err("compose body rejected: porch theater signature (Certify transcript)".into());
+    }
+    if has_review_findings_dump(&visible) {
+        return Err("compose body rejected: porch theater signature (Review findings dump)".into());
+    }
+    if has_visible_attestation_restatement(&visible) {
+        return Err("compose body rejected: porch theater signature (visible attestation)".into());
+    }
+    Ok(())
+}
+
+fn has_pipeline_board(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("## pipeline") {
+        return false;
+    }
+    // intent → … → deliver (ASCII or unicode arrows)
+    let collapsed: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    collapsed.contains("intent")
+        && collapsed.contains("deliver")
+        && (collapsed.contains("→") || collapsed.contains("->") || collapsed.contains("=>"))
+}
+
+fn has_approved_at_sha_line(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("approved at") && lower.chars().filter(char::is_ascii_hexdigit).count() >= 7
+}
+
+fn has_certify_transcript(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("## certify") {
+        return false;
+    }
+    // Gate-style transcript cues (not a bare consumer checklist heading).
+    lower.contains("continuity")
+        || lower.contains("certified head")
+        || lower.contains("certify:")
+        || (lower.contains("passed") && lower.contains("failed"))
+}
+
+fn has_review_findings_dump(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    if !lower.contains("## review") {
+        return false;
+    }
+    lower.contains("\"severity\"")
+        || lower.contains("finding id")
+        || lower.contains("findings:")
+        || lower.contains("blocking finding")
+}
+
+fn has_visible_attestation_restatement(body: &str) -> bool {
+    // HTML comment attestation is stripped before this check; bare marker is theater.
+    body.to_ascii_lowercase().contains("porch-attestation")
+        || (body.contains("\"head_sha\"") && body.contains("\"steps\""))
 }
 
 /// Options for [`watch_allowlisted_checks`].
@@ -778,8 +1210,147 @@ mod tests {
         assert!(!s.contains(r"C:\Users\bob"), "{s}");
     }
 
+    fn sample_attestation() -> Attestation {
+        Attestation {
+            head_sha: "abc123deadbeef".into(),
+            steps: vec![StepSnapshot {
+                step: "review".into(),
+                status: "completed".into(),
+            }],
+        }
+    }
+
     #[test]
-    fn attestation_binds_head_sha() {
+    fn default_scaffold_has_summary_why_how_tested_links() {
+        let body = build_scaffold_body(None, &ScaffoldFacts::default(), &sample_attestation());
+        assert!(body.contains("## Summary"), "{body}");
+        assert!(body.contains("## Why"), "{body}");
+        assert!(body.contains("## How tested"), "{body}");
+        assert!(body.contains("## Links"), "{body}");
+    }
+
+    #[test]
+    fn default_scaffold_omits_gate_theater_headings() {
+        let body = build_scaffold_body(
+            None,
+            &ScaffoldFacts {
+                summary: "short prose about the change".into(),
+                ..ScaffoldFacts::default()
+            },
+            &sample_attestation(),
+        );
+        assert!(!body.contains("## Review"), "{body}");
+        assert!(!body.contains("## Certify"), "{body}");
+        assert!(!body.contains("## Pipeline"), "{body}");
+        assert!(!body.contains("## Intent"), "{body}");
+        assert!(!body.contains("## What Changed"), "{body}");
+        assert!(!body.contains("approved at"), "{body}");
+    }
+
+    #[test]
+    fn scaffold_wraps_visible_body_in_managed_markers() {
+        let body = build_scaffold_body(None, &ScaffoldFacts::default(), &sample_attestation());
+        let begin = body.find(MANAGED_BEGIN).expect("managed begin");
+        let end = body.find(MANAGED_END).expect("managed end");
+        assert!(begin < end, "{body}");
+        let attest = body.find("<!-- porch-attestation").expect("attestation");
+        assert!(end < attest, "attestation must follow managed end: {body}");
+    }
+
+    #[test]
+    fn scaffold_attestation_binds_head_sha_outside_managed() {
+        let body = build_scaffold_body(None, &ScaffoldFacts::default(), &sample_attestation());
+        assert!(body.contains("<!-- porch-attestation"), "{body}");
+        assert!(body.contains("\"head_sha\":\"abc123deadbeef\""), "{body}");
+        let managed_end = body.find(MANAGED_END).unwrap();
+        let attest_at = body.find("<!-- porch-attestation").unwrap();
+        assert!(managed_end < attest_at, "{body}");
+    }
+
+    #[test]
+    fn scaffold_uses_template_bytes_as_managed_interior() {
+        let template = "## Custom checklist\n\n- [ ] item\n";
+        let body = build_scaffold_body(
+            Some(template),
+            &ScaffoldFacts::default(),
+            &sample_attestation(),
+        );
+        assert!(body.contains("## Custom checklist"), "{body}");
+        assert!(body.contains("- [ ] item"), "{body}");
+        assert!(!body.contains("## Summary"), "{body}");
+        assert!(body.contains(MANAGED_BEGIN), "{body}");
+        assert!(body.contains("<!-- porch-attestation"), "{body}");
+    }
+
+    #[test]
+    fn scaffold_redacts_home_paths_in_visible_and_facts() {
+        let body = build_scaffold_body(
+            None,
+            &ScaffoldFacts {
+                summary: "touched /Users/jayden/secret/file".into(),
+                why: "see /home/alice/notes".into(),
+                ..ScaffoldFacts::default()
+            },
+            &sample_attestation(),
+        );
+        assert!(!body.contains("/Users/jayden"), "{body}");
+        assert!(!body.contains("/home/alice"), "{body}");
+        assert!(body.contains("~/secret/file"), "{body}");
+        assert!(body.contains("~/notes"), "{body}");
+    }
+
+    #[test]
+    fn merge_replaces_managed_region_and_refreshes_attestation() {
+        let existing = format!(
+            "operator note\n{MANAGED_BEGIN}\n## Summary\n\nold\n{MANAGED_END}\n\n<!-- porch-attestation {{\"head_sha\":\"oldsha\",\"steps\":[]}} -->\n"
+        );
+        let merged = merge_porch_managed(
+            &existing,
+            "## Summary\n\nnew prose\n",
+            &Attestation {
+                head_sha: "newsha".into(),
+                steps: vec![],
+            },
+        );
+        assert!(merged.contains("operator note"), "{merged}");
+        assert!(merged.contains("new prose"), "{merged}");
+        assert!(!merged.contains("oldsha"), "{merged}");
+        assert!(merged.contains("\"head_sha\":\"newsha\""), "{merged}");
+        assert!(!merged.contains("\nold\n"), "{merged}");
+        assert!(
+            merged.contains(MANAGED_BEGIN) && merged.contains(MANAGED_END),
+            "{merged}"
+        );
+    }
+
+    #[test]
+    fn merge_preserves_human_regions_outside_markers() {
+        let existing = format!(
+            "## Human preface\n\nkeep me\n{MANAGED_BEGIN}\ninterior\n{MANAGED_END}\n## Human footer\n\nalso keep\n"
+        );
+        let merged = merge_porch_managed(&existing, "replaced interior\n", &sample_attestation());
+        assert!(merged.contains("## Human preface"), "{merged}");
+        assert!(merged.contains("keep me"), "{merged}");
+        assert!(merged.contains("## Human footer"), "{merged}");
+        assert!(merged.contains("also keep"), "{merged}");
+        assert!(merged.contains("replaced interior"), "{merged}");
+        assert!(!merged.contains("\ninterior\n"), "{merged}");
+    }
+
+    #[test]
+    fn merge_redacts_home_paths() {
+        let existing = format!("{MANAGED_BEGIN}\nold\n{MANAGED_END}\n");
+        let merged = merge_porch_managed(
+            &existing,
+            "path /Users/jayden/proj\n",
+            &sample_attestation(),
+        );
+        assert!(!merged.contains("/Users/jayden"), "{merged}");
+        assert!(merged.contains("~/proj"), "{merged}");
+    }
+
+    #[test]
+    fn compatibility_build_pr_body_uses_scaffold_not_theater() {
         let body = build_pr_body(
             Some("fix it"),
             "one file",
@@ -787,27 +1358,381 @@ mod tests {
             "clean",
             "ok",
             "intent→deliver",
-            &Attestation {
-                head_sha: "abc123deadbeef".into(),
-                steps: vec![StepSnapshot {
-                    step: "review".into(),
-                    status: "completed".into(),
-                }],
-            },
+            &sample_attestation(),
         );
+        assert!(body.contains("## Summary"), "{body}");
         assert!(body.contains("<!-- porch-attestation"), "{body}");
         assert!(body.contains("\"head_sha\":\"abc123deadbeef\""), "{body}");
-        assert!(body.contains("## Intent"), "{body}");
-        assert!(body.contains("fix it"), "{body}");
-        assert!(body.contains("## What Changed"), "{body}");
-        assert!(body.contains("one file"), "{body}");
-        assert!(body.contains("## Review"), "{body}");
-        assert!(body.contains("## Certify"), "{body}");
+        assert!(!body.contains("## Review"), "{body}");
+        assert!(!body.contains("## Certify"), "{body}");
+        assert!(!body.contains("## Pipeline"), "{body}");
     }
 
     #[test]
-    fn pr_title_deterministic() {
+    fn validate_compose_body_rejects_theater_and_empty() {
+        assert!(validate_compose_body("").is_err());
+        assert!(validate_compose_body("   \n").is_err());
+        let theater =
+            "## Summary\nok\n\n## Pipeline\n\nintent → rebase → review → certify → deliver\n";
+        assert!(
+            validate_compose_body(theater)
+                .unwrap_err()
+                .contains("theater")
+        );
+        let approved = "## Summary\nok\n\napproved at `deadbeefcafebabe`\n";
+        assert!(validate_compose_body(approved).is_err());
+        let ok = "## Summary\n\nShip it.\n\n## Why\n\nBecause.\n";
+        assert!(validate_compose_body(ok).is_ok());
+    }
+
+    fn bare_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, porch_git::GitDir, String) {
+        use std::process::Command;
+
+        use porch_git::{init_bare, run, stdout_trim};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["init"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["config", "user.email", "porch@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["config", "user.name", "Porch"])
+            .status()
+            .unwrap();
+        for (rel, content) in files {
+            let path = work.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, content).unwrap();
+        }
+        Command::new("git")
+            .current_dir(&work)
+            .args(["add", "-A"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["commit", "-m", "templates"])
+            .status()
+            .unwrap();
+        let bare_path = root.join("bare.git");
+        let bare = init_bare(&bare_path).unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["push", bare_path.to_str().unwrap(), "HEAD:refs/heads/main"])
+            .status()
+            .unwrap();
+        let sha = stdout_trim(&run(&bare, &["rev-parse", "refs/heads/main"]).unwrap());
+        (tmp, bare, sha)
+    }
+
+    #[test]
+    fn load_template_from_github_path_becomes_managed_interior() {
+        let (_tmp, bare, trusted) = bare_with_files(&[(
+            ".github/pull_request_template.md",
+            "## Repo checklist\n\n- [ ] done\n",
+        )]);
+        let loaded = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(loaded.source, TemplateSource::RepoTemplate);
+        assert_eq!(
+            loaded.path.as_deref(),
+            Some(".github/pull_request_template.md")
+        );
+        let text = std::str::from_utf8(loaded.bytes.as_ref().unwrap()).unwrap();
+        let body =
+            build_scaffold_body(Some(text), &ScaffoldFacts::default(), &sample_attestation());
+        assert!(body.contains("## Repo checklist"), "{body}");
+        assert!(body.contains("- [ ] done"), "{body}");
+        assert!(body.contains(MANAGED_BEGIN), "{body}");
+        assert!(!body.contains("## Summary"), "{body}");
+    }
+
+    #[test]
+    fn load_template_missing_uses_porch_default() {
+        let (_tmp, bare, trusted) = bare_with_files(&[("README", "hi\n")]);
+        let loaded = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(loaded.source, TemplateSource::PorchDefault);
+        assert!(loaded.path.is_none());
+        assert!(loaded.bytes.is_none());
+        let text = loaded
+            .bytes
+            .as_deref()
+            .and_then(|b| std::str::from_utf8(b).ok());
+        let body = build_scaffold_body(text, &ScaffoldFacts::default(), &sample_attestation());
+        assert!(body.contains("## Summary"), "{body}");
+        assert!(body.contains("## Why"), "{body}");
+    }
+
+    #[test]
+    fn load_template_ignores_feature_tip_alone() {
+        use std::process::Command;
+
+        use porch_git::{init_bare, stdout_trim};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["init"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["config", "user.email", "porch@example.com"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["config", "user.name", "Porch"])
+            .status()
+            .unwrap();
+        std::fs::write(work.join("README"), "base\n").unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["add", "README"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["commit", "-m", "trusted"])
+            .status()
+            .unwrap();
+        let trusted = stdout_trim(
+            &Command::new("git")
+                .current_dir(&work)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap(),
+        );
+        // Feature tip alone carries a template the trusted SHA does not.
+        std::fs::create_dir_all(work.join(".github")).unwrap();
+        std::fs::write(
+            work.join(".github/pull_request_template.md"),
+            "## Tip-only template\n",
+        )
+        .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["add", "-A"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["commit", "-m", "feature tip"])
+            .status()
+            .unwrap();
+        let tip = stdout_trim(
+            &Command::new("git")
+                .current_dir(&work)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap(),
+        );
+        let bare_path = root.join("bare.git");
+        let bare = init_bare(&bare_path).unwrap();
+        Command::new("git")
+            .current_dir(&work)
+            .args(["push", bare_path.to_str().unwrap(), "HEAD:refs/heads/feat"])
+            .status()
+            .unwrap();
+        // Pin trusted commit on main without the tip-only template.
+        Command::new("git")
+            .current_dir(&work)
+            .args([
+                "push",
+                bare_path.to_str().unwrap(),
+                &format!("{trusted}:refs/heads/main"),
+            ])
+            .status()
+            .unwrap();
+
+        let from_trusted = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(from_trusted.source, TemplateSource::PorchDefault);
+        assert!(from_trusted.bytes.is_none());
+
+        // Control: tip blob exists; load still keyed off trusted SHA only.
+        let tip_blob =
+            porch_git::show_path_at(&bare, &tip, ".github/pull_request_template.md").unwrap();
+        assert!(tip_blob.is_some());
+    }
+
+    #[test]
+    fn load_template_pick_order_prefers_github_path() {
+        let (_tmp, bare, trusted) = bare_with_files(&[
+            (".github/pull_request_template.md", "## From .github\n"),
+            ("pull_request_template.md", "## From root\n"),
+            ("docs/pull_request_template.md", "## From docs\n"),
+            (
+                ".github/PULL_REQUEST_TEMPLATE/alpha.md",
+                "## From dir alpha\n",
+            ),
+        ]);
+        let loaded = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(
+            loaded.path.as_deref(),
+            Some(".github/pull_request_template.md")
+        );
+        let text = std::str::from_utf8(loaded.bytes.as_ref().unwrap()).unwrap();
+        assert!(text.contains("From .github"), "{text}");
+    }
+
+    #[test]
+    fn load_template_falls_through_fixed_paths() {
+        let (_tmp, bare, trusted) =
+            bare_with_files(&[("docs/pull_request_template.md", "## From docs only\n")]);
+        let loaded = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(
+            loaded.path.as_deref(),
+            Some("docs/pull_request_template.md")
+        );
+        let text = std::str::from_utf8(loaded.bytes.as_ref().unwrap()).unwrap();
+        assert!(text.contains("From docs only"), "{text}");
+    }
+
+    #[test]
+    fn load_template_dir_picks_lexicographic_first_md() {
+        let (_tmp, bare, trusted) = bare_with_files(&[
+            (".github/PULL_REQUEST_TEMPLATE/zebra.md", "## Zebra\n"),
+            (".github/PULL_REQUEST_TEMPLATE/alpha.md", "## Alpha\n"),
+            (".github/PULL_REQUEST_TEMPLATE/notes.txt", "ignore me\n"),
+        ]);
+        let loaded = load_pr_template(&bare, &trusted).unwrap();
+        assert_eq!(
+            loaded.path.as_deref(),
+            Some(".github/PULL_REQUEST_TEMPLATE/alpha.md")
+        );
+        let text = std::str::from_utf8(loaded.bytes.as_ref().unwrap()).unwrap();
+        assert!(text.contains("Alpha"), "{text}");
+        assert!(!text.contains("Zebra"), "{text}");
+    }
+
+    #[test]
+    fn deterministic_pr_title_falls_back_to_porch_branch() {
+        assert_eq!(
+            deterministic_pr_title("feat/x", None, None),
+            "porch: feat/x"
+        );
+        assert_eq!(
+            deterministic_pr_title("feat/x", Some("  \n  "), Some("")),
+            "porch: feat/x"
+        );
+        // Thin wrapper keeps the branch-only fallback.
         assert_eq!(pr_title("feat/x"), "porch: feat/x");
+    }
+
+    #[test]
+    fn deterministic_pr_title_prefers_intent_over_branch() {
+        let title = deterministic_pr_title(
+            "feat/x",
+            Some("ship the compose packet\n\nmore detail"),
+            Some("feat: unrelated commit subject"),
+        );
+        assert_eq!(title, "ship the compose packet");
+        assert_ne!(title, "porch: feat/x");
+        assert!(!title.starts_with("porch: "), "{title}");
+    }
+
+    #[test]
+    fn deterministic_pr_title_uses_commit_subject_when_intent_absent() {
+        let title = deterministic_pr_title(
+            "feat/x",
+            None,
+            Some("feat(deliver): improve PR scaffold title"),
+        );
+        assert_eq!(title, "feat(deliver): improve PR scaffold title");
+        assert_ne!(title, "porch: feat/x");
+    }
+
+    #[test]
+    fn is_porch_managed_title_matches_design_heuristic() {
+        let scaffold = deterministic_pr_title("feat/x", Some("ship it"), None);
+        assert!(is_porch_managed_title("porch: feat/x", None, &scaffold));
+        assert!(is_porch_managed_title(
+            "porch: legacy leftover",
+            None,
+            &scaffold
+        ));
+        assert!(is_porch_managed_title(&scaffold, None, &scaffold));
+        assert!(is_porch_managed_title(
+            "agent wrote this earlier",
+            Some("agent wrote this earlier"),
+            &scaffold
+        ));
+        assert!(!is_porch_managed_title(
+            "Human: please review carefully",
+            Some("agent wrote this earlier"),
+            &scaffold
+        ));
+        assert!(!is_porch_managed_title(
+            "Human: please review carefully",
+            None,
+            &scaffold
+        ));
+    }
+
+    #[test]
+    fn edit_pr_title_invokes_gh_pr_edit_title() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt = wt.canonicalize().unwrap();
+
+        let bin = tmp.path().join("fake-gh");
+        let log = fake_gh_log_path(&home);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(
+                &bin,
+                format!(
+                    r#"#!/bin/sh
+LOG="{}"
+{{
+  printf '+'
+  for a in "$@"; do
+    printf ' %s' "$a"
+  done
+  printf '\n'
+}} >> "$LOG"
+exit 0
+"#,
+                    log.display()
+                ),
+            )
+            .unwrap();
+            let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bin, perms).unwrap();
+        }
+
+        edit_pr_title(
+            bin.to_str().unwrap(),
+            Duration::from_secs(5),
+            &wt,
+            42,
+            "ship the compose packet",
+        )
+        .unwrap();
+
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains("pr edit 42 --title ship the compose packet"),
+            "expected gh pr edit --title in log, got: {logged}"
+        );
     }
 
     #[test]

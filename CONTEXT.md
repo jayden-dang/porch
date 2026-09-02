@@ -129,9 +129,10 @@ _Avoid_: "prompt", "goal"
 
 **Park**:
 A run halting mid-pipeline to wait for an **Operator** decision: at `rebase` on a
-conflict (`fix` | `abort` only), or at `review` when the round carries blocking
-findings (`approve` | `skip` | `abort` | `fix`). `parked` is the run status while
-it waits; the response resumes or ends the run.
+conflict (`fix` | `abort` only), at `review` when the round carries blocking
+findings (`approve` | `skip` | `abort` | `fix`), or at `compose` after the
+scaffold PR exists (`respond` | `skip` | `abort`). `parked` is the run status
+while it waits; the response resumes or ends the run.
 _Avoid_: "stash", "pause". Never "setting aside hunks" — porch has no hunk-level
 splitting; the TUI's hunk view only shows a finding's diff snippet.
 
@@ -176,8 +177,8 @@ _Avoid_: "client", "user" — a user is a person.
 - A **Run** executes in exactly one **Worktree** and is scoped to one pushed SHA
 - **Admit** gates entry; the run's phases are intent → rebase → **Review** →
   **Certify** → **Deliver**
-- A **Park** interrupts a run at `rebase` or `review`; only an **Operator** or an
-  **Agent** response clears it
+- A **Park** interrupts a run at `rebase`, `review`, or `compose`; only an
+  **Operator** or an **Agent** response clears it
 - A **Review** produces findings; a **Fixer** consumes them
 - A **Run** holds **Custody** of a ref; custody is what makes a force-push refusable
 - A **Consumer** repo has one porch remote and keeps its own CI

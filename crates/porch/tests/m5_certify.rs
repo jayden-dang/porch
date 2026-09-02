@@ -121,15 +121,18 @@ for a in "$@"; do
 done
 case "$CMD" in
   list)
-    if [ -f "$STATE" ]; then cat "$STATE"; else printf '[]\n'; fi
+    if [ -f "$STATE" ]; then /bin/cat "$STATE"; else printf '[]\n'; fi
     ;;
   create)
-    cat >/dev/null
+    /bin/cat >/dev/null
     printf '[{"number":1,"url":"https://example.com/pull/1","title":"t"}]\n' > "$STATE"
     echo "https://example.com/pull/1"
     ;;
   edit)
-    cat >/dev/null
+    /bin/cat >/dev/null
+    ;;
+  view)
+    printf '{"mergeable":"MERGEABLE","number":1,"url":"https://example.com/pull/1","title":"t","body":""}\n'
     ;;
   checks)
     printf '[]\n'
@@ -423,10 +426,10 @@ commands:
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(30),
     );
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
 
     let steps = db.step_results_for_run(&run.id).unwrap();
     assert_eq!(
@@ -434,8 +437,8 @@ commands:
         Some("completed")
     );
     assert_eq!(
-        last_step(&steps, "deliver").map(|s| s.status.as_str()),
-        Some("completed")
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("parked")
     );
 
     assert!(
@@ -513,15 +516,19 @@ fn missing_trusted_yaml_completes_without_spawn() {
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(30),
     );
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
 
     let steps = db.step_results_for_run(&run.id).unwrap();
     assert_eq!(
         last_step(&steps, "certify").map(|s| s.status.as_str()),
         Some("completed")
+    );
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("parked")
     );
     assert!(!s.home.join("certify-format.ran").is_file());
     assert!(!s.home.join("certify-lint.ran").is_file());
@@ -597,11 +604,15 @@ commands:
     );
 
     let run = db.run_by_id(&run.id).unwrap().unwrap();
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
     let steps = db.step_results_for_run(&run.id).unwrap();
     assert_eq!(
         last_step(&steps, "certify").map(|s| s.status.as_str()),
         Some("completed")
+    );
+    assert_eq!(
+        last_step(&steps, "compose").map(|s| s.status.as_str()),
+        Some("parked")
     );
     assert!(
         s.home.join("certify-format.ran").is_file(),
@@ -696,10 +707,10 @@ commands:
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(30),
     );
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
     assert!(s.home.join("certify-format-dirty.ran").is_file());
     assert!(s.home.join("certify-lint.ran").is_file());
 
@@ -744,11 +755,11 @@ commands:
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(30),
     );
     assert_eq!(
-        run.status, "completed",
+        run.status, "parked",
         "correction commit must supply porch identity under useConfigOnly; err={:?}",
         run.error
     );

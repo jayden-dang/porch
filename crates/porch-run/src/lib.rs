@@ -19,7 +19,7 @@ use porch_agent::{
 };
 use porch_gate::{
     Db, RunExecutor, RunRow, db_path, event_hub, load_finding_notes, repo_id_for, rpc_start_run,
-    run_deliver_repair_dir, run_fixer_dir, run_worktree_dir,
+    run_artifact_dir, run_deliver_repair_dir, run_fixer_dir, run_worktree_dir,
 };
 use porch_git::GitDir;
 use porch_review::{Finding, RunReviewOpts, review_bin, review_timeout, run_review};
@@ -402,8 +402,12 @@ fn deliver_with_repair(
         if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
             return Err(RunError::Msg("cancelled".into()));
         }
-        match deliver::run_deliver_phase(db, run_id, bare, wt, default_branch, cancel) {
-            Ok(()) => {
+        match deliver::run_deliver_phase(db, home, run_id, bare, wt, default_branch, cancel) {
+            Ok(deliver::DeliverOutcome::ParkedCompose) => {
+                // compose+parked already recorded inside deliver; do not complete deliver.
+                return Ok(PhaseLoop::Parked);
+            }
+            Ok(deliver::DeliverOutcome::Completed) => {
                 record_step(db, run_id, "deliver", "completed", None)?;
                 return Ok(PhaseLoop::Continue);
             }
@@ -803,7 +807,7 @@ pub fn expected_worktree_path(home: &Path, repo_id: &str, run_id: &str) -> PathB
     run_worktree_dir(home, repo_id, run_id)
 }
 
-/// Human response to a parked review.
+/// Human response to a parked review or compose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentResponse {
     Approve,
@@ -815,6 +819,11 @@ pub enum AgentResponse {
         finding_ids: Option<Vec<String>>,
         /// Standing consent: one fix round then approve remaining.
         yes: bool,
+    },
+    /// Compose park: merge Agent-authored title/body into the scaffold PR.
+    Compose {
+        body: String,
+        title: Option<String>,
     },
 }
 
@@ -854,6 +863,12 @@ pub struct AgentStatus {
     pub findings: Vec<Finding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_packet_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_actions: Option<Vec<String>>,
 }
 
 /// Exit code for agent CLI (D11): 0 ok, 1 failed/cancelled, 2 usage.
@@ -933,7 +948,7 @@ fn agent_status_inner(
 ) -> std::result::Result<AgentStatus, UsageOrFail> {
     let db = Db::open(&db_path(home)).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     let run = resolve_run(&db, run_id, work_tree)?;
-    Ok(status_from_run(&db, &run))
+    Ok(status_from_run(&db, &run, home))
 }
 
 fn agent_respond_inner(
@@ -962,7 +977,23 @@ fn agent_respond_inner(
         .ok_or_else(|| UsageOrFail::Fail("parked run has no worktree_dir".into()))?;
 
     let phase = parked_phase(&db, &run);
+
+    // Compose park MUST be branched before review Skip (skip continues deliver).
+    if phase == "compose" {
+        respond_compose(home, &db, &run, &bare, &wt, &repo.default_branch, response)?;
+        let run = db
+            .run_by_id(&run.id)
+            .map_err(|e| UsageOrFail::Fail(e.to_string()))?
+            .ok_or_else(|| UsageOrFail::Fail("run disappeared".into()))?;
+        return Ok(status_from_run(&db, &run, home));
+    }
+
     match response {
+        AgentResponse::Compose { .. } => {
+            return Err(UsageOrFail::Usage(
+                "--body-file is only valid when phase=compose".into(),
+            ));
+        }
         AgentResponse::Approve | AgentResponse::Skip if phase == "rebase" => {
             return Err(UsageOrFail::Usage(
                 "rebase park accepts fix|abort only (not approve/skip)".into(),
@@ -1013,7 +1044,65 @@ fn agent_respond_inner(
         .run_by_id(&run.id)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?
         .ok_or_else(|| UsageOrFail::Fail("run disappeared".into()))?;
-    Ok(status_from_run(&db, &run))
+    Ok(status_from_run(&db, &run, home))
+}
+
+fn respond_compose(
+    home: &Path,
+    db: &Db,
+    run: &RunRow,
+    bare: &GitDir,
+    wt: &Path,
+    default_branch: &str,
+    response: AgentResponse,
+) -> std::result::Result<(), UsageOrFail> {
+    let resolution = match response {
+        AgentResponse::Approve | AgentResponse::Fix { .. } => {
+            return Err(UsageOrFail::Usage(
+                "compose park accepts respond|--body-file|skip|abort (not approve/fix)".into(),
+            ));
+        }
+        AgentResponse::Compose { body, title } => {
+            deliver::ComposeResolution::Respond { body, title }
+        }
+        AgentResponse::Skip => deliver::ComposeResolution::Skip,
+        AgentResponse::Abort => deliver::ComposeResolution::Abort,
+    };
+
+    match deliver::resume_deliver_after_compose(
+        db,
+        home,
+        &run.id,
+        bare,
+        wt,
+        default_branch,
+        resolution,
+    ) {
+        Ok(()) => {
+            let run = db
+                .run_by_id(&run.id)
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))?
+                .ok_or_else(|| UsageOrFail::Fail("run disappeared".into()))?;
+            if run.status != "parked" {
+                finish_remove_worktree(bare, &run, wt);
+            }
+            Ok(())
+        }
+        Err(deliver::DeliverError::ComposeRejected(msg)) => {
+            let _ = db.set_run_status(&run.id, "parked", Some(&msg));
+            Err(UsageOrFail::Fail(msg))
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = set_status(db, &run.id, "failed", Some(&msg));
+            if let Ok(Some(run)) = db.run_by_id(&run.id) {
+                finish_remove_worktree(bare, &run, wt);
+            } else {
+                remove_run_worktree(bare, wt);
+            }
+            Err(UsageOrFail::Fail(msg))
+        }
+    }
 }
 
 fn parked_phase(db: &Db, run: &RunRow) -> String {
@@ -1428,7 +1517,7 @@ fn resolve_run(
         .ok_or_else(|| UsageOrFail::Usage("no parked run for this repo".into()))
 }
 
-pub(crate) fn status_from_run(db: &Db, run: &RunRow) -> AgentStatus {
+pub(crate) fn status_from_run(db: &Db, run: &RunRow, home: &Path) -> AgentStatus {
     let findings = run
         .findings_json
         .as_deref()
@@ -1439,6 +1528,15 @@ pub(crate) fn status_from_run(db: &Db, run: &RunRow) -> AgentStatus {
         "completed" | "failed" | "cancelled" => "done".into(),
         "running" | "pending" => "pipeline".into(),
         other => other.to_string(),
+    };
+    let (compose_packet_path, allowed_actions) = if phase == "compose" {
+        let path = run_artifact_dir(home, &run.id).join("compose-packet.json");
+        (
+            Some(path.display().to_string()),
+            Some(vec!["respond".into(), "skip".into(), "abort".into()]),
+        )
+    } else {
+        (None, None)
     };
     AgentStatus {
         run_id: run.id.clone(),
@@ -1451,6 +1549,9 @@ pub(crate) fn status_from_run(db: &Db, run: &RunRow) -> AgentStatus {
         review_approved_head_sha: run.review_approved_head_sha.clone(),
         findings,
         error: run.error.clone(),
+        pr_url: run.pr_url.clone(),
+        compose_packet_path,
+        allowed_actions,
     }
 }
 

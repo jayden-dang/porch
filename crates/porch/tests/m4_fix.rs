@@ -31,15 +31,18 @@ for a in "$@"; do
 done
 case "$CMD" in
   list)
-    if [ -f "$STATE" ]; then cat "$STATE"; else printf '[]\n'; fi
+    if [ -f "$STATE" ]; then /bin/cat "$STATE"; else printf '[]\n'; fi
     ;;
   create)
-    cat >/dev/null
+    /bin/cat >/dev/null
     printf '[{"number":1,"url":"https://example.com/pull/1","title":"t"}]\n' > "$STATE"
     echo "https://example.com/pull/1"
     ;;
   edit)
-    cat >/dev/null
+    /bin/cat >/dev/null
+    ;;
+  view)
+    printf '{"mergeable":"MERGEABLE","number":1,"url":"https://example.com/pull/1","title":"t","body":""}\n'
     ;;
   checks)
     printf '[]\n'
@@ -434,16 +437,17 @@ fn fix_then_clean_rereview_completes_with_new_approved_sha() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["status"], "completed");
+    // Clean rereview certifies then parks compose (Task 5 resolves).
+    assert_eq!(v["status"], "parked");
     let approved = v["review_approved_head_sha"].as_str().unwrap();
     assert_ne!(approved, parked_head);
     assert!(approved.len() >= 7);
 
     let run = db.run_by_id(&run.id).unwrap().unwrap();
-    assert_eq!(run.status, "completed");
+    assert_eq!(run.status, "parked");
     assert!(
-        run.worktree_dir.as_ref().is_none_or(|p| !p.exists()),
-        "worktree should be gone"
+        run.worktree_dir.as_ref().is_some_and(|p| p.exists()),
+        "worktree kept while compose parked"
     );
     assert!(
         db.get_uncertified_pipeline_range(&repo_id, "feat-fix-clean")
@@ -501,7 +505,7 @@ fn fix_yes_approves_remaining_after_one_round() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["status"], "completed");
+    assert_eq!(v["status"], "parked");
     assert!(v["review_approved_head_sha"].as_str().unwrap().len() >= 7);
 
     kill_daemon(&s.home);
@@ -579,7 +583,7 @@ fn next_initial_review_uses_uncertified_from_sha() {
 
     let db = Db::open(&s.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&s.work);
-    let _ = wait_status(&db, &repo_id, &["completed"], Duration::from_secs(45));
+    let _ = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(45));
 
     // Seed an uncertified range covering HEAD as tip with an earlier from_sha.
     let head = StdCommand::new("git")
@@ -612,7 +616,7 @@ fn next_initial_review_uses_uncertified_from_sha() {
 
     commit_change(&s.work, "b.txt", "two\n");
     push_with_env(&s, "feat-bind", "clean");
-    let _ = wait_status(&db, &repo_id, &["completed"], Duration::from_secs(45));
+    let _ = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(45));
 
     let last_from = std::fs::read_to_string(s.home.join("last-review-from")).unwrap();
     let last_from = last_from.trim();
@@ -654,10 +658,10 @@ fn completed_review_clears_uncertified_range() {
     let run = wait_status(
         &db,
         &repo_id,
-        &["completed", "failed"],
+        &["parked", "failed"],
         Duration::from_secs(45),
     );
-    assert_eq!(run.status, "completed", "err={:?}", run.error);
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
     assert!(
         db.get_uncertified_pipeline_range(&repo_id, "feat-clear")
             .unwrap()

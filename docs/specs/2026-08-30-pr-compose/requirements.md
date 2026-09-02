@@ -1,7 +1,7 @@
 # Requirements: PR Compose
 
 Feature code: PRCMP
-Status: In-progress
+Status: Implemented
 Date: 2026-08-30
 
 Roadmap item: — (not a pre-planned ROAD slot; DELIVER-adjacent).

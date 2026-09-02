@@ -794,6 +794,7 @@ name = "porch-deliver"
 version = "0.2.1"
 dependencies = [
  "nix",
+ "porch-git",
  "serde",
  "serde_json",
  "tempfile",
