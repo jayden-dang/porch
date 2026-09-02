@@ -846,10 +846,12 @@ dependencies = [
 name = "porch-review"
 version = "0.2.1"
 dependencies = [
+ "hex",
  "nix",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tempfile",
  "thiserror",
 ]

@@ -7,6 +7,7 @@ mod agent_review;
 mod engine;
 mod home_config;
 mod pathutil;
+mod plan;
 mod setup;
 
 use std::collections::BTreeSet;
@@ -31,6 +32,12 @@ pub use home_config::{
     load_home_config, write_home_config,
 };
 pub use pathutil::{is_executable, resolve_bin, which};
+pub use plan::{
+    AdapterKind, ArtifactStamp, BackendObservation, DeclaredEngineKind, InvocationPlan,
+    InvocationRecord, ObservedVersionIdentity, PrepareOpts, PreparedContextElement,
+    PreparedInvocation, ProducerDescriptor, ReportedVersion, SelectionSource, WrapperObservation,
+    check_artifacts_stable, composite_artifact_identity, prepare,
+};
 pub use setup::{
     SetupResult, WRAPPER_REL, default_engine, detect_engines, detect_optional_tools,
     review_setup_ok, setup_apply, setup_verify, setup_yes, verify_setup, wrapper_path,
@@ -199,6 +206,8 @@ pub enum Error {
     Coverage(String),
     #[error("prompt file missing or not under PORCH_HOME: {0}")]
     PromptRefuse(String),
+    #[error("producer artifact changed after plan resolution")]
+    ProducerArtifactChanged,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -392,6 +401,8 @@ pub struct RunReviewOpts<'a> {
     pub run_id: Option<&'a str>,
     /// Authoritative intent text, if any (agent prompt).
     pub intent: Option<&'a str>,
+    /// When set, spawn uses this plan's absolute target without re-resolving.
+    pub plan: Option<&'a plan::InvocationPlan>,
 }
 
 /// Spawn review: agent path when configured (`PORCH_REVIEW_BIN` unset); else CLI.
@@ -400,13 +411,23 @@ pub struct RunReviewOpts<'a> {
 ///
 /// Returns spawn, timeout, exit, JSON, coverage, prompt-refuse, or I/O errors.
 pub fn run_review(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
-    if review_uses_agent(opts.porch_home) {
+    let use_agent = match opts.plan.map(|p| p.descriptor.adapter_kind) {
+        Some(plan::AdapterKind::NativeAgent) => true,
+        Some(plan::AdapterKind::PorchJsonCli) => false,
+        None => review_uses_agent(opts.porch_home),
+    };
+    let outcome = if use_agent {
         let home = opts.porch_home.ok_or_else(|| {
             Error::Msg("agent review requires porch_home for prompt artifacts".into())
         })?;
-        return run_review_via_agent(opts, home);
+        run_review_via_agent(opts, home)?
+    } else {
+        run_review_cli(opts)?
+    };
+    if let Some(plan) = opts.plan {
+        plan::check_artifacts_stable(plan)?;
     }
-    run_review_cli(opts)
+    Ok(outcome)
 }
 
 fn run_review_via_agent(
@@ -437,7 +458,16 @@ fn run_review_via_agent(
         path_instructions.as_deref(),
         opts.changed_files,
     )?;
-    let bin = agent_review_bin(porch_home)?;
+    let planned = opts
+        .plan
+        .map(|p| p.spawned_target_absolute.display().to_string());
+    let resolved;
+    let bin = if let Some(ref absolute) = planned {
+        absolute.as_str()
+    } else {
+        resolved = agent_review_bin(porch_home)?;
+        resolved.as_str()
+    };
     run_agent_review(&RunAgentReviewOpts {
         work_tree: opts.work_tree,
         prompt_file: &prompt_file,
@@ -445,8 +475,9 @@ fn run_review_via_agent(
         from_sha: opts.from_sha,
         to_sha: opts.to_sha,
         changed_files: opts.changed_files,
-        bin: &bin,
+        bin,
         timeout: opts.timeout,
+        plan: opts.plan,
     })
 }
 
@@ -463,7 +494,13 @@ fn run_review_cli(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
         .ok_or_else(|| Error::Msg(format!("non-utf8 output path {}", out_file.display())))?
         .to_string();
 
-    let mut cmd = Command::new(opts.bin);
+    let bin = opts.plan.map_or_else(
+        || Path::new(opts.bin),
+        |p| p.spawned_target_absolute.as_path(),
+    );
+    let bin_label = bin.display().to_string();
+
+    let mut cmd = Command::new(bin);
     cmd.current_dir(opts.work_tree);
     cmd.args([
         "--from",
@@ -487,7 +524,7 @@ fn run_review_cli(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::BinNotFound {
-                bin: opts.bin.to_string(),
+                bin: bin_label,
                 source: e,
             }
         } else {

@@ -51,6 +51,8 @@ pub struct RunAgentReviewOpts<'a> {
     pub changed_files: &'a [String],
     pub bin: &'a str,
     pub timeout: Duration,
+    /// When set, spawn uses this plan's absolute target without re-resolving.
+    pub plan: Option<&'a crate::plan::InvocationPlan>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,7 +374,9 @@ pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, 
     let out_s = abs_str(&out_file)?;
     let prompt_s = abs_str(opts.prompt_file)?;
 
-    let family = agent_cli_family(opts.bin);
+    let bin_path = spawn_bin_path(opts);
+    let bin_label = bin_path.display().to_string();
+    let family = agent_cli_family(&bin_label);
     // Neutralize before the dirty snapshot so rename/restore is not mistaken for
     // a reviewer write. Claude/Codex skip AGENTS.md neutralize because readonly /
     // plan flags are used; dirty worktree (file-write) detection still fail-closes.
@@ -384,7 +388,7 @@ pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, 
     let dirty_before = worktree_porcelain(opts.work_tree)?;
 
     let result = (|| {
-        let mut cmd = Command::new(opts.bin);
+        let mut cmd = Command::new(bin_path);
         cmd.current_dir(opts.work_tree);
         apply_agent_argv(&mut cmd, family, &prompt_s, &out_s, opts)?;
         cmd.stdin(Stdio::null());
@@ -399,7 +403,7 @@ pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::BinNotFound {
-                    bin: opts.bin.to_string(),
+                    bin: bin_label,
                     source: e,
                 }
             } else {
@@ -471,6 +475,13 @@ pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, 
 
     restore_neutralized(&neutralized);
     result
+}
+
+fn spawn_bin_path<'a>(opts: &'a RunAgentReviewOpts<'a>) -> &'a Path {
+    opts.plan.map_or_else(
+        || Path::new(opts.bin),
+        |p| p.spawned_target_absolute.as_path(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -794,6 +805,7 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             changed_files: &["README".into()],
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_secs(5),
+            plan: None,
         })
         .unwrap();
         assert!(out.findings.is_empty());
@@ -833,6 +845,7 @@ printf '%s\n' '{"findings":[],"files":["a.rs"]}' > "$OUT"
             changed_files: &["a.rs".into(), "b.rs".into()],
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_secs(5),
+            plan: None,
         })
         .unwrap_err();
         assert!(matches!(err, Error::Coverage(ref p) if p == "b.rs"));
@@ -870,6 +883,7 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             changed_files: &["README".into()],
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_secs(5),
+            plan: None,
         })
         .unwrap_err();
         assert!(
@@ -895,6 +909,7 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             changed_files: &[],
             bin: "true",
             timeout: Duration::from_secs(1),
+            plan: None,
         })
         .unwrap_err();
         assert!(matches!(err, Error::PromptRefuse(_)));
@@ -922,6 +937,7 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             changed_files: &[],
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_millis(200),
+            plan: None,
         })
         .unwrap_err();
         assert!(matches!(err, Error::Timeout(_)));

@@ -280,6 +280,7 @@ fn run_review_phase(
         porch_home: Some(home),
         run_id: Some(run_id),
         intent: run.intent.as_deref(),
+        plan: None,
     }) {
         Ok(o) => o,
         Err(porch_review::Error::Timeout(d)) => {
