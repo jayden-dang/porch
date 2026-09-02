@@ -6,7 +6,7 @@ mod schema;
 
 pub use applicability::{
     Applicability, EquivalenceInput, ObservedVersionForEquivalence, applicable_round,
-    descriptor_equivalence_digest,
+    applicable_round_for_run, descriptor_equivalence_digest,
 };
 
 use std::cell::Cell;

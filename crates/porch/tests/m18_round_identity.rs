@@ -1189,6 +1189,42 @@ fn parked_round_serves_findings_from_applicable_round() {
     kill_daemon(&s.home);
 }
 
+#[test]
+fn inapplicable_finalized_round_is_not_served() {
+    let s = setup("blocking");
+    commit_change(&s.work, "bug.txt", "boom\n");
+    push_branch(&s, "feat-inapplicable-serve", "blocking");
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    let rounds = rounds::rounds_for_run(&db, &run.id).unwrap();
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(
+        rounds[0].assurance_completion,
+        AssuranceCompletion::Complete
+    );
+    let before = porch_gate::get_run(&s.home, &run.id).unwrap();
+    assert_eq!(before.assurance_record.kind_str(), "round");
+
+    // Drift trusted_config on the run so reconstructed bindings no longer match.
+    db.set_trusted_config_sha(&run.id, &"0".repeat(40)).unwrap();
+    let after = porch_gate::get_run(&s.home, &run.id).unwrap();
+    assert_ne!(
+        after.assurance_record.kind_str(),
+        "round",
+        "inapplicable complete round must not back assurance_record: {:?}",
+        after.assurance_record
+    );
+    assert!(
+        after.findings.as_array().is_none_or(|a| a.is_empty()),
+        "must not project instances from an inapplicable round: {:?}",
+        after.findings
+    );
+
+    kill_daemon(&s.home);
+}
+
 fn strip_rounds_for_run(db: &Db, run_id: &str) {
     porch_gate::clear_rounds_for_run(db, run_id).unwrap();
 }

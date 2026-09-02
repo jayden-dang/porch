@@ -11,9 +11,7 @@ use crate::Result;
 use crate::db::{Db, RunRow, StepResultRow};
 use crate::events::{Event, EventHub};
 use crate::home::socket_path;
-use crate::rounds::{
-    self, AssuranceCompletion, CoverageState, ExecutionState, FindingInstanceRecord, RoundId,
-};
+use crate::rounds::{self, Applicability, FindingInstanceRecord, RoundId};
 
 /// Soft cap for on-demand finding hunk / diff payloads (bytes).
 pub const FINDING_HUNK_MAX_BYTES: usize = 16_384;
@@ -185,8 +183,9 @@ fn status_from_instance(index: usize, inst: &FindingInstanceRecord) -> StatusFin
 
 /// Finalized, applicable round backing the current parked decision, if any.
 ///
-/// Prefers the newest finished/complete round whose `to_sha` matches the run tip
-/// and whose coverage has no `selected` / `failed` paths (authorization floor).
+/// Reconstructs decision bindings from the run tip and consults
+/// [`rounds::applicable_round_for_run`] so coverage, bindings, producers, and
+/// context must all authorize — not merely tip/`complete` filters.
 ///
 /// # Errors
 ///
@@ -196,32 +195,10 @@ fn status_from_instance(index: usize, inst: &FindingInstanceRecord) -> StatusFin
 ///
 /// Panics if the database mutex is poisoned.
 pub fn round_for_decision(db: &Db, run: &RunRow) -> Result<Option<RoundId>> {
-    let rounds = rounds::rounds_for_run(db, &run.id)?;
-    for round in rounds.into_iter().rev() {
-        if round.finalized_at.is_none() {
-            continue;
-        }
-        if round.execution != ExecutionState::Finished {
-            continue;
-        }
-        if round.assurance_completion != AssuranceCompletion::Complete {
-            continue;
-        }
-        if let Some(head) = run.head_sha.as_deref() {
-            if round.to_sha != head {
-                continue;
-            }
-        }
-        let coverage = rounds::coverage_for_round(db, &round.id)?;
-        if coverage
-            .iter()
-            .any(|row| matches!(row.state, CoverageState::Selected | CoverageState::Failed))
-        {
-            continue;
-        }
-        return Ok(Some(round.id));
+    match rounds::applicable_round_for_run(db, run)? {
+        Applicability::Applicable(id) => Ok(Some(id)),
+        Applicability::RequiresNew { .. } => Ok(None),
     }
-    Ok(None)
 }
 
 /// Resolve assurance labeling and status findings for a run.

@@ -5,12 +5,14 @@ use std::collections::BTreeMap;
 use ulid::Ulid;
 
 use super::{
-    AssuranceCompletion, ContextApplicationRecord, CoverageState, ExecutionState, RoundBindings,
-    RoundId, context_applications_for_round, context_elements_for_round, coverage_for_round,
-    get_round, producers_for_round, rounds_for_run, sha256_hex,
+    AssuranceCompletion, ContextApplication, ContextApplicationRecord, ContextElement,
+    CoverageState, ExecutionState, RoundBindings, RoundId, capture_context_element,
+    context_applications_for_round, context_elements_for_round, coverage_for_round, get_round,
+    producers_for_round, rounds_for_run, sha256_hex,
 };
+use super::{ContextSource, SnapshotState};
 use crate::Result;
-use crate::db::Db;
+use crate::db::{Db, RunRow};
 
 const EQUIVALENCE_DOMAIN: &[u8] = b"porch-producer-equivalence/v1";
 
@@ -93,6 +95,173 @@ pub fn applicable_round(
     }
     Ok(Applicability::RequiresNew {
         reason: "no applicable round may authorize the current change".into(),
+    })
+}
+
+/// Serve/authorize helper: reconstruct decision bindings from the run tip and ask
+/// [`applicable_round`].
+///
+/// Inventory, producer digests, and context applications come from the newest
+/// tip-matching finished/complete round (seed). Live run fields that can drift
+/// (`head_sha`, `trusted_config_sha`, intent presence) are taken from `run` so a
+/// mismatched parked decision fails closed.
+///
+/// # Errors
+///
+/// Returns a storage error when round or blob rows cannot be read.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn applicable_round_for_run(db: &Db, run: &RunRow) -> Result<Applicability> {
+    let Some((bindings, required)) = decision_bindings_for_run(db, run)? else {
+        return Ok(Applicability::RequiresNew {
+            reason: "no tip-complete round available to reconstruct decision bindings".into(),
+        });
+    };
+    applicable_round(db, &run.id, &bindings, &required)
+}
+
+/// Build current decision bindings + required producer digests for serve/authorize.
+fn decision_bindings_for_run(
+    db: &Db,
+    run: &RunRow,
+) -> Result<Option<(RoundBindings, Vec<String>)>> {
+    let Some(seed) = tip_complete_seed(db, run)? else {
+        return Ok(None);
+    };
+
+    let inventory_bytes = blob_bytes(db, &seed.inventory_digest)?;
+    let producers = producers_for_round(db, &seed.id)?;
+    if producers.is_empty() {
+        return Ok(None);
+    }
+    let required: Vec<String> = producers
+        .iter()
+        .map(|p| p.descriptor_equivalence_digest.clone())
+        .collect();
+
+    let id_to_slot: BTreeMap<&str, usize> = producers
+        .iter()
+        .map(|p| (p.id.as_str(), usize::try_from(p.slot).unwrap_or(usize::MAX)))
+        .collect();
+
+    let recorded_apps = context_applications_for_round(db, &seed.id)?;
+    let mut context_applications = Vec::with_capacity(recorded_apps.len());
+    for app in &recorded_apps {
+        let Some(&slot) = id_to_slot.get(app.producer_invocation_id.as_str()) else {
+            return Ok(None);
+        };
+        if slot == usize::MAX {
+            return Ok(None);
+        }
+        context_applications.push(ContextApplication {
+            element_name: app.element_name.clone(),
+            producer_slot: slot,
+            application: app.application,
+            effective_digest: app.effective_digest.clone(),
+        });
+    }
+
+    let recorded_elements = context_elements_for_round(db, &seed.id)?;
+    let mut context_elements: Vec<ContextElement> =
+        recorded_elements.iter().map(element_from_record).collect();
+
+    // Intent presence follows the live run so a cleared/changed intent fails closed.
+    let intent = match run.intent.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => capture_context_element(
+            "intent",
+            ContextSource::Present {
+                bytes: s.as_bytes().to_vec(),
+            },
+        ),
+        _ => capture_context_element("intent", ContextSource::Absent { reason: None }),
+    };
+    if let Some(pos) = context_elements
+        .iter()
+        .position(|e| e.element_name == "intent")
+    {
+        context_elements[pos] = intent;
+    } else {
+        context_elements.push(intent);
+    }
+
+    let to_sha = match run.head_sha.as_deref() {
+        Some(h) => h.to_string(),
+        None => seed.to_sha.clone(),
+    };
+    let trusted_config_sha = match run.trusted_config_sha.as_deref() {
+        Some(s) => s.to_string(),
+        None => seed.trusted_config_sha.clone(),
+    };
+
+    Ok(Some((
+        RoundBindings {
+            from_sha: seed.from_sha.clone(),
+            to_sha,
+            inventory_digest: seed.inventory_digest.clone(),
+            inventory_bytes,
+            trusted_config_sha,
+            protocol_schema_version: seed.protocol_schema_version,
+            fingerprint_version: seed.fingerprint_version,
+            intent_source: run.intent_source.clone(),
+            context_elements,
+            context_applications,
+        },
+        required,
+    )))
+}
+
+fn tip_complete_seed(db: &Db, run: &RunRow) -> Result<Option<super::RoundRecord>> {
+    let rounds = rounds_for_run(db, &run.id)?;
+    for round in rounds.into_iter().rev() {
+        if round.finalized_at.is_none() {
+            continue;
+        }
+        if round.execution != ExecutionState::Finished {
+            continue;
+        }
+        if round.assurance_completion != AssuranceCompletion::Complete {
+            continue;
+        }
+        if let Some(head) = run.head_sha.as_deref() {
+            if round.to_sha != head {
+                continue;
+            }
+        }
+        return Ok(Some(round));
+    }
+    Ok(None)
+}
+
+fn element_from_record(rec: &super::ContextElementRecord) -> ContextElement {
+    ContextElement {
+        element_name: rec.element_name.clone(),
+        source_state: rec.source_state,
+        source_reason: rec.source_reason.clone(),
+        snapshot_state: rec.snapshot_state,
+        snapshot_reason: rec.snapshot_reason.clone(),
+        snapshot_digest: rec.snapshot_digest.clone(),
+        snapshot_bytes: if rec.snapshot_state == SnapshotState::Stored {
+            rec.snapshot_bytes.clone()
+        } else {
+            None
+        },
+    }
+}
+
+fn blob_bytes(db: &Db, digest: &str) -> Result<Vec<u8>> {
+    let conn = db.conn();
+    conn.query_row(
+        "SELECT bytes FROM content_blobs WHERE digest = ?1",
+        [digest],
+        |row| row.get(0),
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => crate::Error::Other(format!(
+            "missing content blob for inventory digest {digest}"
+        )),
+        other => other.into(),
     })
 }
 
