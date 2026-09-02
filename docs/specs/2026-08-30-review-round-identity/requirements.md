@@ -1,7 +1,7 @@
 # Requirements: Review Round Identity
 
 Feature code: ROUND
-Status: Approved
+Status: In-progress
 Date: 2026-08-30
 
 Roadmap item: ROAD-6 (MILE-2). Serves GOAL-2.

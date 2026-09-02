@@ -1,9 +1,9 @@
 # Tasks: Review Round Identity
 
 Feature code: ROUND
-Status: Approved
+Status: In-progress
 Date: 2026-08-30
-Execution-mode: unset
+Execution-mode: continuous
 Requirements: ./requirements.md
 Design: ./design.md
 

@@ -1,7 +1,7 @@
 # Design: Review Round Identity
 
 Feature code: ROUND
-Status: Approved
+Status: In-progress
 Date: 2026-08-30
 Requirements: ./requirements.md
 
