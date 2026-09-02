@@ -10,6 +10,7 @@ mod home_config;
 mod identity;
 mod pathutil;
 mod plan;
+mod reconcile;
 mod setup;
 
 use std::collections::BTreeSet;
@@ -46,6 +47,10 @@ pub use plan::{
     InvocationRecord, ObservedVersionIdentity, PrepareOpts, PreparedContextElement,
     PreparedInvocation, ProducerDescriptor, ReportedVersion, SelectionSource, WrapperObservation,
     check_artifacts_stable, composite_artifact_identity, prepare,
+};
+pub use reconcile::{
+    Assignment, CurrentFinding, History, PriorInstance, Proposal, RenameEvidence, SourceRange,
+    mint_fingerprint, reconcile,
 };
 pub use setup::{
     SetupResult, WRAPPER_REL, default_engine, detect_engines, detect_optional_tools,
