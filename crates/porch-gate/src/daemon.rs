@@ -45,6 +45,9 @@ pub fn run_daemon(home: &Path, executor: &Arc<dyn RunExecutor>) -> Result<()> {
         .try_lock_exclusive()
         .map_err(|e| crate::Error::Other(format!("daemon already running: {e}")))?;
     let db = Arc::new(Db::open(&db_path(home))?);
+    if let Err(e) = crate::rounds::reconcile_stale(&db) {
+        return Err(crate::Error::Other(format!("reconcile stale rounds: {e}")));
+    }
     if let Err(e) = executor.recover_stale(home) {
         return Err(crate::Error::Other(format!("recover stale runs: {e}")));
     }

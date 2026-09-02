@@ -1006,21 +1006,89 @@ pub fn finalize_round(
 ///
 /// Panics if the database mutex is poisoned.
 pub fn abandon_for_history_contention(db: &Db, round_id: &RoundId) -> Result<()> {
+    if !close_interrupted(db, round_id, "history_contention")? {
+        let loaded = get_round(db, round_id)?;
+        let detail = match loaded {
+            Some(r) => format!(
+                "{}/{}",
+                r.execution.as_str(),
+                r.assurance_completion.as_str()
+            ),
+            None => "missing".into(),
+        };
+        return Err(Error::Other(format!(
+            "round {} is not open for contention close ({detail})",
+            round_id.as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// Reconcile every round left `running`/`pending` after process death.
+///
+/// Each open round is closed with at most one committed write to
+/// `interrupted`/`incomplete` (`process_interrupted`), without inserting
+/// finding instances or writing an approval.
+///
+/// Returns the number of rounds reconciled.
+///
+/// # Errors
+///
+/// Returns a storage error if listing or closing an open round fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn reconcile_stale(db: &Db) -> Result<usize> {
+    let open_ids = {
+        let conn = db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM review_rounds
+             WHERE execution = ?1 AND assurance_completion = ?2
+             ORDER BY opened_at, id",
+        )?;
+        let rows = stmt.query_map(
+            [
+                ExecutionState::Running.as_str(),
+                AssuranceCompletion::Pending.as_str(),
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        ids
+    };
+
+    let mut closed = 0usize;
+    for id in open_ids {
+        if close_interrupted(db, &RoundId(id), "process_interrupted")? {
+            closed += 1;
+        }
+    }
+    Ok(closed)
+}
+
+/// Close an open round as `interrupted`/`incomplete`. Returns whether a write committed.
+fn close_interrupted(db: &Db, round_id: &RoundId, reason: &str) -> Result<bool> {
     let conn = db.conn();
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
 
-    let (run_id, execution, assurance): (String, String, String) = tx.query_row(
+    let (run_id, execution, assurance): (String, String, String) = match tx.query_row(
         "SELECT run_id, execution, assurance_completion FROM review_rounds WHERE id = ?1",
         [round_id.as_str()],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+    ) {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
     if execution != ExecutionState::Running.as_str()
         || assurance != AssuranceCompletion::Pending.as_str()
     {
-        return Err(Error::Other(format!(
-            "round {} is not open for contention close ({execution}/{assurance})",
-            round_id.as_str()
-        )));
+        // Already terminal — no-op so a concurrent closer is safe.
+        return Ok(false);
     }
 
     tx.execute(
@@ -1033,7 +1101,7 @@ pub fn abandon_for_history_contention(db: &Db, round_id: &RoundId) -> Result<()>
         rusqlite::params![
             ExecutionState::Interrupted.as_str(),
             AssuranceCompletion::Incomplete.as_str(),
-            "history_contention",
+            reason,
             now_secs(),
             round_id.as_str(),
         ],
@@ -1044,7 +1112,7 @@ pub fn abandon_for_history_contention(db: &Db, round_id: &RoundId) -> Result<()>
     )?;
     tx.commit()?;
     record_committed_write();
-    Ok(())
+    Ok(true)
 }
 
 /// Coverage rows recorded for a round.

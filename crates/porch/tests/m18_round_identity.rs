@@ -1,4 +1,4 @@
-//! M18: review round identity — orchestration lifecycle (Task 9).
+//! M18: review round identity — orchestration lifecycle and startup reconciliation.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -7,9 +7,13 @@ use std::time::{Duration, Instant};
 use assert_cmd::Command;
 use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
-use porch_gate::rounds::{self, AssuranceCompletion, ExecutionState};
-use porch_gate::{Db, kill_group, repo_id_for};
-use porch_git::init_bare;
+use porch_gate::rounds::{
+    self, AssuranceCompletion, ContextApplication, ContextApplicationState, ContextSource,
+    ExecutionState, OpenRoundPlan, ProducerInvocation, RoundBindings, capture_context_element,
+    context_applicability_digest, sha256_hex,
+};
+use porch_gate::{Db, kill_group, repo_id_for, run_worktree_dir};
+use porch_git::{GitDir, init_bare, worktree_add_detach};
 use porch_review::REVIEW_BIN_ENV;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -82,9 +86,15 @@ fn kill_daemon(home: &Path) {
     if let Ok(pid) = std::fs::read_to_string(home.join("daemon.pid")) {
         if let Ok(pid) = pid.trim().parse::<u32>() {
             kill_group(pid);
-            std::thread::sleep(Duration::from_millis(200));
         }
     }
+    // Review producers spawn in their own process group; SIGTERM the daemon
+    // group leaves hang-mode fakes behind. Reap anything still bound to this home.
+    let marker = home.display().to_string();
+    let _ = StdCommand::new("pkill")
+        .args(["-9", "-f", &marker])
+        .output();
+    std::thread::sleep(Duration::from_millis(300));
 }
 
 fn wait_status(db: &Db, repo_id: &str, want: &[&str], timeout: Duration) -> porch_gate::RunRow {
@@ -303,9 +313,7 @@ fn setup(review_mode: &str) -> Setup {
         &fake_gh,
         review_mode,
         &path,
-        "5",
-        "20",
-        false,
+        DaemonOpts::default(),
     );
 
     Setup {
@@ -319,7 +327,35 @@ fn setup(review_mode: &str) -> Setup {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, Default)]
+enum FaultHook {
+    #[default]
+    None,
+    FailOpen,
+    AbortAfterOpen,
+    AbortBeforeFinalize,
+    FailRecover,
+}
+
+#[derive(Clone, Copy)]
+struct DaemonOpts {
+    review_timeout: &'static str,
+    fixer_timeout: &'static str,
+    fault: FaultHook,
+    wait_health: bool,
+}
+
+impl Default for DaemonOpts {
+    fn default() -> Self {
+        Self {
+            review_timeout: "5",
+            fixer_timeout: "20",
+            fault: FaultHook::None,
+            wait_health: true,
+        }
+    }
+}
+
 fn restart_daemon(
     home: &Path,
     fake_review: &Path,
@@ -327,9 +363,7 @@ fn restart_daemon(
     fake_gh: &Path,
     review_mode: &str,
     path: &str,
-    review_timeout: &str,
-    fixer_timeout: &str,
-    fail_open: bool,
+    opts: DaemonOpts,
 ) {
     let bin = assert_cmd::cargo::cargo_bin("porch");
     let mut env: Vec<(&str, std::ffi::OsString)> = vec![
@@ -339,16 +373,24 @@ fn restart_daemon(
         ("PORCH_FAKE_REVIEW_MODE", review_mode.into()),
         ("PORCH_FAKE_FIXER_MODE", "apply".into()),
         ("PATH", path.into()),
-        ("PORCH_REVIEW_TIMEOUT_SECS", review_timeout.into()),
-        ("PORCH_FIXER_TIMEOUT_SECS", fixer_timeout.into()),
+        ("PORCH_REVIEW_TIMEOUT_SECS", opts.review_timeout.into()),
+        ("PORCH_FIXER_TIMEOUT_SECS", opts.fixer_timeout.into()),
     ];
-    if fail_open {
-        env.push(("PORCH_TEST_FAIL_ROUND_OPEN", "1".into()));
+    match opts.fault {
+        FaultHook::None => {}
+        FaultHook::FailOpen => env.push(("PORCH_TEST_FAIL_ROUND_OPEN", "1".into())),
+        FaultHook::AbortAfterOpen => env.push(("PORCH_TEST_ABORT_AFTER_ROUND_OPEN", "1".into())),
+        FaultHook::AbortBeforeFinalize => {
+            env.push(("PORCH_TEST_ABORT_BEFORE_ROUND_FINALIZE", "1".into()));
+        }
+        FaultHook::FailRecover => env.push(("PORCH_TEST_FAIL_RECOVER_STALE", "1".into())),
     }
     let env_refs: Vec<(&str, &std::ffi::OsStr)> =
         env.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
     porch_gate::spawn_detached_with_env(&bin, home, &env_refs).unwrap();
-    porch_gate::wait_for_health(home, Duration::from_secs(5)).unwrap();
+    if opts.wait_health {
+        porch_gate::wait_for_health(home, Duration::from_secs(5)).unwrap();
+    }
 }
 
 fn commit_change(work: &Path, name: &str, body: &str) {
@@ -396,9 +438,10 @@ fn failed_round_open_aborts_before_producer_spawn() {
         &s.fake_gh,
         "clean",
         &s.path,
-        "5",
-        "20",
-        true,
+        DaemonOpts {
+            fault: FaultHook::FailOpen,
+            ..DaemonOpts::default()
+        },
     );
 
     commit_change(&s.work, "extra.txt", "x\n");
@@ -706,6 +749,339 @@ fn approve_records_sha_skip_leaves_unrecorded_post_fix_from_sha_unchanged() {
         );
         let last_from = std::fs::read_to_string(s.home.join("last-review-from")).unwrap();
         assert_eq!(last_from.trim(), pre_fix_head);
+        kill_daemon(&s.home);
+    }
+}
+
+fn assert_interrupted_incomplete_no_instances_no_approval(db: &Db, run_id: &str) {
+    let run = db.run_by_id(run_id).unwrap().unwrap();
+    assert!(
+        run.review_approved_head_sha.is_none(),
+        "interrupted reconciliation must not approve: {:?}",
+        run.review_approved_head_sha
+    );
+    let rounds = rounds::rounds_for_run(db, run_id).unwrap();
+    assert_eq!(rounds.len(), 1, "expected one round, got {rounds:?}");
+    let r = &rounds[0];
+    assert_eq!(r.execution, ExecutionState::Interrupted);
+    assert_eq!(r.assurance_completion, AssuranceCompletion::Incomplete);
+    assert_eq!(r.completion_reason.as_deref(), Some("process_interrupted"));
+    assert!(r.finalized_at.is_some());
+    assert!(
+        rounds::instances_for_round(db, &r.id).unwrap().is_empty(),
+        "interrupted round must have no finding instances"
+    );
+    assert!(
+        rounds::coverage_for_round(db, &r.id).unwrap().is_empty(),
+        "interrupted round must have no coverage rows"
+    );
+}
+
+fn open_stale_round(db: &Db, run_id: &str) -> rounds::RoundId {
+    let inventory = b"stale-inv\n";
+    let digest = sha256_hex(inventory);
+    let intent = capture_context_element(
+        "intent",
+        ContextSource::Present {
+            bytes: inventory.to_vec(),
+        },
+    );
+    let plan = OpenRoundPlan {
+        run_id: run_id.to_string(),
+        producers: vec![ProducerInvocation {
+            descriptor_json: r#"{"adapter_kind":"porch_json_cli"}"#.into(),
+            descriptor_equivalence_digest: "equiv-stale".into(),
+        }],
+    };
+    let bindings = RoundBindings {
+        from_sha: "from".into(),
+        to_sha: "to".into(),
+        inventory_digest: digest,
+        inventory_bytes: inventory.to_vec(),
+        trusted_config_sha: "config".into(),
+        protocol_schema_version: 1,
+        fingerprint_version: 1,
+        intent_source: Some("flag".into()),
+        context_elements: vec![intent],
+        context_applications: vec![ContextApplication {
+            element_name: "intent".into(),
+            producer_slot: 0,
+            application: ContextApplicationState::Applied,
+            effective_digest: Some(context_applicability_digest("intent", "present", inventory)),
+        }],
+    };
+    rounds::open_round(db, &plan, &bindings).unwrap()
+}
+
+fn restart_clean(s: &Setup) {
+    restart_daemon(
+        &s.home,
+        &s.fake_review,
+        &s.fake_fixer,
+        &s.fake_gh,
+        "clean",
+        &s.path,
+        DaemonOpts::default(),
+    );
+}
+
+fn wait_file(path: &Path, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        if path.exists() {
+            return;
+        }
+        assert!(start.elapsed() <= timeout, "missing {}", path.display());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_round_interrupted(db: &Db, run_id: &str, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        let rounds = rounds::rounds_for_run(db, run_id).unwrap();
+        if rounds
+            .first()
+            .is_some_and(|r| r.execution == ExecutionState::Interrupted)
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() <= timeout,
+            "round not reconciled: {rounds:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_open_pending_round(db: &Db, run_id: &str) {
+    let before = rounds::rounds_for_run(db, run_id).unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].execution, ExecutionState::Running);
+    assert_eq!(before[0].assurance_completion, AssuranceCompletion::Pending);
+}
+
+fn boundary_post_open() {
+    let s = setup("clean");
+    kill_daemon(&s.home);
+    restart_daemon(
+        &s.home,
+        &s.fake_review,
+        &s.fake_fixer,
+        &s.fake_gh,
+        "clean",
+        &s.path,
+        DaemonOpts {
+            fault: FaultHook::AbortAfterOpen,
+            ..DaemonOpts::default()
+        },
+    );
+    commit_change(&s.work, "post-open.txt", "x\n");
+    push_branch(&s, "feat-kill-post-open", "clean");
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let run = wait_status(&db, &repo_id, &["failed"], Duration::from_secs(20));
+    assert_open_pending_round(&db, &run.id);
+    assert!(!s.home.join("review-spawned").exists());
+    kill_daemon(&s.home);
+    restart_clean(&s);
+    assert_interrupted_incomplete_no_instances_no_approval(&db, &run.id);
+    kill_daemon(&s.home);
+}
+
+fn boundary_mid_producer() {
+    let s = setup("hang");
+    commit_change(&s.work, "mid.txt", "x\n");
+    push_branch(&s, "feat-kill-mid", "hang");
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    wait_file(&s.home.join("review-spawned"), Duration::from_secs(15));
+    let run = db
+        .runs_for_repo(&repo_id)
+        .unwrap()
+        .last()
+        .expect("run")
+        .clone();
+    assert_open_pending_round(&db, &run.id);
+    kill_daemon(&s.home);
+    restart_clean(&s);
+    wait_round_interrupted(&db, &run.id, Duration::from_secs(10));
+    assert_interrupted_incomplete_no_instances_no_approval(&db, &run.id);
+    kill_daemon(&s.home);
+}
+
+fn boundary_pre_finalize() {
+    let s = setup("clean");
+    kill_daemon(&s.home);
+    restart_daemon(
+        &s.home,
+        &s.fake_review,
+        &s.fake_fixer,
+        &s.fake_gh,
+        "clean",
+        &s.path,
+        DaemonOpts {
+            fault: FaultHook::AbortBeforeFinalize,
+            ..DaemonOpts::default()
+        },
+    );
+    commit_change(&s.work, "pre-final.txt", "x\n");
+    push_branch(&s, "feat-kill-pre-final", "clean");
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let run = wait_status(&db, &repo_id, &["failed"], Duration::from_secs(20));
+    assert!(s.home.join("review-spawned").exists());
+    assert_open_pending_round(&db, &run.id);
+    kill_daemon(&s.home);
+    restart_clean(&s);
+    assert_interrupted_incomplete_no_instances_no_approval(&db, &run.id);
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn killed_at_each_boundary_reconciles_to_interrupted_incomplete() {
+    boundary_post_open();
+    boundary_mid_producer();
+    boundary_pre_finalize();
+}
+
+#[test]
+fn reconcile_stale_uses_at_most_one_committed_write_per_round() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    db.upsert_repo("repo1", &home, &home.join("bare.git"), "main")
+        .unwrap();
+    let mut round_ids = Vec::new();
+    for i in 0..3 {
+        let run = db
+            .insert_run("repo1", &format!("feat-{i}"), "deadbeef", None, None)
+            .unwrap();
+        round_ids.push(open_stale_round(&db, &run.id));
+    }
+
+    rounds::reset_committed_write_count();
+    let n = rounds::reconcile_stale(&db).unwrap();
+    assert_eq!(n, 3);
+    let writes = rounds::take_committed_write_count();
+    assert_eq!(
+        writes, 3,
+        "expected one committed write per stale round, got {writes}"
+    );
+    for id in &round_ids {
+        let loaded = rounds::get_round(&db, id).unwrap().unwrap();
+        assert_eq!(loaded.execution, ExecutionState::Interrupted);
+        assert_eq!(loaded.assurance_completion, AssuranceCompletion::Incomplete);
+        assert!(rounds::instances_for_round(&db, id).unwrap().is_empty());
+    }
+
+    rounds::reset_committed_write_count();
+    let n2 = rounds::reconcile_stale(&db).unwrap();
+    assert_eq!(n2, 0);
+    assert_eq!(rounds::take_committed_write_count(), 0);
+}
+
+#[test]
+fn startup_recovers_stale_runs_and_refuses_when_recovery_fails() {
+    // Still recovers stale running runs (and their open rounds).
+    {
+        let s = setup("clean");
+        let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+        let repo_id = repo_id_for(&s.work);
+        // Ensure the bare has objects for worktree_add_detach.
+        commit_change(&s.work, "seed-stale.txt", "s\n");
+        push_branch(&s, "feat-seed-stale", "clean");
+        let _ = wait_status(
+            &db,
+            &repo_id,
+            &["parked", "completed", "failed"],
+            Duration::from_secs(20),
+        );
+
+        let repo = db.repo_by_id(&repo_id).unwrap().unwrap();
+        let sha = {
+            let out = StdCommand::new("git")
+                .current_dir(&s.work)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let run = db
+            .insert_run(&repo_id, "stale-running", &sha, None, None)
+            .unwrap();
+        let wt = run_worktree_dir(&s.home, &repo_id, &run.id);
+        db.set_worktree_dir(&run.id, &wt).unwrap();
+        db.set_run_status(&run.id, "running", None).unwrap();
+        worktree_add_detach(&GitDir::new(&repo.bare_path).unwrap(), &wt, &sha).unwrap();
+        let round_id = open_stale_round(&db, &run.id);
+        assert!(wt.exists());
+
+        kill_daemon(&s.home);
+        restart_daemon(
+            &s.home,
+            &s.fake_review,
+            &s.fake_fixer,
+            &s.fake_gh,
+            "clean",
+            &s.path,
+            DaemonOpts::default(),
+        );
+
+        let start = Instant::now();
+        let failed = loop {
+            let r = db.run_by_id(&run.id).unwrap().unwrap();
+            if r.status == "failed" {
+                break r;
+            }
+            assert!(
+                start.elapsed() <= Duration::from_secs(10),
+                "stale run not recovered: {} {:?}",
+                r.status,
+                r.error
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("daemon restarted")),
+            "error={:?}",
+            failed.error
+        );
+        assert!(!wt.exists(), "stale worktree must be removed");
+        let loaded = rounds::get_round(&db, &round_id).unwrap().unwrap();
+        assert_eq!(loaded.execution, ExecutionState::Interrupted);
+        assert_eq!(loaded.assurance_completion, AssuranceCompletion::Incomplete);
+        kill_daemon(&s.home);
+    }
+
+    // Refuse to serve when recover_stale fails.
+    {
+        let s = setup("clean");
+        kill_daemon(&s.home);
+        let sock = s.home.join("daemon.sock");
+        let _ = std::fs::remove_file(&sock);
+        restart_daemon(
+            &s.home,
+            &s.fake_review,
+            &s.fake_fixer,
+            &s.fake_gh,
+            "clean",
+            &s.path,
+            DaemonOpts {
+                fault: FaultHook::FailRecover,
+                wait_health: false,
+                ..DaemonOpts::default()
+            },
+        );
+        let health = porch_gate::wait_for_health(&s.home, Duration::from_secs(2));
+        assert!(
+            health.is_err(),
+            "daemon must refuse to serve when recovery fails"
+        );
         kill_daemon(&s.home);
     }
 }
