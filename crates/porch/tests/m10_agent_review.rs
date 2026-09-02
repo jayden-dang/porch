@@ -377,12 +377,29 @@ fn agent_review_push_writes_prompt_and_completes() {
     );
     assert_eq!(run.status, "parked", "err={:?}", run.error);
 
-    let prompt = home
-        .join("runs")
-        .join(&run.id)
-        .join("review")
-        .join("prompt.txt");
-    assert!(prompt.is_file(), "missing {}", prompt.display());
+    // ROUND moves prompts under runs/<id>/rounds/<round>/producers/<inv>/.
+    let rounds_root = home.join("runs").join(&run.id).join("rounds");
+    let mut prompt = None;
+    if rounds_root.is_dir() {
+        for round in fs::read_dir(&rounds_root).unwrap() {
+            let producers = round.unwrap().path().join("producers");
+            if !producers.is_dir() {
+                continue;
+            }
+            for inv in fs::read_dir(&producers).unwrap() {
+                let candidate = inv.unwrap().path().join("prompt.txt");
+                if candidate.is_file() {
+                    prompt = Some(candidate);
+                    break;
+                }
+            }
+            if prompt.is_some() {
+                break;
+            }
+        }
+    }
+    let prompt =
+        prompt.unwrap_or_else(|| panic!("missing prompt.txt under {}", rounds_root.display()));
     let body = fs::read_to_string(&prompt).unwrap();
     assert!(body.contains("session-free") || body.contains("JSON"));
     assert!(body.contains("README"));

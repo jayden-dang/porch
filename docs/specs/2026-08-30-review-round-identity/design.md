@@ -1,7 +1,7 @@
 # Design: Review Round Identity
 
 Feature code: ROUND
-Status: In-progress
+Status: Implemented
 Date: 2026-08-30
 Requirements: ./requirements.md
 
@@ -601,9 +601,35 @@ Reuse: rung 2 — extends `recover_stale` (`executor.rs:17`, invoked `daemon.rs:
 Respects: ARCH-10
 Surface: the `RunExecutor` trait (`executor.rs:17`) — **replace**: stale-round reconciliation joins
 stale-run recovery behind the same contract; the daemon's refuse-on-failure behaviour is unchanged.
-Interface: `recover_stale(home)` — same signature, wider responsibility
-Depth: n/a — extends `recover_stale`
-Locality: `daemon.rs` and `executor.rs` — **extend**. No new module.
+Interface: `rounds::reconcile_stale(db) -> Result<usize>` · `recover_stale(home)` — same signature,
+wider responsibility (implementors reconcile open rounds then recover stale runs)
+Depth: n/a — extends `recover_stale` and the round store
+Locality: `daemon.rs`, `executor.rs`, and `rounds/mod.rs` — **extend**. No new module.
+
+A kill anywhere between durable open and durable finalization leaves the round
+`running`/`pending` (`ROUND-4.6`). The durable checkpoints are:
+
+1. **post-open** — open transaction committed; producer not yet spawned
+2. **mid-producer** — producer running or hung; still no coverage/instances rows
+3. **post-spawn / pre-finalize** — producer returned; phase-2 not committed
+
+All three share the same open-row shape (no `finding_instances`, no `round_coverage`, no
+`finalized_at`, no approval). Startup therefore does not branch on boundary: it scans
+`review_rounds_open` for `running`/`pending` and closes each with one `BEGIN IMMEDIATE`
+write that sets `interrupted` / `incomplete`, `completion_reason = 'process_interrupted'`,
+`finalized_at`, and bumps `runs.review_history_revision` — never inserting instances or
+writing `review_approved_head_sha` (`ROUND-4.7`, `ROUND-4.8`, `ROUND-7.6`).
+
+Call order at daemon start (after `Db::open`, before bind/serve):
+
+1. `rounds::reconcile_stale(&db)` — fail closed → refuse to serve
+2. `executor.recover_stale(home)` — existing stale-run / worktree recovery; fail closed unchanged
+
+`PipelineExecutor::recover_stale` also invokes `reconcile_stale` so any path that only
+calls the trait still meets the wider contract; a second call is a no-op (no open rows).
+Already-terminal rounds are skipped. Fault-injection tests kill or abort at each
+checkpoint above and assert restart yields `interrupted`/`incomplete` with empty
+instances and no approval (`ROUND-7.3`).
 
 ### 10. Read path and legacy labeling — `porch-gate/src/rpc.rs`, `porch/src/tui.rs`
 

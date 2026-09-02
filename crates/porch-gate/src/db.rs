@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use ulid::Ulid;
@@ -91,6 +91,7 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS repos (
@@ -156,9 +157,14 @@ impl Db {
             );
             ",
         )?;
+        crate::rounds::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().expect("db mutex")
     }
 
     /// Insert or update a repo row keyed by `id`.
@@ -960,7 +966,12 @@ impl Db {
     }
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+pub(crate) fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<()> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
     let mut found = false;

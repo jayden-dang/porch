@@ -1,0 +1,40 @@
+{
+  "fingerprint_version": 1,
+  "cases": [
+    {
+      "case": "moved-code",
+      "fingerprint_version": 1,
+      "families": ["moved-code"]
+    },
+    {
+      "case": "rewritten-message",
+      "fingerprint_version": 1,
+      "families": ["rewritten-message"]
+    },
+    {
+      "case": "path-change",
+      "fingerprint_version": 1,
+      "families": ["path-change"]
+    },
+    {
+      "case": "collision",
+      "fingerprint_version": 1,
+      "families": ["collision"]
+    },
+    {
+      "case": "disappearing-finding",
+      "fingerprint_version": 1,
+      "families": ["disappearing-finding"]
+    },
+    {
+      "case": "multi-producer-duplicate",
+      "fingerprint_version": 1,
+      "families": ["multi-producer-duplicate"]
+    },
+    {
+      "case": "ambiguous-correspondence",
+      "fingerprint_version": 1,
+      "families": ["ambiguous-correspondence"]
+    }
+  ]
+}

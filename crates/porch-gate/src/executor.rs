@@ -9,10 +9,13 @@ pub trait RunExecutor: Send + Sync {
     /// Drive one run to a terminal status. Honors `cancel` between phases.
     fn execute(&self, home: &Path, run_id: &str, cancel: &AtomicBool);
 
-    /// Fail stale `running` rows and remove their leftover worktrees.
+    /// Recover after an unclean shutdown: reconcile open review rounds to
+    /// `interrupted`/`incomplete`, fail stale `running` rows, and remove leftover
+    /// worktrees. The daemon refuses to serve when this returns an error.
     ///
     /// # Errors
     ///
-    /// Returns a stringified error if recovery cannot update state or remove trees.
+    /// Returns a stringified error if round reconciliation, run recovery, or
+    /// worktree cleanup cannot complete.
     fn recover_stale(&self, home: &Path) -> Result<(), String>;
 }

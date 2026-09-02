@@ -306,6 +306,7 @@ fn agent_status_from_snap(snap: &RunSnapshot) -> AgentRunSnapshot {
         base_sha: snap.base_sha.clone(),
         review_approved_head_sha: snap.review_approved_head_sha.clone(),
         findings,
+        assurance_record: snap.assurance_record.clone(),
         error: snap.error.clone(),
         pr_url: snap.pr_url.clone(),
         steps: snap
@@ -332,6 +333,7 @@ struct AgentRunSnapshot {
     base_sha: Option<String>,
     review_approved_head_sha: Option<String>,
     findings: serde_json::Value,
+    assurance_record: porch_gate::AssuranceRecord,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

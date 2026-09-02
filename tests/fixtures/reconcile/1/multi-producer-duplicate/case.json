@@ -1,0 +1,47 @@
+{
+  "case": "multi-producer-duplicate",
+  "fingerprint_version": 1,
+  "prior_rounds": [
+    {
+      "ordinal": 1,
+      "findings": [
+        {
+          "ref": "p1",
+          "path": "src/a.rs",
+          "criterion_id": "rust/unwrap-in-lib",
+          "anchor": { "kind": "symbol", "value": "fn load" },
+          "lines": [10, 12],
+          "producer": "quality"
+        }
+      ]
+    }
+  ],
+  "current_round": {
+    "producers": ["quality", "agent"],
+    "findings": [
+      {
+        "ref": "c1",
+        "path": "src/a.rs",
+        "criterion_id": "rust/unwrap-in-lib",
+        "anchor": { "kind": "symbol", "value": "fn load" },
+        "lines": [18, 20],
+        "producer": "quality"
+      },
+      {
+        "ref": "c2",
+        "path": "src/a.rs",
+        "criterion_id": "rust/unwrap-in-lib",
+        "anchor": { "kind": "symbol", "value": "fn load" },
+        "lines": [18, 20],
+        "producer": "agent"
+      }
+    ]
+  },
+  "rename_evidence": [],
+  "expect": {
+    "reuse": [{ "current": "c1", "prior": "p1" }],
+    "equivalence_groups": [["c1", "c2"]],
+    "minted": [],
+    "disappeared": []
+  }
+}

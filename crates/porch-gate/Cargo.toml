@@ -25,6 +25,8 @@ ulid.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

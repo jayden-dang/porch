@@ -45,6 +45,9 @@ pub fn run_daemon(home: &Path, executor: &Arc<dyn RunExecutor>) -> Result<()> {
         .try_lock_exclusive()
         .map_err(|e| crate::Error::Other(format!("daemon already running: {e}")))?;
     let db = Arc::new(Db::open(&db_path(home))?);
+    if let Err(e) = crate::rounds::reconcile_stale(&db) {
+        return Err(crate::Error::Other(format!("reconcile stale rounds: {e}")));
+    }
     if let Err(e) = executor.recover_stale(home) {
         return Err(crate::Error::Other(format!("recover stale runs: {e}")));
     }
@@ -397,8 +400,13 @@ mod tests {
         db.set_run_status(&run.id, "parked", None).unwrap();
         db.insert_step_result(&run.id, "review", "parked", None)
             .unwrap();
-        db.set_findings_json(&run.id, Some(r#"[{"id":"f0"}]"#))
-            .unwrap();
+        db.set_findings_json(
+            &run.id,
+            Some(
+                r#"[{"id":"f0","path":"README","message":"x","severity":"warning","action":"ask-user"}]"#,
+            ),
+        )
+        .unwrap();
 
         let _handle = start_test_daemon(&home);
         wait_for_health(&home, Duration::from_secs(5)).unwrap();

@@ -10,14 +10,33 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::{
-    Action, Error, Finding, ReviewComment, ReviewOutcome, Severity, assert_coverage, map_comment,
+    Action, Error, Finding, ReviewComment, ReviewOutcome, Severity, assert_coverage,
+    coverage_state::{ProducerOutput, StatusRow},
 };
 
 /// Env override for the review agent binary (`claude` / `codex` / PATH fake).
 pub const REVIEW_AGENT_BIN_ENV: &str = "PORCH_REVIEW_AGENT_BIN";
 
-/// Relative review artifact dir under `$PORCH_HOME/runs/<id>/`.
+/// Relative review artifact dir under `$PORCH_HOME/runs/<id>/` (legacy flat path).
 pub const REVIEW_ARTIFACT_REL: &str = "review";
+
+/// Per-invocation artifact directory:
+/// `$PORCH_HOME/runs/<run>/rounds/<round>/producers/<invocation>/`.
+#[must_use]
+pub fn producer_artifact_dir(
+    porch_home: &Path,
+    run_id: &str,
+    round_id: &str,
+    invocation_id: &str,
+) -> PathBuf {
+    porch_home
+        .join("runs")
+        .join(run_id)
+        .join("rounds")
+        .join(round_id)
+        .join("producers")
+        .join(invocation_id)
+}
 
 /// Porch-owned reviewer prompt body (written under `$PORCH_HOME`, outside the worktree).
 pub const REVIEWER_PROMPT: &str = "\
@@ -51,6 +70,10 @@ pub struct RunAgentReviewOpts<'a> {
     pub changed_files: &'a [String],
     pub bin: &'a str,
     pub timeout: Duration,
+    /// When set, spawn uses this plan's absolute target without re-resolving.
+    pub plan: Option<&'a crate::plan::InvocationPlan>,
+    /// When set, `result.json` is written here (invocation namespace).
+    pub artifact_dir: Option<&'a Path>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,10 +203,17 @@ pub fn write_reviewer_prompt(
 /// Returns [`Error::Json`] when the payload is not valid JSON of either shape.
 pub fn parse_agent_review_json(bytes: &[u8]) -> Result<ReviewOutcome, Error> {
     let parsed: AgentReviewJson = serde_json::from_slice(bytes)?;
+    let mapping = crate::CriterionMapping::builtin();
     let mut findings = Vec::new();
     if parsed.findings.is_empty() {
         for (i, c) in parsed.comments.iter().enumerate() {
-            if let Some(mut f) = map_comment(c) {
+            let deterministic = c.rule_id.as_deref().is_some_and(|s| !s.trim().is_empty());
+            if let Some(mut f) = crate::enrich_from_comment(
+                c,
+                &mapping,
+                &crate::AnchorContext::default(),
+                deterministic,
+            ) {
                 f.id = format!("f{i}");
                 findings.push(f);
             }
@@ -198,7 +228,45 @@ pub fn parse_agent_review_json(bytes: &[u8]) -> Result<ReviewOutcome, Error> {
     Ok(ReviewOutcome {
         findings,
         covered_files: derive_agent_coverage(&parsed),
+        coverage: agent_coverage_output(&parsed),
     })
+}
+
+fn agent_coverage_output(parsed: &AgentReviewJson) -> ProducerOutput {
+    let rows: Vec<StatusRow> = parsed
+        .coverage
+        .iter()
+        .filter(|c| !c.path.is_empty())
+        .map(|c| StatusRow {
+            path: c.path.clone(),
+            status: c.status.clone(),
+            ..StatusRow::default()
+        })
+        .collect();
+    let mut out = ProducerOutput::from_status_rows(&rows);
+    for path in &parsed.files {
+        if !path.is_empty() {
+            out.present_paths.push(path.clone());
+        }
+    }
+    if out.completed.is_empty()
+        && out.waived.is_empty()
+        && out.failed.is_empty()
+        && out.selected.is_empty()
+    {
+        // Findings/comments alone are presence, never completion.
+        for f in &parsed.findings {
+            if !f.path.is_empty() {
+                out.present_paths.push(f.path.clone());
+            }
+        }
+        for c in &parsed.comments {
+            if !c.path.is_empty() {
+                out.present_paths.push(c.path.clone());
+            }
+        }
+    }
+    out
 }
 
 fn map_agent_finding(raw: &AgentFindingIn) -> Finding {
@@ -217,8 +285,15 @@ fn map_agent_finding(raw: &AgentFindingIn) -> Finding {
         end_line: raw.end_line,
         category: raw.category.clone(),
         severity: raw.severity.clone(),
+        rule_id: None,
+        confidence: None,
     };
-    if let Some(mut f) = map_comment(&comment) {
+    if let Some(mut f) = crate::enrich_from_comment(
+        &comment,
+        &crate::CriterionMapping::builtin(),
+        &crate::AnchorContext::default(),
+        false,
+    ) {
         if let Some(action) = raw.action.as_deref() {
             f.action = parse_action(action);
         }
@@ -236,7 +311,6 @@ fn map_agent_finding(raw: &AgentFindingIn) -> Finding {
         _ => Severity::Warning,
     };
     Finding {
-        id: String::new(),
         path: raw.path.clone(),
         message,
         severity,
@@ -244,6 +318,7 @@ fn map_agent_finding(raw: &AgentFindingIn) -> Finding {
         category: raw.category.clone(),
         start_line: raw.start_line,
         end_line: raw.end_line,
+        ..Finding::default()
     }
 }
 
@@ -361,18 +436,13 @@ pub fn review_uses_agent(porch_home: Option<&Path>) -> bool {
 pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
     assert_prompt_under_home(opts.prompt_file, opts.porch_home)?;
 
-    let out_file = opts
-        .prompt_file
-        .parent()
-        .unwrap_or(opts.porch_home)
-        .join("result.json");
-    if out_file.exists() {
-        let _ = fs::remove_file(&out_file);
-    }
+    let out_file = prepare_result_json(opts)?;
     let out_s = abs_str(&out_file)?;
     let prompt_s = abs_str(opts.prompt_file)?;
 
-    let family = agent_cli_family(opts.bin);
+    let bin_path = spawn_bin_path(opts);
+    let bin_label = bin_path.display().to_string();
+    let family = agent_cli_family(&bin_label);
     // Neutralize before the dirty snapshot so rename/restore is not mistaken for
     // a reviewer write. Claude/Codex skip AGENTS.md neutralize because readonly /
     // plan flags are used; dirty worktree (file-write) detection still fail-closes.
@@ -384,7 +454,7 @@ pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, 
     let dirty_before = worktree_porcelain(opts.work_tree)?;
 
     let result = (|| {
-        let mut cmd = Command::new(opts.bin);
+        let mut cmd = Command::new(bin_path);
         cmd.current_dir(opts.work_tree);
         apply_agent_argv(&mut cmd, family, &prompt_s, &out_s, opts)?;
         cmd.stdin(Stdio::null());
@@ -399,7 +469,7 @@ pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::BinNotFound {
-                    bin: opts.bin.to_string(),
+                    bin: bin_label,
                     source: e,
                 }
             } else {
@@ -471,6 +541,27 @@ pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, 
 
     restore_neutralized(&neutralized);
     result
+}
+
+fn prepare_result_json(opts: &RunAgentReviewOpts<'_>) -> Result<PathBuf, Error> {
+    let prompt_parent = opts.prompt_file.parent();
+    let out_dir: &Path = match opts.artifact_dir {
+        Some(d) => d,
+        None => prompt_parent.unwrap_or(opts.porch_home),
+    };
+    fs::create_dir_all(out_dir)?;
+    let out_file = out_dir.join("result.json");
+    if out_file.exists() {
+        let _ = fs::remove_file(&out_file);
+    }
+    Ok(out_file)
+}
+
+fn spawn_bin_path<'a>(opts: &'a RunAgentReviewOpts<'a>) -> &'a Path {
+    opts.plan.map_or_else(
+        || Path::new(opts.bin),
+        |p| p.spawned_target_absolute.as_path(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -794,6 +885,8 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             changed_files: &["README".into()],
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_secs(5),
+            plan: None,
+            artifact_dir: None,
         })
         .unwrap();
         assert!(out.findings.is_empty());
@@ -833,6 +926,8 @@ printf '%s\n' '{"findings":[],"files":["a.rs"]}' > "$OUT"
             changed_files: &["a.rs".into(), "b.rs".into()],
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_secs(5),
+            plan: None,
+            artifact_dir: None,
         })
         .unwrap_err();
         assert!(matches!(err, Error::Coverage(ref p) if p == "b.rs"));
@@ -870,6 +965,8 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             changed_files: &["README".into()],
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_secs(5),
+            plan: None,
+            artifact_dir: None,
         })
         .unwrap_err();
         assert!(
@@ -895,6 +992,8 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             changed_files: &[],
             bin: "true",
             timeout: Duration::from_secs(1),
+            plan: None,
+            artifact_dir: None,
         })
         .unwrap_err();
         assert!(matches!(err, Error::PromptRefuse(_)));
@@ -922,6 +1021,8 @@ printf '%s\n' '{"findings":[],"files":["README"]}' > "$OUT"
             changed_files: &[],
             bin: bin.to_str().unwrap(),
             timeout: Duration::from_millis(200),
+            plan: None,
+            artifact_dir: None,
         })
         .unwrap_err();
         assert!(matches!(err, Error::Timeout(_)));

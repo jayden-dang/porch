@@ -17,13 +17,27 @@ use porch_agent::{
     RunFixerOpts, fixer_bin, fixer_timeout, run_fixer, write_deliver_repair_inputs,
     write_fixer_inputs, write_rebase_fix_inputs,
 };
+use porch_gate::rounds::{
+    self, AssuranceCompletion, ContextApplication, ContextApplicationState, ContextSource,
+    EquivalenceInput, ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal,
+    ObservedVersionForEquivalence, OpenRoundPlan, ProducerInvocation, RoundCoverageProposal,
+    RoundId, STALE_REVISION_RETRIES, capture_context_element, descriptor_equivalence_digest,
+    sha256_hex,
+};
 use porch_gate::{
-    Db, RunExecutor, RunRow, db_path, event_hub, load_finding_notes, repo_id_for, rpc_start_run,
-    run_artifact_dir, run_deliver_repair_dir, run_fixer_dir, run_worktree_dir,
+    Db, RunExecutor, RunRow, StatusFindingDto, db_path, event_hub, load_finding_notes, repo_id_for,
+    resolve_run_assurance, rpc_start_run, run_artifact_dir, run_deliver_repair_dir, run_fixer_dir,
+    run_worktree_dir,
 };
 use porch_git::GitDir;
-use porch_review::{Finding, RunReviewOpts, review_bin, review_timeout, run_review};
+use porch_review::{
+    Action, AdapterKind, CriterionMapping, CurrentFinding, Finding, History,
+    ObservedVersionIdentity, PrepareOpts, PriorInstance, ProducerDescriptor, ProducerOutput,
+    RunReviewOpts, Severity, SourceRange, derive, prepare, producer_artifact_dir, reconcile,
+    review_timeout, run_review,
+};
 use serde::Serialize;
+use ulid::Ulid;
 
 pub use agent_run::{AgentRunOpts, agent_run};
 pub use sync::{SyncStatus, agent_sync, recovery_ref_name, sync_hint_for};
@@ -53,6 +67,11 @@ impl RunExecutor for PipelineExecutor {
     }
 
     fn recover_stale(&self, home: &Path) -> std::result::Result<(), String> {
+        if std::env::var_os("PORCH_TEST_FAIL_RECOVER_STALE").is_some() {
+            return Err("test recover_stale failure".into());
+        }
+        let db = Db::open(&db_path(home)).map_err(|e| e.to_string())?;
+        rounds::reconcile_stale(&db).map_err(|e| e.to_string())?;
         recover_stale_running(home).map_err(|e| e.to_string())
     }
 }
@@ -170,7 +189,7 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                         }
                     }
                 }
-                "review" => match run_review_phase(&db, home, run_id, &wt_path, false)? {
+                "review" => match run_review_phase(&db, home, run_id, &bare, &wt_path, false)? {
                     ReviewPhase::Approved => {
                         record_step(&db, run_id, phase, "completed", None)?;
                     }
@@ -247,49 +266,45 @@ enum ReviewPhase {
     Parked,
 }
 
+/// Protocol schema version recorded on every round opened by this binary.
+const PROTOCOL_SCHEMA_VERSION: i64 = 1;
+
 fn run_review_phase(
     db: &Db,
     home: &Path,
     run_id: &str,
+    bare: &GitDir,
     wt: &Path,
     after_fix: bool,
 ) -> Result<ReviewPhase> {
     let run = db
         .run_by_id(run_id)?
         .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
-    let base = run
+    let base_sha = run
         .base_sha
         .as_deref()
         .ok_or_else(|| RunError::Msg("review requires base_sha".into()))?;
     let head = porch_git::rev_parse_c(wt, "HEAD")?;
     db.set_run_shas(run_id, Some(&head), None)?;
 
-    let from_sha = resolve_review_from(db, wt, &run, base, &head, after_fix)?;
+    let from_sha = resolve_review_from(db, wt, &run, base_sha, &head, after_fix)?;
     let range = format!("{from_sha}..{head}");
     let changed = porch_git::diff_name_only(wt, &range)?;
-    let bin = review_bin();
-    let timeout = review_timeout();
 
-    let outcome = match run_review(&RunReviewOpts {
-        work_tree: wt,
-        from_sha: &from_sha,
-        to_sha: &head,
-        changed_files: &changed,
-        bin: &bin,
-        timeout,
-        porch_home: Some(home),
-        run_id: Some(run_id),
-        intent: run.intent.as_deref(),
-    }) {
-        Ok(o) => o,
-        Err(porch_review::Error::Timeout(d)) => {
-            return Err(RunError::Msg(format!("review timed out after {d:?}")));
-        }
-        Err(e) => return Err(RunError::Review(e)),
-    };
-
-    let findings_json = serde_json::to_string(&outcome.findings)?;
-    db.set_findings_json(run_id, Some(&findings_json))?;
+    let opened = open_review_round(db, home, bare, &run, run_id, &from_sha, &head, &changed)?;
+    let outcome = spawn_review_for_round(
+        db,
+        &SpawnReviewCtx {
+            home,
+            wt,
+            run: &run,
+            from_sha: &from_sha,
+            head: &head,
+            changed: &changed,
+            opened: &opened,
+        },
+    )?;
+    finalize_complete_round(db, run_id, &opened, &changed, &outcome)?;
     publish_run(run_id, "findings updated");
 
     if outcome.has_blocking() {
@@ -300,6 +315,470 @@ fn run_review_phase(
     db.set_review_approved_head_sha(run_id, Some(&head))?;
     clear_uncertified_if_certified(db, wt, &run.repo_id, &run.branch, &head)?;
     Ok(ReviewPhase::Approved)
+}
+
+struct OpenedRound {
+    round_id: RoundId,
+    producer_invocation_id: String,
+    artifact_dir: PathBuf,
+    plan: porch_review::InvocationPlan,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn open_review_round(
+    db: &Db,
+    home: &Path,
+    bare: &GitDir,
+    run: &RunRow,
+    run_id: &str,
+    from_sha: &str,
+    head: &str,
+    changed: &[String],
+) -> Result<OpenedRound> {
+    let intent_bytes = run.intent.as_ref().map(|s| s.as_bytes().to_vec());
+    let path_instructions_path = run_artifact_dir(home, run_id).join("path_instructions.json");
+    let path_instructions_bytes = if path_instructions_path.is_file() {
+        Some(std::fs::read(&path_instructions_path)?)
+    } else {
+        None
+    };
+
+    let prepared = prepare(&PrepareOpts {
+        porch_home: Some(home),
+        review_bin: None,
+        agent_bin: None,
+        prefer_agent: None,
+        intent: intent_bytes.as_deref(),
+        path_instructions: path_instructions_bytes.as_deref(),
+    })?;
+
+    let trusted_config_sha = run
+        .trusted_config_sha
+        .clone()
+        .ok_or_else(|| RunError::Msg("review requires trusted_config_sha".into()))?;
+    // Pin before open so a failed open leaves a sweepable ref leak, not an unpinned round.
+    rounds::retention::pin_trusted_config(bare, &trusted_config_sha).map_err(|e| {
+        RunError::Msg(format!(
+            "failed to pin trusted config before round open: {e}"
+        ))
+    })?;
+    let inv_bytes = inventory_bytes(changed);
+    let inventory_digest = sha256_hex(&inv_bytes);
+
+    let context_elements = vec![
+        capture_context_element(
+            "intent",
+            match &intent_bytes {
+                Some(b) => ContextSource::Present { bytes: b.clone() },
+                None => ContextSource::Absent { reason: None },
+            },
+        ),
+        capture_context_element(
+            "path_instructions",
+            match &path_instructions_bytes {
+                Some(b) => ContextSource::Present { bytes: b.clone() },
+                None => ContextSource::Absent { reason: None },
+            },
+        ),
+    ];
+    let context_applications: Vec<ContextApplication> = prepared
+        .context_elements
+        .iter()
+        .map(|el| ContextApplication {
+            element_name: el.element_name.clone(),
+            producer_slot: 0,
+            application: if el.applied {
+                ContextApplicationState::Applied
+            } else {
+                ContextApplicationState::NotApplied
+            },
+            effective_digest: el.effective_digest.clone(),
+        })
+        .collect();
+
+    let mut bindings = rounds::RoundBindings {
+        from_sha: from_sha.to_string(),
+        to_sha: head.to_string(),
+        inventory_digest,
+        inventory_bytes: inv_bytes,
+        trusted_config_sha,
+        protocol_schema_version: PROTOCOL_SCHEMA_VERSION,
+        fingerprint_version: i64::from(porch_review::FINGERPRINT_VERSION),
+        intent_source: run.intent_source.clone(),
+        context_elements,
+        context_applications,
+    };
+    // Test hook: force open_round to refuse before any spawn.
+    if std::env::var_os("PORCH_TEST_FAIL_ROUND_OPEN").is_some() {
+        bindings.inventory_digest = sha256_hex(b"porch-test-fail-round-open");
+    }
+
+    let descriptor_json = serde_json::to_string(&prepared.plan.descriptor)
+        .map_err(|e| RunError::Msg(format!("serialize producer descriptor: {e}")))?;
+    let open_plan = OpenRoundPlan {
+        run_id: run_id.to_string(),
+        producers: vec![ProducerInvocation {
+            descriptor_equivalence_digest: producer_equivalence_digest(&prepared.plan.descriptor),
+            descriptor_json,
+        }],
+    };
+
+    let round_id = rounds::open_round(db, &open_plan, &bindings).map_err(|e| {
+        RunError::Msg(format!(
+            "failed to open review round before producer spawn: {e}"
+        ))
+    })?;
+    if std::env::var_os("PORCH_TEST_ABORT_AFTER_ROUND_OPEN").is_some() {
+        return Err(RunError::Msg("test abort after round open".into()));
+    }
+    let producer_invocation_id = rounds::producers_for_round(db, &round_id)?
+        .into_iter()
+        .next()
+        .map(|p| p.id)
+        .ok_or_else(|| RunError::Msg("opened round has no producer invocation".into()))?;
+    let artifact_dir =
+        producer_artifact_dir(home, run_id, round_id.as_str(), &producer_invocation_id);
+    std::fs::create_dir_all(&artifact_dir)?;
+    Ok(OpenedRound {
+        round_id,
+        producer_invocation_id,
+        artifact_dir,
+        plan: prepared.plan,
+    })
+}
+
+struct SpawnReviewCtx<'a> {
+    home: &'a Path,
+    wt: &'a Path,
+    run: &'a RunRow,
+    from_sha: &'a str,
+    head: &'a str,
+    changed: &'a [String],
+    opened: &'a OpenedRound,
+}
+
+fn spawn_review_for_round(
+    db: &Db,
+    ctx: &SpawnReviewCtx<'_>,
+) -> Result<porch_review::ReviewOutcome> {
+    let opened = ctx.opened;
+    let spawn_result = run_review(&RunReviewOpts {
+        work_tree: ctx.wt,
+        from_sha: ctx.from_sha,
+        to_sha: ctx.head,
+        changed_files: ctx.changed,
+        bin: opened.plan.spawned_target_absolute.to_str().unwrap_or(""),
+        timeout: review_timeout(),
+        porch_home: Some(ctx.home),
+        run_id: Some(&ctx.run.id),
+        intent: ctx.run.intent.as_deref(),
+        plan: Some(&opened.plan),
+        artifact_dir: Some(&opened.artifact_dir),
+    });
+    match spawn_result {
+        Ok(o) => {
+            if std::env::var_os("PORCH_TEST_ABORT_BEFORE_ROUND_FINALIZE").is_some() {
+                return Err(RunError::Msg("test abort before round finalize".into()));
+            }
+            Ok(o)
+        }
+        Err(e) => {
+            finalize_incomplete(db, &opened.round_id, incomplete_reason(&e))?;
+            Err(match e {
+                porch_review::Error::Timeout(d) => {
+                    RunError::Msg(format!("review timed out after {d:?}"))
+                }
+                other => RunError::Review(other),
+            })
+        }
+    }
+}
+
+fn incomplete_reason(err: &porch_review::Error) -> &'static str {
+    match err {
+        porch_review::Error::Timeout(_) => "producer_timeout",
+        porch_review::Error::Exit { .. } => "producer_exit",
+        porch_review::Error::Coverage(_) => "coverage_shortfall",
+        porch_review::Error::ProducerArtifactChanged => "producer_artifact_changed",
+        _ => "malformed_output",
+    }
+}
+
+fn finalize_complete_round(
+    db: &Db,
+    run_id: &str,
+    opened: &OpenedRound,
+    changed: &[String],
+    outcome: &porch_review::ReviewOutcome,
+) -> Result<()> {
+    let coverage_entries = match porch_review::derive_states(changed, &outcome.coverage) {
+        Ok(entries) => entries,
+        Err(e) => {
+            finalize_incomplete(db, &opened.round_id, incomplete_reason(&e))?;
+            return Err(RunError::Review(e));
+        }
+    };
+    // Presence-only / failed paths are a coverage shortfall — never Complete.
+    if !ProducerOutput::meets_required(&coverage_entries) {
+        finalize_incomplete(db, &opened.round_id, "coverage_shortfall")?;
+        let short = coverage_entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.state,
+                    porch_review::CoverageState::Selected | porch_review::CoverageState::Failed
+                )
+            })
+            .map_or_else(
+                || changed.first().cloned().unwrap_or_default(),
+                |e| e.path.clone(),
+            );
+        return Err(RunError::Review(porch_review::Error::Coverage(short)));
+    }
+    let coverage_proposal: Vec<RoundCoverageProposal> = coverage_entries
+        .iter()
+        .map(|e| RoundCoverageProposal {
+            producer_invocation_id: opened.producer_invocation_id.clone(),
+            path: e.path.clone(),
+            state: map_coverage_state(e.state),
+            reason: e.reason.clone(),
+            authority: e.authority.clone(),
+            completion_evidence: e.completion_evidence.clone(),
+        })
+        .collect();
+
+    let mapping = CriterionMapping::builtin();
+    let mut current = Vec::with_capacity(outcome.findings.len());
+    let mut provisional = Vec::with_capacity(outcome.findings.len());
+    for finding in &outcome.findings {
+        let key = derive(finding, &mapping);
+        let instance_id = Ulid::new().to_string();
+        let range = match (finding.start_line, finding.end_line) {
+            (Some(s), Some(e)) => Some(SourceRange::new(s, e)),
+            (Some(s), None) | (None, Some(s)) => Some(SourceRange::new(s, s)),
+            (None, None) => None,
+        };
+        current.push(CurrentFinding {
+            instance_id: instance_id.clone(),
+            key: key.clone(),
+            producer_invocation_id: opened.producer_invocation_id.clone(),
+            range,
+        });
+        provisional.push((instance_id, finding, key));
+    }
+
+    finalize_with_reconcile(
+        db,
+        run_id,
+        &opened.round_id,
+        &opened.producer_invocation_id,
+        &current,
+        &provisional,
+        &coverage_proposal,
+    )?;
+    Ok(())
+}
+
+fn inventory_bytes(changed: &[String]) -> Vec<u8> {
+    let mut lines = changed.to_vec();
+    lines.sort();
+    let mut out = lines.join("\n").into_bytes();
+    if !out.is_empty() {
+        out.push(b'\n');
+    }
+    out
+}
+
+fn producer_equivalence_digest(desc: &ProducerDescriptor) -> String {
+    let adapter_kind = match desc.adapter_kind {
+        AdapterKind::NativeAgent => "native_agent",
+        AdapterKind::PorchJsonCli => "porch_json_cli",
+    };
+    let observed_version = match &desc.observed_version_identity {
+        ObservedVersionIdentity::ArtifactSha256(hex) => {
+            ObservedVersionForEquivalence::ArtifactSha256(hex.clone())
+        }
+        ObservedVersionIdentity::Unavailable(reason) => {
+            ObservedVersionForEquivalence::Unavailable {
+                reason: reason.clone(),
+            }
+        }
+    };
+    descriptor_equivalence_digest(&EquivalenceInput {
+        adapter_kind,
+        argv_prefix: &desc.invocation.argv_prefix,
+        observed_version,
+        consumed_context: &desc.consumed_context,
+    })
+}
+
+fn map_coverage_state(state: porch_review::CoverageState) -> rounds::CoverageState {
+    match state {
+        porch_review::CoverageState::Selected => rounds::CoverageState::Selected,
+        porch_review::CoverageState::Completed => rounds::CoverageState::Completed,
+        porch_review::CoverageState::Failed => rounds::CoverageState::Failed,
+        porch_review::CoverageState::Waived => rounds::CoverageState::Waived,
+    }
+}
+
+fn action_str(action: Action) -> &'static str {
+    match action {
+        Action::AutoFix => "auto-fix",
+        Action::AskUser => "ask-user",
+        Action::NoOp => "no-op",
+    }
+}
+
+fn severity_str(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Info => "info",
+    }
+}
+
+fn finding_instance_proposal(
+    producer_invocation_id: &str,
+    finding: &Finding,
+    key: &porch_review::CandidateKey,
+    fingerprint: &str,
+) -> Result<FindingInstanceProposal> {
+    let provenance_json = match &finding.provenance {
+        Some(p) => serde_json::to_string(p)?,
+        None => "{}".into(),
+    };
+    let (confidence_value, confidence_kind) = match &finding.confidence {
+        Some(c) => (
+            Some(c.value.clone()),
+            Some(match c.kind {
+                porch_review::ConfidenceKind::Model => "model".into(),
+                porch_review::ConfidenceKind::Deterministic => "deterministic".into(),
+            }),
+        ),
+        None => (None, None),
+    };
+    Ok(FindingInstanceProposal {
+        producer_invocation_id: producer_invocation_id.into(),
+        fingerprint: fingerprint.into(),
+        fingerprint_version: i64::from(key.fingerprint_version),
+        candidate_key: key.digest.clone(),
+        criterion_id: key.criterion_id.clone(),
+        evidence: finding
+            .evidence
+            .clone()
+            .unwrap_or_else(|| finding.message.clone()),
+        consequence: finding
+            .consequence
+            .clone()
+            .unwrap_or_else(|| finding.message.clone()),
+        action: action_str(finding.action).into(),
+        severity: severity_str(finding.severity).into(),
+        provenance_json,
+        confidence_value,
+        confidence_kind,
+        path: finding.path.clone(),
+        anchor_kind: key.anchor_kind.clone(),
+        anchor_value: key.anchor_value.clone(),
+    })
+}
+
+fn stored_to_prior(stored: rounds::StoredPriorInstance) -> PriorInstance {
+    PriorInstance {
+        instance_id: stored.finding_instance_id,
+        fingerprint: stored.fingerprint,
+        fingerprint_version: u32::try_from(stored.fingerprint_version).unwrap_or(0),
+        key: porch_review::CandidateKey {
+            digest: stored.candidate_key.clone(),
+            fingerprint_version: u32::try_from(stored.fingerprint_version).unwrap_or(0),
+            path_key: stored.path,
+            criterion_id: String::new(),
+            anchor_kind: stored.anchor_kind,
+            anchor_value: stored.anchor_value,
+        },
+    }
+}
+
+fn finalize_with_reconcile(
+    db: &Db,
+    run_id: &str,
+    round_id: &RoundId,
+    producer_invocation_id: &str,
+    current: &[CurrentFinding],
+    provisional: &[(String, &Finding, porch_review::CandidateKey)],
+    coverage: &[RoundCoverageProposal],
+) -> Result<()> {
+    let mut attempts = 0_u32;
+    loop {
+        let (rev, stored) = rounds::read_history(db, run_id)?;
+        let history = History {
+            priors: stored.into_iter().map(stored_to_prior).collect(),
+            renames: Vec::new(),
+        };
+        let proposal = reconcile(current, &history);
+        let mut by_id = std::collections::BTreeMap::new();
+        for a in &proposal.assignments {
+            by_id.insert(a.instance_id.clone(), a.fingerprint.clone());
+        }
+        let mut instances = Vec::with_capacity(provisional.len());
+        for (id, finding, key) in provisional {
+            let fp = by_id
+                .get(id)
+                .cloned()
+                .ok_or_else(|| RunError::Msg(format!("reconcile omitted assignment for {id}")))?;
+            instances.push(finding_instance_proposal(
+                producer_invocation_id,
+                finding,
+                key,
+                &fp,
+            )?);
+        }
+        let fin = FinalizeProposal {
+            execution: ExecutionState::Finished,
+            assurance_completion: AssuranceCompletion::Complete,
+            completion_reason: None,
+            coverage: coverage.to_vec(),
+            instances,
+        };
+        match rounds::finalize_round(db, round_id, &fin, rev)? {
+            FinalizeOutcome::Finalized => return Ok(()),
+            FinalizeOutcome::Stale => {
+                attempts += 1;
+                if attempts >= STALE_REVISION_RETRIES {
+                    rounds::abandon_for_history_contention(db, round_id)?;
+                    return Err(RunError::Msg(
+                        "review round finalization abandoned after history contention".into(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn finalize_incomplete(db: &Db, round_id: &RoundId, reason: &str) -> Result<()> {
+    let run_id = rounds::get_round(db, round_id)?
+        .ok_or_else(|| RunError::Msg(format!("missing round {}", round_id.as_str())))?
+        .run_id;
+    let mut attempts = 0_u32;
+    loop {
+        let (rev, _) = rounds::read_history(db, &run_id)?;
+        let fin = FinalizeProposal {
+            execution: ExecutionState::Finished,
+            assurance_completion: AssuranceCompletion::Incomplete,
+            completion_reason: Some(reason.into()),
+            coverage: Vec::new(),
+            instances: Vec::new(),
+        };
+        match rounds::finalize_round(db, round_id, &fin, rev)? {
+            FinalizeOutcome::Finalized => return Ok(()),
+            FinalizeOutcome::Stale => {
+                attempts += 1;
+                if attempts >= STALE_REVISION_RETRIES {
+                    rounds::abandon_for_history_contention(db, round_id)?;
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 fn resolve_review_from(
@@ -462,7 +941,7 @@ fn deliver_with_repair(
                 )?;
 
                 // Session-free rereview (after_fix never passes fixer session).
-                match run_review_phase(db, home, run_id, wt, true)? {
+                match run_review_phase(db, home, run_id, bare, wt, true)? {
                     ReviewPhase::Approved => {
                         record_step(db, run_id, "review", "completed", Some("deliver_repair"))?;
                         let local_cancel = AtomicBool::new(false);
@@ -861,6 +1340,7 @@ pub struct AgentStatus {
     pub base_sha: Option<String>,
     pub review_approved_head_sha: Option<String>,
     pub findings: Vec<Finding>,
+    pub assurance_record: porch_gate::AssuranceRecord,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -948,7 +1428,7 @@ fn agent_status_inner(
 ) -> std::result::Result<AgentStatus, UsageOrFail> {
     let db = Db::open(&db_path(home)).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     let run = resolve_run(&db, run_id, work_tree)?;
-    Ok(status_from_run(&db, &run, home))
+    status_from_run(&db, &run, home).map_err(UsageOrFail::Fail)
 }
 
 fn agent_respond_inner(
@@ -985,7 +1465,7 @@ fn agent_respond_inner(
             .run_by_id(&run.id)
             .map_err(|e| UsageOrFail::Fail(e.to_string()))?
             .ok_or_else(|| UsageOrFail::Fail("run disappeared".into()))?;
-        return Ok(status_from_run(&db, &run, home));
+        return status_from_run(&db, &run, home).map_err(UsageOrFail::Fail);
     }
 
     match response {
@@ -1044,7 +1524,7 @@ fn agent_respond_inner(
         .run_by_id(&run.id)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?
         .ok_or_else(|| UsageOrFail::Fail("run disappeared".into()))?;
-    Ok(status_from_run(&db, &run, home))
+    status_from_run(&db, &run, home).map_err(UsageOrFail::Fail)
 }
 
 fn respond_compose(
@@ -1214,7 +1694,7 @@ fn respond_rebase_fix(
         return Ok(());
     }
 
-    match run_review_phase(db, home, &run.id, wt, false) {
+    match run_review_phase(db, home, &run.id, bare, wt, false) {
         Ok(ReviewPhase::Approved) => {
             complete_after_review(db, home, bare, wt, run, None)?;
         }
@@ -1246,11 +1726,7 @@ fn respond_fix(
         return Err(UsageOrFail::Fail("parked run worktree missing".into()));
     }
 
-    let all_findings: Vec<Finding> = run
-        .findings_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    let all_findings = findings_for_run(db, run).map_err(UsageOrFail::Fail)?;
     let selected = select_findings(&all_findings, finding_ids)?;
     if selected.is_empty() {
         return Err(UsageOrFail::Usage(
@@ -1347,7 +1823,7 @@ fn finish_rereview(
     yes: bool,
 ) -> std::result::Result<(), UsageOrFail> {
     // Session-free rereview (never pass fixer session).
-    match run_review_phase(db, home, &run.id, wt, true) {
+    match run_review_phase(db, home, &run.id, bare, wt, true) {
         Ok(ReviewPhase::Approved) => {
             complete_after_review(db, home, bare, wt, run, None)?;
         }
@@ -1517,12 +1993,18 @@ fn resolve_run(
         .ok_or_else(|| UsageOrFail::Usage("no parked run for this repo".into()))
 }
 
-pub(crate) fn status_from_run(db: &Db, run: &RunRow, home: &Path) -> AgentStatus {
-    let findings = run
-        .findings_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<Vec<Finding>>(s).ok())
-        .unwrap_or_default();
+pub(crate) fn status_from_run(
+    db: &Db,
+    run: &RunRow,
+    home: &Path,
+) -> std::result::Result<AgentStatus, String> {
+    // Fail closed: storage/resolve errors must not look like "not reviewed".
+    let (assurance_record, status_findings) =
+        resolve_run_assurance(db, run).map_err(|e| e.to_string())?;
+    let findings = status_findings
+        .into_iter()
+        .map(finding_from_status_dto)
+        .collect();
     let phase = match run.status.as_str() {
         "parked" => parked_phase(db, run),
         "completed" | "failed" | "cancelled" => "done".into(),
@@ -1538,7 +2020,7 @@ pub(crate) fn status_from_run(db: &Db, run: &RunRow, home: &Path) -> AgentStatus
     } else {
         (None, None)
     };
-    AgentStatus {
+    Ok(AgentStatus {
         run_id: run.id.clone(),
         repo_id: run.repo_id.clone(),
         branch: run.branch.clone(),
@@ -1548,10 +2030,43 @@ pub(crate) fn status_from_run(db: &Db, run: &RunRow, home: &Path) -> AgentStatus
         base_sha: run.base_sha.clone(),
         review_approved_head_sha: run.review_approved_head_sha.clone(),
         findings,
+        assurance_record,
         error: run.error.clone(),
         pr_url: run.pr_url.clone(),
         compose_packet_path,
         allowed_actions,
+    })
+}
+
+fn findings_for_run(db: &Db, run: &RunRow) -> std::result::Result<Vec<Finding>, String> {
+    let (_record, status_findings) = resolve_run_assurance(db, run).map_err(|e| e.to_string())?;
+    Ok(status_findings
+        .into_iter()
+        .map(finding_from_status_dto)
+        .collect())
+}
+
+fn finding_from_status_dto(dto: StatusFindingDto) -> Finding {
+    let severity = match dto.severity.as_str() {
+        "error" => Severity::Error,
+        "warning" => Severity::Warning,
+        _ => Severity::Info,
+    };
+    let action = match dto.action.as_str() {
+        "auto-fix" => Action::AutoFix,
+        "ask-user" => Action::AskUser,
+        _ => Action::NoOp,
+    };
+    Finding {
+        id: dto.id,
+        path: dto.path,
+        message: dto.message,
+        severity,
+        action,
+        category: dto.category,
+        start_line: dto.start_line,
+        end_line: dto.end_line,
+        ..Finding::default()
     }
 }
 
@@ -1799,6 +2314,7 @@ mod notes_tests {
             category: None,
             start_line: Some(1),
             end_line: Some(2),
+            ..Finding::default()
         }];
         let json = findings_json_with_notes(home, "run-n", &selected).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

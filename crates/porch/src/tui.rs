@@ -509,8 +509,9 @@ impl App {
                 ))
             })
             .collect();
+        let title = findings_panel_title(&self.snapshot.assurance_record);
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("findings"))
+            .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .highlight_symbol("> ");
         frame.render_stateful_widget(list, area, &mut self.list_state);
@@ -570,6 +571,13 @@ fn truncate_chars(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+fn findings_panel_title(record: &porch_gate::AssuranceRecord) -> &'static str {
+    match record.kind_str() {
+        "legacy_snapshot" => "findings (legacy snapshot)",
+        _ => "findings",
+    }
 }
 
 fn parse_findings(value: &serde_json::Value) -> Vec<FindingRow> {
@@ -782,6 +790,7 @@ mod tests {
                     "end_line":3
                 }
             ]),
+            assurance_record: porch_gate::AssuranceRecord::round("01ROUND"),
             steps: vec![
                 porch_gate::StepSnapshot {
                     step: "intent".into(),
@@ -1115,5 +1124,23 @@ mod tests {
         set_finding_note(tmp.path(), "r1", "f0", "hi").unwrap();
         let map = load_finding_notes(tmp.path(), "r1").unwrap();
         assert_eq!(map.get("f0").map(String::as_str), Some("hi"));
+    }
+
+    #[test]
+    fn legacy_snapshot_keeps_actions_and_marks_findings_panel() {
+        let home = TempDir::new().unwrap();
+        let mut snap = parked_snapshot();
+        snap.assurance_record = porch_gate::AssuranceRecord::legacy_snapshot();
+        let app = App::from_snapshot(snap, home.path(), home.path());
+        assert!(app.actions_enabled());
+        assert_eq!(app.findings.len(), 2);
+        assert_eq!(
+            findings_panel_title(&app.snapshot.assurance_record),
+            "findings (legacy snapshot)"
+        );
+        assert_eq!(
+            findings_panel_title(&porch_gate::AssuranceRecord::round("r1")),
+            "findings"
+        );
     }
 }

@@ -1,0 +1,39 @@
+{
+  "case": "path-change",
+  "fingerprint_version": 1,
+  "prior_rounds": [
+    {
+      "ordinal": 1,
+      "findings": [
+        {
+          "ref": "p1",
+          "path": "old/path.rs",
+          "criterion_id": "rust/dbg-macro",
+          "anchor": { "kind": "symbol", "value": "fn run" },
+          "lines": [8, 9],
+          "producer": "quality"
+        }
+      ]
+    }
+  ],
+  "current_round": {
+    "producers": ["quality"],
+    "findings": [
+      {
+        "ref": "c1",
+        "path": "new/path.rs",
+        "criterion_id": "rust/dbg-macro",
+        "anchor": { "kind": "symbol", "value": "fn run" },
+        "lines": [8, 9],
+        "producer": "quality"
+      }
+    ]
+  },
+  "rename_evidence": [{ "from": "old/path.rs", "to": "new/path.rs" }],
+  "expect": {
+    "reuse": [{ "current": "c1", "prior": "p1" }],
+    "equivalence_groups": [],
+    "minted": [],
+    "disappeared": []
+  }
+}

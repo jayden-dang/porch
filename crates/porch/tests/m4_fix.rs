@@ -138,6 +138,13 @@ for f in $FILES; do
   FILES_JSON="$FILES_JSON\"$f\""
 done
 FILES_JSON="$FILES_JSON]"
+COV_JSON="["
+FIRST=1
+for f in $FILES; do
+  if [ $FIRST -eq 1 ]; then FIRST=0; else COV_JSON="$COV_JSON,"; fi
+  COV_JSON="$COV_JSON{\"path\":\"$f\",\"status\":\"pass\"}"
+done
+COV_JSON="$COV_JSON]"
 # Clean if any changed file contains the substring "fixed".
 HAS_FIXED=0
 for f in $FILES; do
@@ -147,24 +154,24 @@ for f in $FILES; do
   fi
 done
 if [ "$HAS_FIXED" -eq 1 ]; then
-  printf '{"comments":[],"files":%s}\n' "$FILES_JSON" > "$OUT"
+  printf '{"comments":[],"files":%s,"coverage":%s}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
   exit 0
 fi
 case "$MODE" in
   clean)
-    printf '{"comments":[],"files":%s}\n' "$FILES_JSON" > "$OUT"
+    printf '{"comments":[],"files":%s,"coverage":%s}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
     ;;
   blocking)
     TARGET=$(printf '%s\n' $FILES | head -n1)
     if [ -z "$TARGET" ]; then TARGET="README"; fi
-    printf '{"comments":[{"path":"%s","content":"null deref on empty input","category":"bug","severity":"high","start_line":1,"end_line":2}],"files":%s}\n' \
-      "$TARGET" "$FILES_JSON" > "$OUT"
+    printf '{"comments":[{"path":"%s","content":"null deref on empty input","category":"bug","severity":"high","start_line":1,"end_line":2}],"files":%s,"coverage":%s}\n' \
+      "$TARGET" "$FILES_JSON" "$COV_JSON" > "$OUT"
     ;;
   two-blocking)
     TARGET=$(printf '%s\n' $FILES | head -n1)
     if [ -z "$TARGET" ]; then TARGET="README"; fi
-    printf '{"comments":[{"path":"%s","content":"bug one","category":"bug","severity":"high","start_line":1,"end_line":1},{"path":"%s","content":"bug two","category":"bug","severity":"high","start_line":2,"end_line":2}],"files":%s}\n' \
-      "$TARGET" "$TARGET" "$FILES_JSON" > "$OUT"
+    printf '{"comments":[{"path":"%s","content":"bug one","category":"bug","severity":"high","start_line":1,"end_line":1},{"path":"%s","content":"bug two","category":"bug","severity":"high","start_line":2,"end_line":2}],"files":%s,"coverage":%s}\n' \
+      "$TARGET" "$TARGET" "$FILES_JSON" "$COV_JSON" > "$OUT"
     ;;
   missing-file)
     printf '{"comments":[],"files":[]}\n' > "$OUT"
@@ -769,7 +776,8 @@ fn findings_flag_selects_subset() {
     let db = Db::open(&s.home.join("state.sqlite")).unwrap();
     let repo_id = repo_id_for(&s.work);
     let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(45));
-    let findings: Vec<Value> = serde_json::from_str(run.findings_json.as_deref().unwrap()).unwrap();
+    let snap = porch_gate::get_run(&s.home, &run.id).unwrap();
+    let findings = snap.findings.as_array().expect("findings array");
     assert!(findings.len() >= 2, "findings={findings:?}");
 
     let out = agent_fix(&s, &run.id, &["--findings", "f0"], "noop");

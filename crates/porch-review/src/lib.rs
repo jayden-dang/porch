@@ -4,9 +4,13 @@
 //! (wrapper write/verify). Gate must not depend on this crate.
 
 mod agent_review;
+mod coverage_state;
 mod engine;
 mod home_config;
+mod identity;
 mod pathutil;
+mod plan;
+mod reconcile;
 mod setup;
 
 use std::collections::BTreeSet;
@@ -21,7 +25,10 @@ use serde::{Deserialize, Serialize};
 pub use agent_review::{
     REVIEW_AGENT_BIN_ENV, REVIEW_ARTIFACT_REL, REVIEWER_PROMPT, RunAgentReviewOpts,
     agent_review_bin, assert_prompt_under_home, build_reviewer_prompt, parse_agent_review_json,
-    review_uses_agent, run_agent_review, write_reviewer_prompt,
+    producer_artifact_dir, review_uses_agent, run_agent_review, write_reviewer_prompt,
+};
+pub use coverage_state::{
+    CoverageEntry, CoverageState, PathSignal, ProducerOutput, StatusRow, derive_states,
 };
 pub use engine::{
     AGENT_DETECT_BINS, DetectedEngine, EngineKind, agent_detect_bins, known_engines, wrapper_script,
@@ -30,7 +37,21 @@ pub use home_config::{
     CONFIG_FILE, FixerConfig, GithubConfig, HomeConfig, ReviewConfig, ToolsConfig, config_path,
     load_home_config, write_home_config,
 };
+pub use identity::{
+    Anchor, AnchorContext, AnchorKind, CandidateKey, Confidence, ConfidenceKind, CriterionMapping,
+    FINGERPRINT_VERSION, Provenance, apply_contract, derive, enrich_from_comment, path_key,
+};
 pub use pathutil::{is_executable, resolve_bin, which};
+pub use plan::{
+    AdapterKind, ArtifactStamp, BackendObservation, DeclaredEngineKind, InvocationPlan,
+    InvocationRecord, ObservedVersionIdentity, PrepareOpts, PreparedContextElement,
+    PreparedInvocation, ProducerDescriptor, ReportedVersion, SelectionSource, WrapperObservation,
+    check_artifacts_stable, composite_artifact_identity, prepare,
+};
+pub use reconcile::{
+    Assignment, CurrentFinding, History, PriorInstance, Proposal, RenameEvidence, SourceRange,
+    mint_fingerprint, reconcile,
+};
 pub use setup::{
     SetupResult, WRAPPER_REL, default_engine, detect_engines, detect_optional_tools,
     review_setup_ok, setup_apply, setup_verify, setup_yes, verify_setup, wrapper_path,
@@ -74,12 +95,49 @@ pub struct Finding {
     pub message: String,
     pub severity: Severity,
     pub action: Action,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_line: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_line: Option<u32>,
+    /// Porch-normalized criterion (optional on legacy rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criterion_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consequence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<identity::Provenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<identity::Confidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_value: Option<String>,
+}
+
+impl Default for Finding {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            path: String::new(),
+            message: String::new(),
+            severity: Severity::Info,
+            action: Action::NoOp,
+            category: None,
+            start_line: None,
+            end_line: None,
+            criterion_id: None,
+            evidence: None,
+            consequence: None,
+            provenance: None,
+            confidence: None,
+            anchor_kind: None,
+            anchor_value: None,
+        }
+    }
 }
 
 impl Finding {
@@ -109,6 +167,12 @@ pub struct ReviewComment {
     pub category: Option<String>,
     #[serde(default)]
     pub severity: Option<String>,
+    /// Producer-local rule / finding key (provenance only).
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    /// Optional producer-supplied confidence.
+    #[serde(default)]
+    pub confidence: Option<identity::Confidence>,
 }
 
 /// OCR / generic file-group entry (optional coverage source).
@@ -119,10 +183,16 @@ pub struct ReviewGroup {
 }
 
 /// One OCR manifest coverage item.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct CoverageItem {
     #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub authority: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<String>,
 }
 
 /// OCR coverage sets (optional).
@@ -150,7 +220,8 @@ pub struct ReviewManifest {
 /// Top-level review CLI JSON (`comments` + coverage `files`).
 ///
 /// OCR often omits top-level `files`; porch then derives coverage from
-/// `groups` / `manifest.coverage` / comment paths.
+/// `groups` / `manifest.coverage` / comment paths. First-party quality emits
+/// flat `coverage[]` status rows (`pass` / `skip`) alongside `files`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReviewJson {
     #[serde(default)]
@@ -158,6 +229,9 @@ pub struct ReviewJson {
     /// Paths the engine claims to have covered (or explicitly skipped).
     #[serde(default)]
     pub files: Vec<String>,
+    /// Flat status rows (`pass` / `skip` / …). Explicit completion signals.
+    #[serde(default)]
+    pub coverage: Vec<coverage_state::StatusRow>,
     #[serde(default)]
     pub groups: Vec<ReviewGroup>,
     #[serde(default)]
@@ -169,6 +243,8 @@ pub struct ReviewJson {
 pub struct ReviewOutcome {
     pub findings: Vec<Finding>,
     pub covered_files: Vec<String>,
+    /// Structured producer coverage claims for state derivation.
+    pub coverage: ProducerOutput,
 }
 
 impl ReviewOutcome {
@@ -199,6 +275,8 @@ pub enum Error {
     Coverage(String),
     #[error("prompt file missing or not under PORCH_HOME: {0}")]
     PromptRefuse(String),
+    #[error("producer artifact changed after plan resolution")]
+    ProducerArtifactChanged,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -258,7 +336,6 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
 
     if matches!(category.as_str(), "style" | "documentation") {
         return Some(Finding {
-            id: String::new(),
             path: comment.path.clone(),
             message: comment.content.clone(),
             severity: Severity::Info,
@@ -266,6 +343,7 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
             category: Some(category),
             start_line: comment.start_line,
             end_line: comment.end_line,
+            ..Finding::default()
         });
     }
 
@@ -293,7 +371,6 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
     };
 
     Some(Finding {
-        id: String::new(),
         path: comment.path.clone(),
         message: comment.content.clone(),
         severity,
@@ -301,6 +378,7 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
         category: Some(category),
         start_line: comment.start_line,
         end_line: comment.end_line,
+        ..Finding::default()
     })
 }
 
@@ -315,14 +393,25 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
 /// Returns [`Error::Json`] when the payload is not valid review JSON.
 pub fn parse_review_json(bytes: &[u8]) -> Result<ReviewOutcome, Error> {
     let parsed: ReviewJson = serde_json::from_slice(bytes)?;
-    let mut findings: Vec<Finding> = parsed.comments.iter().filter_map(map_comment).collect();
+    let mapping = CriterionMapping::builtin();
+    let mut findings: Vec<Finding> = parsed
+        .comments
+        .iter()
+        .filter_map(|c| {
+            // Quality (and other rule-keyed) producers are deterministic: never keep model confidence.
+            let deterministic = c.rule_id.as_deref().is_some_and(|s| !s.trim().is_empty());
+            enrich_from_comment(c, &mapping, &AnchorContext::default(), deterministic)
+        })
+        .collect();
     for (i, f) in findings.iter_mut().enumerate() {
         f.id = format!("f{i}");
     }
     let covered_files = derive_covered_files(&parsed);
+    let coverage = ProducerOutput::from_review_json(&parsed);
     Ok(ReviewOutcome {
         findings,
         covered_files,
+        coverage,
     })
 }
 
@@ -377,6 +466,19 @@ pub fn assert_coverage(changed: &[String], covered: &[String]) -> Result<(), Err
     Ok(())
 }
 
+/// Derive structured coverage states for `changed`, then fail closed on shortfall.
+///
+/// # Errors
+///
+/// Returns [`Error::Coverage`] when a changed path lacks a producer claim, or
+/// [`Error::Msg`] when a failed/waived/completed signal omits required fields.
+pub fn assert_coverage_states(
+    changed: &[String],
+    output: &ProducerOutput,
+) -> Result<Vec<CoverageEntry>, Error> {
+    derive_states(changed, output)
+}
+
 /// Options for one range-review invocation.
 #[derive(Debug, Clone)]
 pub struct RunReviewOpts<'a> {
@@ -392,6 +494,10 @@ pub struct RunReviewOpts<'a> {
     pub run_id: Option<&'a str>,
     /// Authoritative intent text, if any (agent prompt).
     pub intent: Option<&'a str>,
+    /// When set, spawn uses this plan's absolute target without re-resolving.
+    pub plan: Option<&'a plan::InvocationPlan>,
+    /// When set, prompt/result artifacts land under this invocation namespace.
+    pub artifact_dir: Option<&'a Path>,
 }
 
 /// Spawn review: agent path when configured (`PORCH_REVIEW_BIN` unset); else CLI.
@@ -400,13 +506,23 @@ pub struct RunReviewOpts<'a> {
 ///
 /// Returns spawn, timeout, exit, JSON, coverage, prompt-refuse, or I/O errors.
 pub fn run_review(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
-    if review_uses_agent(opts.porch_home) {
+    let use_agent = match opts.plan.map(|p| p.descriptor.adapter_kind) {
+        Some(plan::AdapterKind::NativeAgent) => true,
+        Some(plan::AdapterKind::PorchJsonCli) => false,
+        None => review_uses_agent(opts.porch_home),
+    };
+    let outcome = if use_agent {
         let home = opts.porch_home.ok_or_else(|| {
             Error::Msg("agent review requires porch_home for prompt artifacts".into())
         })?;
-        return run_review_via_agent(opts, home);
+        run_review_via_agent(opts, home)?
+    } else {
+        run_review_cli(opts)?
+    };
+    if let Some(plan) = opts.plan {
+        plan::check_artifacts_stable(plan)?;
     }
-    run_review_cli(opts)
+    Ok(outcome)
 }
 
 fn run_review_via_agent(
@@ -416,10 +532,14 @@ fn run_review_via_agent(
     let run_id = opts.run_id.ok_or_else(|| {
         Error::Msg("agent review requires run_id for prompt artifacts under PORCH_HOME".into())
     })?;
-    let review_dir = porch_home
+    let legacy_dir = porch_home
         .join("runs")
         .join(run_id)
         .join(REVIEW_ARTIFACT_REL);
+    let review_dir: &Path = match opts.artifact_dir {
+        Some(d) => d,
+        None => legacy_dir.as_path(),
+    };
     let path_instructions = {
         let p = porch_home
             .join("runs")
@@ -432,12 +552,21 @@ fn run_review_via_agent(
         }
     };
     let prompt_file = write_reviewer_prompt(
-        &review_dir,
+        review_dir,
         opts.intent,
         path_instructions.as_deref(),
         opts.changed_files,
     )?;
-    let bin = agent_review_bin(porch_home)?;
+    let planned = opts
+        .plan
+        .map(|p| p.spawned_target_absolute.display().to_string());
+    let resolved;
+    let bin = if let Some(ref absolute) = planned {
+        absolute.as_str()
+    } else {
+        resolved = agent_review_bin(porch_home)?;
+        resolved.as_str()
+    };
     run_agent_review(&RunAgentReviewOpts {
         work_tree: opts.work_tree,
         prompt_file: &prompt_file,
@@ -445,15 +574,21 @@ fn run_review_via_agent(
         from_sha: opts.from_sha,
         to_sha: opts.to_sha,
         changed_files: opts.changed_files,
-        bin: &bin,
+        bin,
         timeout: opts.timeout,
+        plan: opts.plan,
+        artifact_dir: opts.artifact_dir,
     })
 }
 
 /// Spawn the review CLI in `work_tree`, parse JSON, enforce coverage.
 fn run_review_cli(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
-    let out_dir = opts.work_tree.join(".porch-review");
-    fs::create_dir_all(&out_dir)?;
+    let legacy_dir = opts.work_tree.join(".porch-review");
+    let out_dir: &Path = match opts.artifact_dir {
+        Some(d) => d,
+        None => legacy_dir.as_path(),
+    };
+    fs::create_dir_all(out_dir)?;
     let out_file = out_dir.join("result.json");
     if out_file.exists() {
         let _ = fs::remove_file(&out_file);
@@ -463,7 +598,13 @@ fn run_review_cli(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
         .ok_or_else(|| Error::Msg(format!("non-utf8 output path {}", out_file.display())))?
         .to_string();
 
-    let mut cmd = Command::new(opts.bin);
+    let bin = opts.plan.map_or_else(
+        || Path::new(opts.bin),
+        |p| p.spawned_target_absolute.as_path(),
+    );
+    let bin_label = bin.display().to_string();
+
+    let mut cmd = Command::new(bin);
     cmd.current_dir(opts.work_tree);
     cmd.args([
         "--from",
@@ -487,7 +628,7 @@ fn run_review_cli(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::BinNotFound {
-                bin: opts.bin.to_string(),
+                bin: bin_label,
                 source: e,
             }
         } else {
@@ -575,6 +716,8 @@ mod tests {
             end_line: Some(2),
             category: Some("bug".into()),
             severity: Some("high".into()),
+            rule_id: None,
+            confidence: None,
         };
         let f = map_comment(&c).unwrap();
         assert!(f.is_blocking());
@@ -592,6 +735,8 @@ mod tests {
             end_line: None,
             category: Some("style".into()),
             severity: Some("medium".into()),
+            rule_id: None,
+            confidence: None,
         };
         let f = map_comment(&c).unwrap();
         assert!(!f.is_blocking());
@@ -609,6 +754,8 @@ mod tests {
             end_line: None,
             category: Some("maintainability".into()),
             severity: Some("low".into()),
+            rule_id: None,
+            confidence: None,
         };
         let f = map_comment(&c).unwrap();
         assert!(f.is_blocking());

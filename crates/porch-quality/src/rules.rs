@@ -22,6 +22,7 @@ pub struct RawComment {
     pub end_line: u32,
     pub category: String,
     pub severity: String,
+    /// Stable `pack/rule` identity; copied onto JSON `rule_id` for porch criterion mapping.
     pub rule_id: String,
 }
 
