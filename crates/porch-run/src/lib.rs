@@ -24,8 +24,9 @@ use porch_gate::rounds::{
     capture_context_element, sha256_hex,
 };
 use porch_gate::{
-    Db, RunExecutor, RunRow, db_path, event_hub, load_finding_notes, repo_id_for, rpc_start_run,
-    run_artifact_dir, run_deliver_repair_dir, run_fixer_dir, run_worktree_dir,
+    Db, RunExecutor, RunRow, StatusFindingDto, db_path, event_hub, load_finding_notes, repo_id_for,
+    resolve_run_assurance, rpc_start_run, run_artifact_dir, run_deliver_repair_dir, run_fixer_dir,
+    run_worktree_dir,
 };
 use porch_git::GitDir;
 use porch_review::{
@@ -302,10 +303,6 @@ fn run_review_phase(
         },
     )?;
     finalize_complete_round(db, run_id, &opened, &changed, &outcome)?;
-
-    // Keep findings_json until the audit read path (Task 12) serves rounds.
-    let findings_json = serde_json::to_string(&outcome.findings)?;
-    db.set_findings_json(run_id, Some(&findings_json))?;
     publish_run(run_id, "findings updated");
 
     if outcome.has_blocking() {
@@ -1334,6 +1331,7 @@ pub struct AgentStatus {
     pub base_sha: Option<String>,
     pub review_approved_head_sha: Option<String>,
     pub findings: Vec<Finding>,
+    pub assurance_record: porch_gate::AssuranceRecord,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1719,11 +1717,7 @@ fn respond_fix(
         return Err(UsageOrFail::Fail("parked run worktree missing".into()));
     }
 
-    let all_findings: Vec<Finding> = run
-        .findings_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    let all_findings = findings_for_run(db, run).map_err(UsageOrFail::Fail)?;
     let selected = select_findings(&all_findings, finding_ids)?;
     if selected.is_empty() {
         return Err(UsageOrFail::Usage(
@@ -1991,11 +1985,16 @@ fn resolve_run(
 }
 
 pub(crate) fn status_from_run(db: &Db, run: &RunRow, home: &Path) -> AgentStatus {
-    let findings = run
-        .findings_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<Vec<Finding>>(s).ok())
-        .unwrap_or_default();
+    let (assurance_record, status_findings) = resolve_run_assurance(db, run).unwrap_or_else(|_| {
+        (
+            porch_gate::AssuranceRecord::none(),
+            Vec::<StatusFindingDto>::new(),
+        )
+    });
+    let findings = status_findings
+        .into_iter()
+        .map(finding_from_status_dto)
+        .collect();
     let phase = match run.status.as_str() {
         "parked" => parked_phase(db, run),
         "completed" | "failed" | "cancelled" => "done".into(),
@@ -2021,10 +2020,43 @@ pub(crate) fn status_from_run(db: &Db, run: &RunRow, home: &Path) -> AgentStatus
         base_sha: run.base_sha.clone(),
         review_approved_head_sha: run.review_approved_head_sha.clone(),
         findings,
+        assurance_record,
         error: run.error.clone(),
         pr_url: run.pr_url.clone(),
         compose_packet_path,
         allowed_actions,
+    }
+}
+
+fn findings_for_run(db: &Db, run: &RunRow) -> std::result::Result<Vec<Finding>, String> {
+    let (_record, status_findings) = resolve_run_assurance(db, run).map_err(|e| e.to_string())?;
+    Ok(status_findings
+        .into_iter()
+        .map(finding_from_status_dto)
+        .collect())
+}
+
+fn finding_from_status_dto(dto: StatusFindingDto) -> Finding {
+    let severity = match dto.severity.as_str() {
+        "error" => Severity::Error,
+        "warning" => Severity::Warning,
+        _ => Severity::Info,
+    };
+    let action = match dto.action.as_str() {
+        "auto-fix" => Action::AutoFix,
+        "ask-user" => Action::AskUser,
+        _ => Action::NoOp,
+    };
+    Finding {
+        id: dto.id,
+        path: dto.path,
+        message: dto.message,
+        severity,
+        action,
+        category: dto.category,
+        start_line: dto.start_line,
+        end_line: dto.end_line,
+        ..Finding::default()
     }
 }
 

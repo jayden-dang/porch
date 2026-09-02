@@ -38,8 +38,10 @@ pub use proc::{
 };
 pub use rpc::start_run as rpc_start_run;
 pub use rpc::{
-    FINDING_HUNK_MAX_BYTES, RunSnapshot, StepSnapshot, compact_run_row, get_finding_hunk, get_run,
-    health_check, list_runs, subscribe_events,
+    AssuranceRecord, AuditIdentity, FINDING_HUNK_MAX_BYTES, LegacyFindingDto, RunSnapshot,
+    StatusFindingDto, StepSnapshot, UnavailableAudit, clear_rounds_for_run, compact_run_row,
+    get_finding_hunk, get_run, health_check, list_runs, resolve_run_assurance, round_for_decision,
+    subscribe_events,
 };
 pub use service::{
     ServicePaths, ServiceStatus, daemon_service_suffix, install_service, render_launchd_plist,

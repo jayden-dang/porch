@@ -11,9 +11,256 @@ use crate::Result;
 use crate::db::{Db, RunRow, StepResultRow};
 use crate::events::{Event, EventHub};
 use crate::home::socket_path;
+use crate::rounds::{self, AssuranceCompletion, ExecutionState, FindingInstanceRecord, RoundId};
 
 /// Soft cap for on-demand finding hunk / diff payloads (bytes).
 pub const FINDING_HUNK_MAX_BYTES: usize = 16_384;
+
+/// How audit identity is represented on an assurance record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum AuditIdentity {
+    /// Round-backed evidence with available audit identity.
+    Available(String),
+    /// Legacy or unreviewed evidence with an unavailable reason.
+    Unavailable { unavailable: UnavailableAudit },
+}
+
+/// Nested reason object for unavailable audit identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnavailableAudit {
+    pub reason: String,
+}
+
+/// Additive assurance labeling on run snapshots and agent status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AssuranceRecord {
+    Round {
+        review_round_id: String,
+        audit_identity: AuditIdentity,
+    },
+    LegacySnapshot {
+        review_round_id: Option<String>,
+        audit_identity: AuditIdentity,
+    },
+    None {
+        review_round_id: Option<String>,
+        audit_identity: AuditIdentity,
+    },
+}
+
+impl AssuranceRecord {
+    #[must_use]
+    pub fn round(review_round_id: impl Into<String>) -> Self {
+        Self::Round {
+            review_round_id: review_round_id.into(),
+            audit_identity: AuditIdentity::Available("available".into()),
+        }
+    }
+
+    #[must_use]
+    pub fn legacy_snapshot() -> Self {
+        Self::LegacySnapshot {
+            review_round_id: None,
+            audit_identity: AuditIdentity::Unavailable {
+                unavailable: UnavailableAudit {
+                    reason: "predates_round_identity".into(),
+                },
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn none() -> Self {
+        Self::None {
+            review_round_id: None,
+            audit_identity: AuditIdentity::Unavailable {
+                unavailable: UnavailableAudit {
+                    reason: "not_reviewed".into(),
+                },
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Round { .. } => "round",
+            Self::LegacySnapshot { .. } => "legacy_snapshot",
+            Self::None { .. } => "none",
+        }
+    }
+
+    #[must_use]
+    pub fn review_round_id(&self) -> Option<&str> {
+        match self {
+            Self::Round {
+                review_round_id, ..
+            } => Some(review_round_id.as_str()),
+            Self::LegacySnapshot {
+                review_round_id, ..
+            }
+            | Self::None {
+                review_round_id, ..
+            } => review_round_id.as_deref(),
+        }
+    }
+
+    #[must_use]
+    pub fn audit_identity_available(&self) -> bool {
+        matches!(self, Self::Round { .. })
+    }
+}
+
+impl Default for AssuranceRecord {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+/// Legacy `runs.findings_json` row — no enriched contract fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyFindingDto {
+    #[serde(default)]
+    pub id: String,
+    pub path: String,
+    #[serde(default)]
+    pub message: String,
+    pub severity: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+}
+
+/// Projection of a persisted finding into the existing status/TUI findings shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusFindingDto {
+    pub id: String,
+    pub path: String,
+    pub message: String,
+    pub severity: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+}
+
+impl From<LegacyFindingDto> for StatusFindingDto {
+    fn from(legacy: LegacyFindingDto) -> Self {
+        Self {
+            id: legacy.id,
+            path: legacy.path,
+            message: legacy.message,
+            severity: legacy.severity,
+            action: legacy.action,
+            category: legacy.category,
+            start_line: legacy.start_line,
+            end_line: legacy.end_line,
+        }
+    }
+}
+
+fn status_from_instance(index: usize, inst: &FindingInstanceRecord) -> StatusFindingDto {
+    StatusFindingDto {
+        id: format!("f{index}"),
+        path: inst.path.clone(),
+        message: inst.evidence.clone(),
+        severity: inst.severity.clone(),
+        action: inst.action.clone(),
+        category: None,
+        start_line: None,
+        end_line: None,
+    }
+}
+
+/// Finalized, applicable round backing the current parked decision, if any.
+///
+/// Prefers the newest finished/complete round whose `to_sha` matches the run tip.
+///
+/// # Errors
+///
+/// Returns a storage error when round rows cannot be read.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn round_for_decision(db: &Db, run: &RunRow) -> Result<Option<RoundId>> {
+    let rounds = rounds::rounds_for_run(db, &run.id)?;
+    for round in rounds.into_iter().rev() {
+        if round.finalized_at.is_none() {
+            continue;
+        }
+        if round.execution != ExecutionState::Finished {
+            continue;
+        }
+        if round.assurance_completion != AssuranceCompletion::Complete {
+            continue;
+        }
+        if let Some(head) = run.head_sha.as_deref() {
+            if round.to_sha != head {
+                continue;
+            }
+        }
+        return Ok(Some(round.id));
+    }
+    Ok(None)
+}
+
+/// Resolve assurance labeling and status findings for a run.
+///
+/// # Errors
+///
+/// Returns a storage or JSON error when rows cannot be read or legacy JSON is invalid.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn resolve_run_assurance(
+    db: &Db,
+    run: &RunRow,
+) -> Result<(AssuranceRecord, Vec<StatusFindingDto>)> {
+    if let Some(round_id) = round_for_decision(db, run)? {
+        let instances = rounds::instances_for_round(db, &round_id)?;
+        let findings = instances
+            .iter()
+            .enumerate()
+            .map(|(i, inst)| status_from_instance(i, inst))
+            .collect();
+        return Ok((AssuranceRecord::round(round_id.as_str()), findings));
+    }
+
+    match run.findings_json.as_deref() {
+        Some(raw) => {
+            let legacy: Vec<LegacyFindingDto> = serde_json::from_str(raw).unwrap_or_default();
+            let findings = legacy.into_iter().map(StatusFindingDto::from).collect();
+            Ok((AssuranceRecord::legacy_snapshot(), findings))
+        }
+        None => Ok((AssuranceRecord::none(), Vec::new())),
+    }
+}
+
+/// Remove all round rows for a run (cascade). Used by tests simulating pre-migration state.
+///
+/// # Errors
+///
+/// Returns a storage error when the delete fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn clear_rounds_for_run(db: &Db, run_id: &str) -> Result<()> {
+    let conn = db.conn();
+    conn.execute("DELETE FROM review_rounds WHERE run_id = ?1", [run_id])?;
+    Ok(())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -46,6 +293,8 @@ pub struct RunSnapshot {
     pub pr_url: Option<String>,
     pub worktree_dir: Option<String>,
     pub findings: serde_json::Value,
+    #[serde(default)]
+    pub assurance_record: AssuranceRecord,
     pub steps: Vec<StepSnapshot>,
     pub state_rev: u64,
 }
@@ -74,14 +323,24 @@ pub fn compact_run_row(run: &RunRow) -> serde_json::Value {
 }
 
 /// Build a [`RunSnapshot`] from DB rows + hub revision.
-#[must_use]
-pub fn build_run_snapshot(run: &RunRow, steps: &[StepResultRow], state_rev: u64) -> RunSnapshot {
-    let findings = run
-        .findings_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .unwrap_or_else(|| serde_json::json!([]));
-    RunSnapshot {
+///
+/// # Errors
+///
+/// Returns a storage or JSON error when assurance findings cannot be resolved.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn build_run_snapshot(
+    db: &Db,
+    run: &RunRow,
+    steps: &[StepResultRow],
+    state_rev: u64,
+) -> Result<RunSnapshot> {
+    let (assurance_record, status_findings) = resolve_run_assurance(db, run)?;
+    let findings =
+        serde_json::to_value(&status_findings).map_err(|e| crate::Error::Other(e.to_string()))?;
+    Ok(RunSnapshot {
         run_id: run.id.clone(),
         repo_id: run.repo_id.clone(),
         branch: run.branch.clone(),
@@ -97,6 +356,7 @@ pub fn build_run_snapshot(run: &RunRow, steps: &[StepResultRow], state_rev: u64)
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
         findings,
+        assurance_record,
         steps: steps
             .iter()
             .map(|s| StepSnapshot {
@@ -106,7 +366,7 @@ pub fn build_run_snapshot(run: &RunRow, steps: &[StepResultRow], state_rev: u64)
             })
             .collect(),
         state_rev,
-    }
+    })
 }
 
 fn rpc_call(home: &Path, method: &str, params: Option<serde_json::Value>) -> Result<Response> {
@@ -294,7 +554,7 @@ pub(crate) fn get_run_result(db: &Db, hub: &EventHub, run_id: &str) -> Result<se
         return Ok(serde_json::json!({"error": format!("unknown run {run_id}")}));
     };
     let steps = db.step_results_for_run(run_id)?;
-    let snap = build_run_snapshot(&run, &steps, hub.state_rev());
+    let snap = build_run_snapshot(db, &run, &steps, hub.state_rev())?;
     serde_json::to_value(snap).map_err(|e| crate::Error::Other(e.to_string()))
 }
 
@@ -324,38 +584,18 @@ pub(crate) fn get_finding_hunk_result(
     let Some(run) = db.run_by_id(run_id)? else {
         return Ok(serde_json::json!({"error": format!("unknown run {run_id}")}));
     };
-    let findings = run
-        .findings_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .unwrap_or_else(|| serde_json::json!([]));
-    let Some(arr) = findings.as_array() else {
-        return Ok(serde_json::json!({"error": "findings are not an array"}));
-    };
-    let Some(finding) = arr
-        .iter()
-        .find(|v| v.get("id").and_then(|x| x.as_str()) == Some(finding_id))
-    else {
+    let (_record, findings) = resolve_run_assurance(db, &run)?;
+    let Some(finding) = findings.iter().find(|f| f.id == finding_id) else {
         return Ok(serde_json::json!({
             "error": format!("unknown finding {finding_id}")
         }));
     };
-    let path = finding
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let path = finding.path.clone();
     if path.is_empty() {
         return Ok(serde_json::json!({"error": "finding has empty path"}));
     }
-    let start_line = finding
-        .get("start_line")
-        .and_then(serde_json::Value::as_u64)
-        .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-    let end_line = finding
-        .get("end_line")
-        .and_then(serde_json::Value::as_u64)
-        .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+    let start_line = finding.start_line;
+    let end_line = finding.end_line;
 
     let Some(wt) = run.worktree_dir.as_ref() else {
         return Ok(serde_json::json!({"error": "run has no worktree_dir"}));

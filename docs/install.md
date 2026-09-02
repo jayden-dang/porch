@@ -48,3 +48,9 @@ git push porch HEAD:refs/heads/$(git branch --show-current)
 ```
 
 Do not set `PORCH_REVIEW_BIN=ocr`.
+
+## Upgrading
+
+Before upgrading a machine that already has `$PORCH_HOME` state, see
+[usage.md — Upgrading porch](usage.md#r-upgrading-porch-review-round-identity): finish parked runs
+when you can, back up `$PORCH_HOME`, and do not expect downgrade after new-format rounds exist.

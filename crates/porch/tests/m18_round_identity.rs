@@ -1085,3 +1085,278 @@ fn startup_recovers_stale_runs_and_refuses_when_recovery_fails() {
         kill_daemon(&s.home);
     }
 }
+
+#[test]
+fn parked_round_serves_findings_from_applicable_round() {
+    let s = setup("blocking");
+    commit_change(&s.work, "bug.txt", "boom\n");
+    push_branch(&s, "feat-round-read", "blocking");
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    let rounds = rounds::rounds_for_run(&db, &run.id).unwrap();
+    assert_eq!(rounds.len(), 1);
+    let round_id = rounds[0].id.as_str().to_string();
+    let instances = rounds::instances_for_round(&db, &rounds[0].id).unwrap();
+    assert!(!instances.is_empty());
+    assert!(
+        run.findings_json.is_none(),
+        "finalized rounds must not write findings_json: {:?}",
+        run.findings_json
+    );
+
+    let snap = porch_gate::get_run(&s.home, &run.id).unwrap();
+    assert_eq!(snap.assurance_record.kind_str(), "round");
+    assert_eq!(
+        snap.assurance_record.review_round_id().unwrap(),
+        round_id.as_str()
+    );
+    assert!(snap.assurance_record.audit_identity_available());
+
+    let findings = snap.findings.as_array().expect("findings array");
+    assert_eq!(findings.len(), instances.len());
+    assert_eq!(findings[0]["id"], "f0");
+    assert_eq!(findings[0]["path"], instances[0].path);
+    assert_eq!(findings[0]["message"], instances[0].evidence);
+    assert!(findings[0].get("criterion_id").is_none());
+    assert!(findings[0].get("fingerprint").is_none());
+
+    let hunk = porch_gate::get_finding_hunk(&s.home, &run.id, "f0").unwrap();
+    assert!(hunk.get("error").is_none(), "hunk={hunk}");
+    assert_eq!(hunk["path"], instances[0].path);
+
+    let status = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&s.work)
+        .env("PORCH_HOME", &s.home)
+        .args(["agent", "status", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let v: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(v["assurance_record"]["kind"], "round");
+    assert_eq!(v["assurance_record"]["review_round_id"], round_id);
+    assert!(!v["findings"].as_array().unwrap().is_empty());
+
+    kill_daemon(&s.home);
+}
+
+fn strip_rounds_for_run(db: &Db, run_id: &str) {
+    porch_gate::clear_rounds_for_run(db, run_id).unwrap();
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn legacy_parked_run_answers_actions_and_unreviewed_is_none() {
+    // Pre-migration shape: parked review findings in findings_json, no round rows.
+    {
+        let s = setup("blocking");
+        commit_change(&s.work, "bug.txt", "boom\n");
+        push_branch(&s, "feat-legacy-label", "blocking");
+        let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+        let repo_id = repo_id_for(&s.work);
+        let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+        let instances = {
+            let rounds = rounds::rounds_for_run(&db, &run.id).unwrap();
+            rounds::instances_for_round(&db, &rounds[0].id).unwrap()
+        };
+        let legacy_json = serde_json::json!([{
+            "id": "f0",
+            "path": instances[0].path,
+            "message": instances[0].evidence,
+            "severity": instances[0].severity,
+            "action": instances[0].action,
+            "start_line": 1,
+            "end_line": 2
+        }])
+        .to_string();
+        strip_rounds_for_run(&db, &run.id);
+        db.set_findings_json(&run.id, Some(&legacy_json)).unwrap();
+        assert!(rounds::rounds_for_run(&db, &run.id).unwrap().is_empty());
+
+        let snap = porch_gate::get_run(&s.home, &run.id).unwrap();
+        assert_eq!(snap.assurance_record.kind_str(), "legacy_snapshot");
+        assert!(snap.assurance_record.review_round_id().is_none());
+        assert!(!snap.assurance_record.audit_identity_available());
+        assert_eq!(snap.findings[0]["message"], instances[0].evidence);
+        assert!(snap.findings[0].get("criterion_id").is_none());
+
+        let hunk = porch_gate::get_finding_hunk(&s.home, &run.id, "f0").unwrap();
+        assert!(hunk.get("error").is_none(), "hunk={hunk}");
+
+        porch_gate::set_finding_note(&s.home, &run.id, "f0", "operator note").unwrap();
+        let notes = porch_gate::load_finding_notes(&s.home, &run.id).unwrap();
+        assert_eq!(notes.get("f0").map(String::as_str), Some("operator note"));
+
+        let abort = Command::cargo_bin("porch")
+            .unwrap()
+            .current_dir(&s.work)
+            .env("PORCH_HOME", &s.home)
+            .args(["agent", "respond", "abort", "--run-id", &run.id])
+            .output()
+            .unwrap();
+        let abort_v: Value = serde_json::from_slice(&abort.stdout).unwrap();
+        assert_eq!(
+            abort_v["status"],
+            "cancelled",
+            "{}",
+            String::from_utf8_lossy(&abort.stdout)
+        );
+        assert_eq!(db.run_by_id(&run.id).unwrap().unwrap().status, "cancelled");
+        kill_daemon(&s.home);
+    }
+
+    // Approve on a legacy parked run.
+    {
+        let s = setup("blocking");
+        commit_change(&s.work, "bug.txt", "boom\n");
+        push_branch(&s, "feat-legacy-approve", "blocking");
+        let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+        let repo_id = repo_id_for(&s.work);
+        let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+        db.set_findings_json(
+            &run.id,
+            Some(
+                r#"[{"id":"f0","path":"bug.txt","message":"legacy","severity":"warning","action":"ask-user"}]"#,
+            ),
+        )
+        .unwrap();
+        strip_rounds_for_run(&db, &run.id);
+
+        let out = Command::cargo_bin("porch")
+            .unwrap()
+            .current_dir(&s.work)
+            .env("PORCH_HOME", &s.home)
+            .env(GH_BIN_ENV, &s.fake_gh)
+            .env("PATH", &s.path)
+            .args(["agent", "respond", "approve", "--run-id", &run.id])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        kill_daemon(&s.home);
+    }
+
+    // Skip on a legacy parked run.
+    {
+        let s = setup("blocking");
+        commit_change(&s.work, "bug.txt", "boom\n");
+        push_branch(&s, "feat-legacy-skip", "blocking");
+        let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+        let repo_id = repo_id_for(&s.work);
+        let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+        db.set_findings_json(
+            &run.id,
+            Some(
+                r#"[{"id":"f0","path":"bug.txt","message":"legacy","severity":"warning","action":"ask-user"}]"#,
+            ),
+        )
+        .unwrap();
+        strip_rounds_for_run(&db, &run.id);
+
+        let out = Command::cargo_bin("porch")
+            .unwrap()
+            .current_dir(&s.work)
+            .env("PORCH_HOME", &s.home)
+            .args(["agent", "respond", "skip", "--run-id", &run.id])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            db.run_by_id(&run.id)
+                .unwrap()
+                .unwrap()
+                .review_approved_head_sha
+                .is_none()
+        );
+        kill_daemon(&s.home);
+    }
+
+    // Fix on a legacy parked run.
+    {
+        let s = setup("blocking");
+        commit_change(&s.work, "bug.txt", "boom\n");
+        push_branch(&s, "feat-legacy-fix", "blocking");
+        let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+        let repo_id = repo_id_for(&s.work);
+        let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+        db.set_findings_json(
+            &run.id,
+            Some(
+                r#"[{"id":"f0","path":"bug.txt","message":"legacy","severity":"warning","action":"ask-user","start_line":1,"end_line":1}]"#,
+            ),
+        )
+        .unwrap();
+        strip_rounds_for_run(&db, &run.id);
+
+        let out = Command::cargo_bin("porch")
+            .unwrap()
+            .current_dir(&s.work)
+            .env("PORCH_HOME", &s.home)
+            .env(REVIEW_BIN_ENV, &s.fake_review)
+            .env(FIXER_BIN_ENV, &s.fake_fixer)
+            .env(GH_BIN_ENV, &s.fake_gh)
+            .env("PORCH_FAKE_REVIEW_MODE", "clean")
+            .env("PORCH_FAKE_FIXER_MODE", "apply")
+            .env("PATH", &s.path)
+            .args(["agent", "respond", "fix", "--run-id", &run.id])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "fix failed: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        kill_daemon(&s.home);
+    }
+
+    // Unreviewed run → none
+    {
+        let s = setup("clean");
+        let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+        let repo_id = repo_id_for(&s.work);
+        let run = db
+            .insert_run(&repo_id, "feat-none", "deadbeef", None, None)
+            .unwrap();
+        let (record, findings) = porch_gate::resolve_run_assurance(&db, &run).unwrap();
+        assert_eq!(record.kind_str(), "none");
+        assert!(record.review_round_id().is_none());
+        assert!(!record.audit_identity_available());
+        assert!(findings.is_empty());
+        kill_daemon(&s.home);
+    }
+}
+
+#[test]
+fn legacy_finding_dto_ignores_enriched_fields() {
+    let raw = r#"{"id":"f0","path":"a.rs","message":"x","severity":"warning","action":"ask-user","criterion_id":"rust/unwrap-in-lib","evidence":"e","fingerprint":"fp"}"#;
+    let dto: porch_gate::LegacyFindingDto = serde_json::from_str(raw).unwrap();
+    let v = serde_json::to_value(&dto).unwrap();
+    assert_eq!(v["id"], "f0");
+    assert_eq!(v["path"], "a.rs");
+    assert_eq!(v["message"], "x");
+    assert!(v.get("criterion_id").is_none());
+    assert!(v.get("evidence").is_none());
+    assert!(v.get("fingerprint").is_none());
+    assert!(v.get("consequence").is_none());
+    assert!(v.get("provenance").is_none());
+    assert!(v.get("confidence").is_none());
+    assert!(v.get("anchor_kind").is_none());
+}
+
+#[test]
+fn repo_id_for_is_stable_for_same_absolute_path() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("repo");
+    std::fs::create_dir_all(&path).unwrap();
+    let a = repo_id_for(&path);
+    let b = repo_id_for(&path);
+    assert_eq!(a, b);
+    assert_eq!(a.len(), 12);
+    let abs = path.canonicalize().unwrap();
+    assert_eq!(repo_id_for(&abs), a);
+}
