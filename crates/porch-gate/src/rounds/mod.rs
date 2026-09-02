@@ -2,6 +2,7 @@
 
 mod schema;
 
+use std::cell::Cell;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,44 @@ use crate::db::Db;
 use crate::{Error, Result};
 
 pub(crate) use schema::migrate;
+
+/// Max stale phase-2 attempts before `abandon_for_history_contention`.
+pub const STALE_REVISION_RETRIES: u32 = 3;
+
+thread_local! {
+    static COMMITTED_WRITES: Cell<u64> = const { Cell::new(0) };
+    static FINALIZE_ATTEMPTS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn record_committed_write() {
+    COMMITTED_WRITES.with(|c| c.set(c.get() + 1));
+}
+
+fn record_finalize_attempt() {
+    FINALIZE_ATTEMPTS.with(|c| c.set(c.get() + 1));
+}
+
+/// Reset the committed-write probe used by ROUND write-budget tests.
+pub fn reset_committed_write_count() {
+    COMMITTED_WRITES.with(|c| c.set(0));
+}
+
+/// Take and clear the committed-write probe counter.
+#[must_use]
+pub fn take_committed_write_count() -> u64 {
+    COMMITTED_WRITES.with(|c| c.replace(0))
+}
+
+/// Reset the finalize phase-2 attempt probe.
+pub fn reset_finalize_attempt_count() {
+    FINALIZE_ATTEMPTS.with(|c| c.set(0));
+}
+
+/// Take and clear the finalize phase-2 attempt counter.
+#[must_use]
+pub fn take_finalize_attempt_count() -> u64 {
+    FINALIZE_ATTEMPTS.with(|c| c.replace(0))
+}
 
 /// Stable id for one review round.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -361,6 +400,135 @@ pub struct ProducerRecord {
     pub descriptor_equivalence_digest: String,
 }
 
+/// Monotonic per-run detector for reconciliation history changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HistoryRevision(pub i64);
+
+/// Prior finding instance supplied to reconciliation (phase 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPriorInstance {
+    pub finding_instance_id: String,
+    pub round_id: String,
+    pub producer_invocation_id: String,
+    pub fingerprint: String,
+    pub fingerprint_version: i64,
+    pub candidate_key: String,
+    pub path: String,
+    pub anchor_kind: String,
+    pub anchor_value: String,
+}
+
+/// Coverage state persisted under one producer invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageState {
+    Selected,
+    Completed,
+    Failed,
+    Waived,
+}
+
+impl CoverageState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Waived => "waived",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "selected" => Ok(Self::Selected),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "waived" => Ok(Self::Waived),
+            other => Err(Error::Other(format!("unknown coverage state: {other}"))),
+        }
+    }
+}
+
+/// One coverage row in a finalize proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundCoverageProposal {
+    pub producer_invocation_id: String,
+    pub path: String,
+    pub state: CoverageState,
+    pub reason: Option<String>,
+    pub authority: Option<String>,
+    pub completion_evidence: Option<String>,
+}
+
+/// One finding instance in a finalize proposal (fingerprint already decided).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingInstanceProposal {
+    pub producer_invocation_id: String,
+    pub fingerprint: String,
+    pub fingerprint_version: i64,
+    pub candidate_key: String,
+    pub criterion_id: String,
+    pub evidence: String,
+    pub consequence: String,
+    pub action: String,
+    pub severity: String,
+    pub provenance_json: String,
+    pub confidence_value: Option<String>,
+    pub confidence_kind: Option<String>,
+    pub path: String,
+    pub anchor_kind: String,
+    pub anchor_value: String,
+}
+
+/// Terminal payload for phase-2 finalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeProposal {
+    pub execution: ExecutionState,
+    pub assurance_completion: AssuranceCompletion,
+    pub completion_reason: Option<String>,
+    pub coverage: Vec<RoundCoverageProposal>,
+    pub instances: Vec<FindingInstanceProposal>,
+}
+
+/// Result of a revision-guarded finalize attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    Finalized,
+    Stale,
+}
+
+/// Persisted coverage row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageRecord {
+    pub producer_invocation_id: String,
+    pub path: String,
+    pub state: CoverageState,
+    pub reason: Option<String>,
+    pub authority: Option<String>,
+    pub completion_evidence: Option<String>,
+}
+
+/// Persisted finding instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingInstanceRecord {
+    pub id: String,
+    pub round_id: String,
+    pub producer_invocation_id: String,
+    pub fingerprint: String,
+    pub fingerprint_version: i64,
+    pub candidate_key: String,
+    pub criterion_id: String,
+    pub evidence: String,
+    pub consequence: String,
+    pub action: String,
+    pub severity: String,
+    pub provenance_json: String,
+    pub confidence_value: Option<String>,
+    pub confidence_kind: Option<String>,
+    pub path: String,
+    pub anchor_kind: String,
+    pub anchor_value: String,
+}
+
 /// Hex-encoded SHA-256 of `bytes`.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -403,6 +571,7 @@ pub fn open_round(db: &Db, plan: &OpenRoundPlan, bindings: &RoundBindings) -> Re
     insert_context_rows(&tx, &round_id, &elements, &producer_ids, bindings)?;
 
     tx.commit()?;
+    record_committed_write();
     Ok(RoundId(round_id))
 }
 
@@ -692,6 +861,328 @@ pub fn context_applications_for_round(
         });
     }
     Ok(out)
+}
+
+/// Phase 1: read reconciliation history and revision in one deferred snapshot.
+///
+/// # Errors
+///
+/// Returns a storage error if the run is missing or the query fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn read_history(db: &Db, run_id: &str) -> Result<(HistoryRevision, Vec<StoredPriorInstance>)> {
+    let conn = db.conn();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+
+    let revision: i64 = tx.query_row(
+        "SELECT review_history_revision FROM runs WHERE id = ?1",
+        [run_id],
+        |row| row.get(0),
+    )?;
+
+    let instances = {
+        let mut stmt = tx.prepare(
+            "SELECT i.id, i.round_id, i.producer_invocation_id, i.fingerprint, i.fingerprint_version,
+                    i.candidate_key, i.path, i.anchor_kind, i.anchor_value
+             FROM finding_instances i
+             INNER JOIN review_rounds r ON r.id = i.round_id
+             WHERE r.run_id = ?1
+             ORDER BY r.ordinal, i.id",
+        )?;
+        let mapped = stmt.query_map([run_id], |row| {
+            Ok(StoredPriorInstance {
+                finding_instance_id: row.get(0)?,
+                round_id: row.get(1)?,
+                producer_invocation_id: row.get(2)?,
+                fingerprint: row.get(3)?,
+                fingerprint_version: row.get(4)?,
+                candidate_key: row.get(5)?,
+                path: row.get(6)?,
+                anchor_kind: row.get(7)?,
+                anchor_value: row.get(8)?,
+            })
+        })?;
+        let mut instances = Vec::new();
+        for row in mapped {
+            instances.push(row?);
+        }
+        instances
+    };
+    // Read-only snapshot; explicit commit keeps the deferred txn tidy.
+    tx.commit()?;
+    Ok((HistoryRevision(revision), instances))
+}
+
+/// Phase 2: persist coverage, instances, and terminal state if `seen_revision` still matches.
+///
+/// # Errors
+///
+/// Returns a storage error when the round is missing, not open, the proposal violates
+/// constraints, or the transaction cannot commit.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn finalize_round(
+    db: &Db,
+    round_id: &RoundId,
+    proposal: &FinalizeProposal,
+    seen_revision: HistoryRevision,
+) -> Result<FinalizeOutcome> {
+    record_finalize_attempt();
+    let conn = db.conn();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+
+    let (run_id, execution, assurance): (String, String, String) = tx.query_row(
+        "SELECT run_id, execution, assurance_completion FROM review_rounds WHERE id = ?1",
+        [round_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+
+    if execution != ExecutionState::Running.as_str()
+        || assurance != AssuranceCompletion::Pending.as_str()
+    {
+        return Err(Error::Other(format!(
+            "round {} is not open for finalization ({execution}/{assurance})",
+            round_id.as_str()
+        )));
+    }
+
+    let current: i64 = tx.query_row(
+        "SELECT review_history_revision FROM runs WHERE id = ?1",
+        [&run_id],
+        |row| row.get(0),
+    )?;
+    if current != seen_revision.0 {
+        // `tx` drops without commit — no durable finalization.
+        return Ok(FinalizeOutcome::Stale);
+    }
+
+    insert_coverage(&tx, round_id, &proposal.coverage)?;
+    insert_instances(&tx, round_id, &proposal.instances)?;
+
+    let finalized_at = now_secs();
+    tx.execute(
+        "UPDATE review_rounds
+         SET execution = ?1,
+             assurance_completion = ?2,
+             completion_reason = ?3,
+             finalized_at = ?4
+         WHERE id = ?5",
+        rusqlite::params![
+            proposal.execution.as_str(),
+            proposal.assurance_completion.as_str(),
+            proposal.completion_reason,
+            finalized_at,
+            round_id.as_str(),
+        ],
+    )?;
+
+    tx.execute(
+        "UPDATE runs SET review_history_revision = review_history_revision + 1 WHERE id = ?1",
+        [&run_id],
+    )?;
+
+    tx.commit()?;
+    record_committed_write();
+    Ok(FinalizeOutcome::Finalized)
+}
+
+/// Close a round after stale retries are exhausted (`history_contention`).
+///
+/// # Errors
+///
+/// Returns a storage error if the round is missing, not open, or the transaction fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn abandon_for_history_contention(db: &Db, round_id: &RoundId) -> Result<()> {
+    let conn = db.conn();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+
+    let (run_id, execution, assurance): (String, String, String) = tx.query_row(
+        "SELECT run_id, execution, assurance_completion FROM review_rounds WHERE id = ?1",
+        [round_id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if execution != ExecutionState::Running.as_str()
+        || assurance != AssuranceCompletion::Pending.as_str()
+    {
+        return Err(Error::Other(format!(
+            "round {} is not open for contention close ({execution}/{assurance})",
+            round_id.as_str()
+        )));
+    }
+
+    tx.execute(
+        "UPDATE review_rounds
+         SET execution = ?1,
+             assurance_completion = ?2,
+             completion_reason = ?3,
+             finalized_at = ?4
+         WHERE id = ?5",
+        rusqlite::params![
+            ExecutionState::Interrupted.as_str(),
+            AssuranceCompletion::Incomplete.as_str(),
+            "history_contention",
+            now_secs(),
+            round_id.as_str(),
+        ],
+    )?;
+    tx.execute(
+        "UPDATE runs SET review_history_revision = review_history_revision + 1 WHERE id = ?1",
+        [&run_id],
+    )?;
+    tx.commit()?;
+    record_committed_write();
+    Ok(())
+}
+
+/// Coverage rows recorded for a round.
+///
+/// # Errors
+///
+/// Returns a storage error if the query fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn coverage_for_round(db: &Db, round_id: &RoundId) -> Result<Vec<CoverageRecord>> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT producer_invocation_id, path, state, reason, authority, completion_evidence
+         FROM round_coverage
+         WHERE round_id = ?1
+         ORDER BY producer_invocation_id, path",
+    )?;
+    let mut rows = stmt.query([round_id.as_str()])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let state: String = row.get(2)?;
+        out.push(CoverageRecord {
+            producer_invocation_id: row.get(0)?,
+            path: row.get(1)?,
+            state: CoverageState::parse(&state)?,
+            reason: row.get(3)?,
+            authority: row.get(4)?,
+            completion_evidence: row.get(5)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Finding instances recorded for a round.
+///
+/// # Errors
+///
+/// Returns a storage error if the query fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn instances_for_round(db: &Db, round_id: &RoundId) -> Result<Vec<FindingInstanceRecord>> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT id, round_id, producer_invocation_id, fingerprint, fingerprint_version,
+                candidate_key, criterion_id, evidence, consequence, action, severity,
+                provenance_json, confidence_value, confidence_kind, path, anchor_kind, anchor_value
+         FROM finding_instances
+         WHERE round_id = ?1
+         ORDER BY id",
+    )?;
+    let mut rows = stmt.query([round_id.as_str()])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(FindingInstanceRecord {
+            id: row.get(0)?,
+            round_id: row.get(1)?,
+            producer_invocation_id: row.get(2)?,
+            fingerprint: row.get(3)?,
+            fingerprint_version: row.get(4)?,
+            candidate_key: row.get(5)?,
+            criterion_id: row.get(6)?,
+            evidence: row.get(7)?,
+            consequence: row.get(8)?,
+            action: row.get(9)?,
+            severity: row.get(10)?,
+            provenance_json: row.get(11)?,
+            confidence_value: row.get(12)?,
+            confidence_kind: row.get(13)?,
+            path: row.get(14)?,
+            anchor_kind: row.get(15)?,
+            anchor_value: row.get(16)?,
+        });
+    }
+    Ok(out)
+}
+
+fn insert_coverage(
+    tx: &Transaction<'_>,
+    round_id: &RoundId,
+    coverage: &[RoundCoverageProposal],
+) -> Result<()> {
+    for row in coverage {
+        tx.execute(
+            "INSERT INTO round_coverage (
+                round_id, producer_invocation_id, path, state, reason, authority, completion_evidence
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                round_id.as_str(),
+                row.producer_invocation_id,
+                row.path,
+                row.state.as_str(),
+                row.reason,
+                row.authority,
+                row.completion_evidence,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_instances(
+    tx: &Transaction<'_>,
+    round_id: &RoundId,
+    instances: &[FindingInstanceProposal],
+) -> Result<()> {
+    for instance in instances {
+        if instance.confidence_value.is_some() != instance.confidence_kind.is_some() {
+            return Err(Error::Other(
+                "confidence_value and confidence_kind must both be set or both be absent".into(),
+            ));
+        }
+        let id = Ulid::new().to_string();
+        tx.execute(
+            "INSERT INTO finding_instances (
+                id, round_id, producer_invocation_id, fingerprint, fingerprint_version,
+                candidate_key, criterion_id, evidence, consequence, action, severity,
+                provenance_json, confidence_value, confidence_kind, path, anchor_kind, anchor_value
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            rusqlite::params![
+                id,
+                round_id.as_str(),
+                instance.producer_invocation_id,
+                instance.fingerprint,
+                instance.fingerprint_version,
+                instance.candidate_key,
+                instance.criterion_id,
+                instance.evidence,
+                instance.consequence,
+                instance.action,
+                instance.severity,
+                instance.provenance_json,
+                instance.confidence_value,
+                instance.confidence_kind,
+                instance.path,
+                instance.anchor_kind,
+                instance.anchor_value,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn normalize_context_element(element: &ContextElement) -> ContextElement {
