@@ -164,7 +164,25 @@ impl ProducerOutput {
             out.waived = items_to_signals(&m.coverage.waived);
         }
 
+        // First-party flat status rows (`pass` / `skip`) merge with OCR manifest claims.
+        if !parsed.coverage.is_empty() {
+            let from_status = Self::from_status_rows(&parsed.coverage);
+            out.completed.extend(from_status.completed);
+            out.failed.extend(from_status.failed);
+            out.waived.extend(from_status.waived);
+            out.selected.extend(from_status.selected);
+            out.present_paths.extend(from_status.present_paths);
+        }
+
         out
+    }
+
+    /// True when every derived entry is `completed` or `waived` (required for Complete).
+    #[must_use]
+    pub fn meets_required(entries: &[CoverageEntry]) -> bool {
+        !entries
+            .iter()
+            .any(|e| matches!(e.state, CoverageState::Selected | CoverageState::Failed))
     }
 
     /// Build claims from flat status rows (`pass` / `skip` / …), e.g. quality or agent coverage.
@@ -425,6 +443,7 @@ mod tests {
         let parsed = ReviewJson {
             comments: vec![],
             files: vec!["a.rs".into(), "b.rs".into()],
+            coverage: vec![],
             groups: vec![],
             manifest: Some(ReviewManifest {
                 coverage: ReviewCoverage {
@@ -443,6 +462,29 @@ mod tests {
         assert_eq!(by["a.rs"].state, CoverageState::Completed);
         assert_eq!(by["a.rs"].completion_evidence.as_deref(), Some("ocr:done"));
         assert_eq!(by["b.rs"].state, CoverageState::Selected);
+    }
+
+    #[test]
+    fn top_level_status_coverage_marks_completed() {
+        let parsed = ReviewJson {
+            comments: vec![],
+            files: vec!["a.rs".into()],
+            coverage: vec![StatusRow {
+                path: "a.rs".into(),
+                status: "pass".into(),
+                ..StatusRow::default()
+            }],
+            groups: vec![],
+            manifest: None,
+        };
+        let output = ProducerOutput::from_review_json(&parsed);
+        let entries = derive_states(&["a.rs".into()], &output).unwrap();
+        assert!(ProducerOutput::meets_required(&entries));
+        assert_eq!(entries[0].state, CoverageState::Completed);
+        assert_eq!(
+            entries[0].completion_evidence.as_deref(),
+            Some("status:pass")
+        );
     }
 
     #[test]

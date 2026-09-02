@@ -188,7 +188,7 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                         }
                     }
                 }
-                "review" => match run_review_phase(&db, home, run_id, &wt_path, false)? {
+                "review" => match run_review_phase(&db, home, run_id, &bare, &wt_path, false)? {
                     ReviewPhase::Approved => {
                         record_step(&db, run_id, phase, "completed", None)?;
                     }
@@ -272,24 +272,25 @@ fn run_review_phase(
     db: &Db,
     home: &Path,
     run_id: &str,
+    bare: &GitDir,
     wt: &Path,
     after_fix: bool,
 ) -> Result<ReviewPhase> {
     let run = db
         .run_by_id(run_id)?
         .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
-    let base = run
+    let base_sha = run
         .base_sha
         .as_deref()
         .ok_or_else(|| RunError::Msg("review requires base_sha".into()))?;
     let head = porch_git::rev_parse_c(wt, "HEAD")?;
     db.set_run_shas(run_id, Some(&head), None)?;
 
-    let from_sha = resolve_review_from(db, wt, &run, base, &head, after_fix)?;
+    let from_sha = resolve_review_from(db, wt, &run, base_sha, &head, after_fix)?;
     let range = format!("{from_sha}..{head}");
     let changed = porch_git::diff_name_only(wt, &range)?;
 
-    let opened = open_review_round(db, home, &run, run_id, &from_sha, &head, &changed)?;
+    let opened = open_review_round(db, home, bare, &run, run_id, &from_sha, &head, &changed)?;
     let outcome = spawn_review_for_round(
         db,
         &SpawnReviewCtx {
@@ -322,9 +323,11 @@ struct OpenedRound {
     plan: porch_review::InvocationPlan,
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn open_review_round(
     db: &Db,
     home: &Path,
+    bare: &GitDir,
     run: &RunRow,
     run_id: &str,
     from_sha: &str,
@@ -352,6 +355,12 @@ fn open_review_round(
         .trusted_config_sha
         .clone()
         .ok_or_else(|| RunError::Msg("review requires trusted_config_sha".into()))?;
+    // Pin before open so a failed open leaves a sweepable ref leak, not an unpinned round.
+    rounds::retention::pin_trusted_config(bare, &trusted_config_sha).map_err(|e| {
+        RunError::Msg(format!(
+            "failed to pin trusted config before round open: {e}"
+        ))
+    })?;
     let inv_bytes = inventory_bytes(changed);
     let inventory_digest = sha256_hex(&inv_bytes);
 
@@ -501,17 +510,30 @@ fn finalize_complete_round(
     changed: &[String],
     outcome: &porch_review::ReviewOutcome,
 ) -> Result<()> {
-    let coverage_output = ProducerOutput {
-        present_paths: outcome.covered_files.clone(),
-        ..ProducerOutput::default()
-    };
-    let coverage_entries = match porch_review::derive_states(changed, &coverage_output) {
+    let coverage_entries = match porch_review::derive_states(changed, &outcome.coverage) {
         Ok(entries) => entries,
         Err(e) => {
             finalize_incomplete(db, &opened.round_id, incomplete_reason(&e))?;
             return Err(RunError::Review(e));
         }
     };
+    // Presence-only / failed paths are a coverage shortfall — never Complete.
+    if !ProducerOutput::meets_required(&coverage_entries) {
+        finalize_incomplete(db, &opened.round_id, "coverage_shortfall")?;
+        let short = coverage_entries
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.state,
+                    porch_review::CoverageState::Selected | porch_review::CoverageState::Failed
+                )
+            })
+            .map_or_else(
+                || changed.first().cloned().unwrap_or_default(),
+                |e| e.path.clone(),
+            );
+        return Err(RunError::Review(porch_review::Error::Coverage(short)));
+    }
     let coverage_proposal: Vec<RoundCoverageProposal> = coverage_entries
         .iter()
         .map(|e| RoundCoverageProposal {
@@ -932,7 +954,7 @@ fn deliver_with_repair(
                 )?;
 
                 // Session-free rereview (after_fix never passes fixer session).
-                match run_review_phase(db, home, run_id, wt, true)? {
+                match run_review_phase(db, home, run_id, bare, wt, true)? {
                     ReviewPhase::Approved => {
                         record_step(db, run_id, "review", "completed", Some("deliver_repair"))?;
                         let local_cancel = AtomicBool::new(false);
@@ -1419,7 +1441,7 @@ fn agent_status_inner(
 ) -> std::result::Result<AgentStatus, UsageOrFail> {
     let db = Db::open(&db_path(home)).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     let run = resolve_run(&db, run_id, work_tree)?;
-    Ok(status_from_run(&db, &run, home))
+    status_from_run(&db, &run, home).map_err(UsageOrFail::Fail)
 }
 
 fn agent_respond_inner(
@@ -1456,7 +1478,7 @@ fn agent_respond_inner(
             .run_by_id(&run.id)
             .map_err(|e| UsageOrFail::Fail(e.to_string()))?
             .ok_or_else(|| UsageOrFail::Fail("run disappeared".into()))?;
-        return Ok(status_from_run(&db, &run, home));
+        return status_from_run(&db, &run, home).map_err(UsageOrFail::Fail);
     }
 
     match response {
@@ -1515,7 +1537,7 @@ fn agent_respond_inner(
         .run_by_id(&run.id)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?
         .ok_or_else(|| UsageOrFail::Fail("run disappeared".into()))?;
-    Ok(status_from_run(&db, &run, home))
+    status_from_run(&db, &run, home).map_err(UsageOrFail::Fail)
 }
 
 fn respond_compose(
@@ -1685,7 +1707,7 @@ fn respond_rebase_fix(
         return Ok(());
     }
 
-    match run_review_phase(db, home, &run.id, wt, false) {
+    match run_review_phase(db, home, &run.id, bare, wt, false) {
         Ok(ReviewPhase::Approved) => {
             complete_after_review(db, home, bare, wt, run, None)?;
         }
@@ -1814,7 +1836,7 @@ fn finish_rereview(
     yes: bool,
 ) -> std::result::Result<(), UsageOrFail> {
     // Session-free rereview (never pass fixer session).
-    match run_review_phase(db, home, &run.id, wt, true) {
+    match run_review_phase(db, home, &run.id, bare, wt, true) {
         Ok(ReviewPhase::Approved) => {
             complete_after_review(db, home, bare, wt, run, None)?;
         }
@@ -1984,13 +2006,14 @@ fn resolve_run(
         .ok_or_else(|| UsageOrFail::Usage("no parked run for this repo".into()))
 }
 
-pub(crate) fn status_from_run(db: &Db, run: &RunRow, home: &Path) -> AgentStatus {
-    let (assurance_record, status_findings) = resolve_run_assurance(db, run).unwrap_or_else(|_| {
-        (
-            porch_gate::AssuranceRecord::none(),
-            Vec::<StatusFindingDto>::new(),
-        )
-    });
+pub(crate) fn status_from_run(
+    db: &Db,
+    run: &RunRow,
+    home: &Path,
+) -> std::result::Result<AgentStatus, String> {
+    // Fail closed: storage/resolve errors must not look like "not reviewed".
+    let (assurance_record, status_findings) =
+        resolve_run_assurance(db, run).map_err(|e| e.to_string())?;
     let findings = status_findings
         .into_iter()
         .map(finding_from_status_dto)
@@ -2010,7 +2033,7 @@ pub(crate) fn status_from_run(db: &Db, run: &RunRow, home: &Path) -> AgentStatus
     } else {
         (None, None)
     };
-    AgentStatus {
+    Ok(AgentStatus {
         run_id: run.id.clone(),
         repo_id: run.repo_id.clone(),
         branch: run.branch.clone(),
@@ -2025,7 +2048,7 @@ pub(crate) fn status_from_run(db: &Db, run: &RunRow, home: &Path) -> AgentStatus
         pr_url: run.pr_url.clone(),
         compose_packet_path,
         allowed_actions,
-    }
+    })
 }
 
 fn findings_for_run(db: &Db, run: &RunRow) -> std::result::Result<Vec<Finding>, String> {

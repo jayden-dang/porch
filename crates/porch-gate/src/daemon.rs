@@ -400,8 +400,13 @@ mod tests {
         db.set_run_status(&run.id, "parked", None).unwrap();
         db.insert_step_result(&run.id, "review", "parked", None)
             .unwrap();
-        db.set_findings_json(&run.id, Some(r#"[{"id":"f0"}]"#))
-            .unwrap();
+        db.set_findings_json(
+            &run.id,
+            Some(
+                r#"[{"id":"f0","path":"README","message":"x","severity":"warning","action":"ask-user"}]"#,
+            ),
+        )
+        .unwrap();
 
         let _handle = start_test_daemon(&home);
         wait_for_health(&home, Duration::from_secs(5)).unwrap();

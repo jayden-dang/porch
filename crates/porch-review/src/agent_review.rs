@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::{Action, Error, Finding, ReviewComment, ReviewOutcome, Severity, assert_coverage};
+use crate::{
+    Action, Error, Finding, ReviewComment, ReviewOutcome, Severity, assert_coverage,
+    coverage_state::{ProducerOutput, StatusRow},
+};
 
 /// Env override for the review agent binary (`claude` / `codex` / PATH fake).
 pub const REVIEW_AGENT_BIN_ENV: &str = "PORCH_REVIEW_AGENT_BIN";
@@ -225,7 +228,45 @@ pub fn parse_agent_review_json(bytes: &[u8]) -> Result<ReviewOutcome, Error> {
     Ok(ReviewOutcome {
         findings,
         covered_files: derive_agent_coverage(&parsed),
+        coverage: agent_coverage_output(&parsed),
     })
+}
+
+fn agent_coverage_output(parsed: &AgentReviewJson) -> ProducerOutput {
+    let rows: Vec<StatusRow> = parsed
+        .coverage
+        .iter()
+        .filter(|c| !c.path.is_empty())
+        .map(|c| StatusRow {
+            path: c.path.clone(),
+            status: c.status.clone(),
+            ..StatusRow::default()
+        })
+        .collect();
+    let mut out = ProducerOutput::from_status_rows(&rows);
+    for path in &parsed.files {
+        if !path.is_empty() {
+            out.present_paths.push(path.clone());
+        }
+    }
+    if out.completed.is_empty()
+        && out.waived.is_empty()
+        && out.failed.is_empty()
+        && out.selected.is_empty()
+    {
+        // Findings/comments alone are presence, never completion.
+        for f in &parsed.findings {
+            if !f.path.is_empty() {
+                out.present_paths.push(f.path.clone());
+            }
+        }
+        for c in &parsed.comments {
+            if !c.path.is_empty() {
+                out.present_paths.push(c.path.clone());
+            }
+        }
+    }
+    out
 }
 
 fn map_agent_finding(raw: &AgentFindingIn) -> Finding {

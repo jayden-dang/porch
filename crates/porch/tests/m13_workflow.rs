@@ -97,7 +97,14 @@ for f in $FILES; do
   FILES_JSON="$FILES_JSON\"$f\""
 done
 FILES_JSON="$FILES_JSON]"
-printf '{"comments":[],"files":%s}\n' "$FILES_JSON" > "$OUT"
+COV_JSON="["
+FIRST=1
+for f in $FILES; do
+  if [ $FIRST -eq 1 ]; then FIRST=0; else COV_JSON="$COV_JSON,"; fi
+  COV_JSON="$COV_JSON{\"path\":\"$f\",\"status\":\"pass\"}"
+done
+COV_JSON="$COV_JSON]"
+printf '{"comments":[],"files":%s,"coverage":%s}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
 "#,
     )
     .unwrap();

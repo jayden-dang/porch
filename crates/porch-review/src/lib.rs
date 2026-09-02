@@ -220,7 +220,8 @@ pub struct ReviewManifest {
 /// Top-level review CLI JSON (`comments` + coverage `files`).
 ///
 /// OCR often omits top-level `files`; porch then derives coverage from
-/// `groups` / `manifest.coverage` / comment paths.
+/// `groups` / `manifest.coverage` / comment paths. First-party quality emits
+/// flat `coverage[]` status rows (`pass` / `skip`) alongside `files`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReviewJson {
     #[serde(default)]
@@ -228,6 +229,9 @@ pub struct ReviewJson {
     /// Paths the engine claims to have covered (or explicitly skipped).
     #[serde(default)]
     pub files: Vec<String>,
+    /// Flat status rows (`pass` / `skip` / …). Explicit completion signals.
+    #[serde(default)]
+    pub coverage: Vec<coverage_state::StatusRow>,
     #[serde(default)]
     pub groups: Vec<ReviewGroup>,
     #[serde(default)]
@@ -239,6 +243,8 @@ pub struct ReviewJson {
 pub struct ReviewOutcome {
     pub findings: Vec<Finding>,
     pub covered_files: Vec<String>,
+    /// Structured producer coverage claims for state derivation.
+    pub coverage: ProducerOutput,
 }
 
 impl ReviewOutcome {
@@ -401,9 +407,11 @@ pub fn parse_review_json(bytes: &[u8]) -> Result<ReviewOutcome, Error> {
         f.id = format!("f{i}");
     }
     let covered_files = derive_covered_files(&parsed);
+    let coverage = ProducerOutput::from_review_json(&parsed);
     Ok(ReviewOutcome {
         findings,
         covered_files,
+        coverage,
     })
 }
 

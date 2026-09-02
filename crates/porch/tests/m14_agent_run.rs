@@ -85,15 +85,22 @@ for f in $FILES; do
   FILES_JSON="$FILES_JSON\"$f\""
 done
 FILES_JSON="$FILES_JSON]"
+COV_JSON="["
+FIRST=1
+for f in $FILES; do
+  if [ $FIRST -eq 1 ]; then FIRST=0; else COV_JSON="$COV_JSON,"; fi
+  COV_JSON="$COV_JSON{\"path\":\"$f\",\"status\":\"pass\"}"
+done
+COV_JSON="$COV_JSON]"
 case "$MODE" in
   clean)
-    printf '{"comments":[],"files":%s}\n' "$FILES_JSON" > "$OUT"
+    printf '{"comments":[],"files":%s,"coverage":%s}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
     ;;
   blocking)
     TARGET=$(printf '%s\n' $FILES | head -n1)
     if [ -z "$TARGET" ]; then TARGET="README"; fi
-    printf '{"comments":[{"path":"%s","content":"null deref","category":"bug","severity":"high","start_line":1,"end_line":2}],"files":%s}\n' \
-      "$TARGET" "$FILES_JSON" > "$OUT"
+    printf '{"comments":[{"path":"%s","content":"null deref","category":"bug","severity":"high","start_line":1,"end_line":2}],"files":%s,"coverage":%s}\n' \
+      "$TARGET" "$FILES_JSON" "$COV_JSON" > "$OUT"
     ;;
   *)
     echo "unknown PORCH_FAKE_REVIEW_MODE=$MODE" >&2

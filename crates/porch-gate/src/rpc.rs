@@ -11,7 +11,9 @@ use crate::Result;
 use crate::db::{Db, RunRow, StepResultRow};
 use crate::events::{Event, EventHub};
 use crate::home::socket_path;
-use crate::rounds::{self, AssuranceCompletion, ExecutionState, FindingInstanceRecord, RoundId};
+use crate::rounds::{
+    self, AssuranceCompletion, CoverageState, ExecutionState, FindingInstanceRecord, RoundId,
+};
 
 /// Soft cap for on-demand finding hunk / diff payloads (bytes).
 pub const FINDING_HUNK_MAX_BYTES: usize = 16_384;
@@ -183,7 +185,8 @@ fn status_from_instance(index: usize, inst: &FindingInstanceRecord) -> StatusFin
 
 /// Finalized, applicable round backing the current parked decision, if any.
 ///
-/// Prefers the newest finished/complete round whose `to_sha` matches the run tip.
+/// Prefers the newest finished/complete round whose `to_sha` matches the run tip
+/// and whose coverage has no `selected` / `failed` paths (authorization floor).
 ///
 /// # Errors
 ///
@@ -208,6 +211,13 @@ pub fn round_for_decision(db: &Db, run: &RunRow) -> Result<Option<RoundId>> {
             if round.to_sha != head {
                 continue;
             }
+        }
+        let coverage = rounds::coverage_for_round(db, &round.id)?;
+        if coverage
+            .iter()
+            .any(|row| matches!(row.state, CoverageState::Selected | CoverageState::Failed))
+        {
+            continue;
         }
         return Ok(Some(round.id));
     }
@@ -239,7 +249,9 @@ pub fn resolve_run_assurance(
 
     match run.findings_json.as_deref() {
         Some(raw) => {
-            let legacy: Vec<LegacyFindingDto> = serde_json::from_str(raw).unwrap_or_default();
+            let legacy: Vec<LegacyFindingDto> = serde_json::from_str(raw).map_err(|e| {
+                crate::Error::Other(format!("legacy findings_json decode failed: {e}"))
+            })?;
             let findings = legacy.into_iter().map(StatusFindingDto::from).collect();
             Ok((AssuranceRecord::legacy_snapshot(), findings))
         }

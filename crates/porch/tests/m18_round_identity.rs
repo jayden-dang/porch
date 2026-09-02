@@ -156,6 +156,13 @@ for f in $FILES; do
   FILES_JSON="$FILES_JSON\"$f\""
 done
 FILES_JSON="$FILES_JSON]"
+COV_JSON="["
+FIRST=1
+for f in $FILES; do
+  if [ $FIRST -eq 1 ]; then FIRST=0; else COV_JSON="$COV_JSON,"; fi
+  COV_JSON="$COV_JSON{\"path\":\"$f\",\"status\":\"pass\"}"
+done
+COV_JSON="$COV_JSON]"
 HAS_FIXED=0
 for f in $FILES; do
   if [ -f "$f" ] && grep -q fixed "$f" 2>/dev/null; then
@@ -164,21 +171,25 @@ for f in $FILES; do
   fi
 done
 if [ "$HAS_FIXED" -eq 1 ]; then
-  printf '{"comments":[],"files":%s}\n' "$FILES_JSON" > "$OUT"
+  printf '{"comments":[],"files":%s,"coverage":%s}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
   exit 0
 fi
 case "$MODE" in
   clean)
-    printf '{"comments":[],"files":%s}\n' "$FILES_JSON" > "$OUT"
+    printf '{"comments":[],"files":%s,"coverage":%s}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
     ;;
   blocking)
     TARGET=$(printf '%s\n' $FILES | head -n1)
     if [ -z "$TARGET" ]; then TARGET="README"; fi
-    printf '{"comments":[{"path":"%s","content":"null deref on empty input","category":"bug","severity":"high","start_line":1,"end_line":2}],"files":%s}\n' \
-      "$TARGET" "$FILES_JSON" > "$OUT"
+    printf '{"comments":[{"path":"%s","content":"null deref on empty input","category":"bug","severity":"high","start_line":1,"end_line":2}],"files":%s,"coverage":%s}\n' \
+      "$TARGET" "$FILES_JSON" "$COV_JSON" > "$OUT"
     ;;
   missing-file)
     printf '{"comments":[],"files":[]}\n' > "$OUT"
+    ;;
+  files-only)
+    # Presence without completion signals — must finalize incomplete.
+    printf '{"comments":[],"files":%s}\n' "$FILES_JSON" > "$OUT"
     ;;
   malformed)
     printf 'this-is-not-json\n' > "$OUT"
@@ -521,6 +532,20 @@ fn coverage_shortfall_finalizes_finished_incomplete() {
 }
 
 #[test]
+fn presence_only_coverage_finalizes_incomplete_not_complete() {
+    let s = setup("files-only");
+    commit_change(&s.work, "extra.txt", "x\n");
+    push_branch(&s, "feat-selected-shortfall", "files-only");
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let run = wait_status(&db, &repo_id, &["failed"], Duration::from_secs(20));
+    assert_finished_incomplete(&db, &run.id, "coverage_shortfall");
+
+    kill_daemon(&s.home);
+}
+
+#[test]
 fn clean_run_finalizes_complete_and_records_approved_sha() {
     let s = setup("clean");
     commit_change(&s.work, "extra.txt", "x\n");
@@ -545,6 +570,28 @@ fn clean_run_finalizes_complete_and_records_approved_sha() {
         AssuranceCompletion::Complete
     );
     assert!(rounds[0].completion_reason.is_none());
+    let coverage = rounds::coverage_for_round(&db, &rounds[0].id).unwrap();
+    assert!(
+        !coverage.is_empty(),
+        "complete round must record coverage rows"
+    );
+    assert!(
+        coverage
+            .iter()
+            .all(|row| row.state == rounds::CoverageState::Completed
+                || row.state == rounds::CoverageState::Waived),
+        "complete coverage must be completed/waived, got {coverage:?}"
+    );
+    assert!(
+        coverage
+            .iter()
+            .filter(|row| row.state == rounds::CoverageState::Completed)
+            .all(|row| row
+                .completion_evidence
+                .as_ref()
+                .is_some_and(|e| !e.is_empty())),
+        "completed rows need evidence"
+    );
 
     kill_daemon(&s.home);
 }
