@@ -4,8 +4,9 @@ use std::path::Path;
 
 use porch_gate::db_path;
 use porch_gate::rounds::{
-    self, AssuranceCompletion, ContextApplication, ContextElement, ExecutionState, OpenRoundPlan,
-    ProducerInvocation, RoundBindings, SnapshotState, SourceState, sha256_hex,
+    self, AssuranceCompletion, ContextApplication, ContextSource, ExecutionState, OpenRoundPlan,
+    ProducerInvocation, RoundBindings, SNAPSHOT_CEILING_BYTES, SnapshotState, SourceState,
+    capture_context_element, context_applicability_digest, sha256_hex,
 };
 use porch_gate::{Db, Error};
 use rusqlite::Connection;
@@ -70,28 +71,27 @@ fn sample_plan(run_id: &str) -> OpenRoundPlan {
 
 fn sample_bindings(inventory: &[u8]) -> RoundBindings {
     let digest = sha256_hex(inventory);
+    let intent = capture_context_element(
+        "intent",
+        ContextSource::Present {
+            bytes: inventory.to_vec(),
+        },
+    );
     RoundBindings {
         from_sha: "from".into(),
         to_sha: "to".into(),
-        inventory_digest: digest.clone(),
+        inventory_digest: digest,
         inventory_bytes: inventory.to_vec(),
         trusted_config_sha: "config".into(),
         protocol_schema_version: 1,
         fingerprint_version: 1,
-        context_elements: vec![ContextElement {
-            element_name: "intent".into(),
-            source_state: SourceState::Present,
-            source_reason: None,
-            snapshot_state: SnapshotState::Stored,
-            snapshot_reason: None,
-            snapshot_digest: Some(digest.clone()),
-            snapshot_bytes: Some(inventory.to_vec()),
-        }],
+        intent_source: Some("flag".into()),
+        context_elements: vec![intent.clone()],
         context_applications: vec![ContextApplication {
             element_name: "intent".into(),
             producer_slot: 0,
             application: rounds::ContextApplicationState::Applied,
-            effective_digest: Some(digest),
+            effective_digest: Some(context_applicability_digest("intent", "present", inventory)),
         }],
     }
 }
@@ -229,7 +229,10 @@ fn open_round_commits_before_returning_id_and_allocates_ordinals() {
         .unwrap();
     assert_eq!(app_element, "intent");
     assert_eq!(app_state, "applied");
-    assert_eq!(effective.as_deref(), Some(digest.as_str()));
+    assert_eq!(
+        effective.as_deref(),
+        Some(context_applicability_digest("intent", "present", inventory).as_str())
+    );
     let app_producer: String = conn
         .query_row(
             "SELECT producer_invocation_id FROM round_context_applications WHERE round_id = ?1",
@@ -321,4 +324,179 @@ fn content_blob_rejects_digest_that_does_not_hash_bytes() {
         .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(blobs, 0);
+}
+
+#[test]
+fn absent_and_present_empty_context_elements_differ() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv\n";
+
+    let mut bindings = sample_bindings(inventory);
+    let absent =
+        capture_context_element("path_instructions", ContextSource::Absent { reason: None });
+    let empty = capture_context_element("intent", ContextSource::Present { bytes: Vec::new() });
+    assert_eq!(absent.source_state, SourceState::Absent);
+    assert_eq!(empty.source_state, SourceState::Present);
+    assert_eq!(empty.snapshot_state, SnapshotState::Stored);
+    assert_eq!(empty.snapshot_bytes.as_deref(), Some(&[][..]));
+
+    bindings.context_elements = vec![absent, empty];
+    bindings.context_applications = vec![
+        ContextApplication {
+            element_name: "path_instructions".into(),
+            producer_slot: 0,
+            application: rounds::ContextApplicationState::NotApplied,
+            effective_digest: None,
+        },
+        ContextApplication {
+            element_name: "intent".into(),
+            producer_slot: 0,
+            application: rounds::ContextApplicationState::Applied,
+            effective_digest: Some(context_applicability_digest("intent", "present", &[])),
+        },
+    ];
+
+    let round_id = rounds::open_round(&db, &sample_plan(&run_id), &bindings).unwrap();
+    let elements = rounds::context_elements_for_round(&db, &round_id).unwrap();
+    let by_name: std::collections::BTreeMap<_, _> = elements
+        .into_iter()
+        .map(|e| (e.element_name.clone(), e))
+        .collect();
+
+    assert_eq!(
+        by_name["path_instructions"].source_state,
+        SourceState::Absent
+    );
+    assert_eq!(by_name["path_instructions"].snapshot_digest, None);
+    assert_eq!(by_name["intent"].source_state, SourceState::Present);
+    assert_eq!(by_name["intent"].snapshot_state, SnapshotState::Stored);
+    assert_eq!(by_name["intent"].snapshot_bytes.as_deref(), Some(&[][..]));
+
+    let loaded = rounds::get_round(&db, &round_id).unwrap().unwrap();
+    assert_eq!(loaded.intent_source.as_deref(), Some("flag"));
+    assert!(
+        !by_name.contains_key("intent_source"),
+        "intent_source must stay outside review-context elements"
+    );
+}
+
+#[test]
+fn oversized_context_element_omits_snapshot_keeps_digest_and_source() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-oversize\n";
+    let oversized = vec![b'x'; SNAPSHOT_CEILING_BYTES + 1];
+    let digest = sha256_hex(&oversized);
+
+    let element = capture_context_element(
+        "intent",
+        ContextSource::Present {
+            bytes: oversized.clone(),
+        },
+    );
+    assert_eq!(element.source_state, SourceState::Present);
+    assert_eq!(element.snapshot_state, SnapshotState::Omitted);
+    assert_eq!(element.snapshot_reason.as_deref(), Some("too_large"));
+    assert_eq!(element.snapshot_digest.as_deref(), Some(digest.as_str()));
+    assert!(element.snapshot_bytes.is_none());
+
+    let mut bindings = sample_bindings(inventory);
+    bindings.context_elements = vec![element];
+    bindings.context_applications = vec![ContextApplication {
+        element_name: "intent".into(),
+        producer_slot: 0,
+        application: rounds::ContextApplicationState::Applied,
+        effective_digest: Some(context_applicability_digest(
+            "intent", "present", &oversized,
+        )),
+    }];
+
+    let round_id = rounds::open_round(&db, &sample_plan(&run_id), &bindings).unwrap();
+    let elements = rounds::context_elements_for_round(&db, &round_id).unwrap();
+    assert_eq!(elements.len(), 1);
+    assert_eq!(elements[0].source_state, SourceState::Present);
+    assert_eq!(elements[0].snapshot_state, SnapshotState::Omitted);
+    assert_eq!(elements[0].snapshot_reason.as_deref(), Some("too_large"));
+    assert_eq!(
+        elements[0].snapshot_digest.as_deref(),
+        Some(digest.as_str())
+    );
+    assert!(elements[0].snapshot_bytes.is_none());
+
+    let conn = Connection::open(db_path(home)).unwrap();
+    let blob_hits: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM content_blobs WHERE digest = ?1",
+            [digest],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blob_hits, 0, "oversized snapshot must not store blob bytes");
+}
+
+#[test]
+fn unsupplied_context_element_is_not_applied_without_effective_digest() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-not-applied\n";
+    let intent_bytes = b"keep me";
+
+    let mut bindings = sample_bindings(inventory);
+    bindings.context_elements = vec![
+        capture_context_element(
+            "intent",
+            ContextSource::Present {
+                bytes: intent_bytes.to_vec(),
+            },
+        ),
+        capture_context_element(
+            "path_instructions",
+            ContextSource::Present {
+                bytes: b"paths".to_vec(),
+            },
+        ),
+    ];
+    bindings.context_applications = vec![
+        ContextApplication {
+            element_name: "intent".into(),
+            producer_slot: 0,
+            application: rounds::ContextApplicationState::Applied,
+            effective_digest: Some(context_applicability_digest(
+                "intent",
+                "present",
+                intent_bytes,
+            )),
+        },
+        ContextApplication {
+            element_name: "path_instructions".into(),
+            producer_slot: 0,
+            application: rounds::ContextApplicationState::NotApplied,
+            effective_digest: None,
+        },
+    ];
+
+    let round_id = rounds::open_round(&db, &sample_plan(&run_id), &bindings).unwrap();
+    let apps = rounds::context_applications_for_round(&db, &round_id).unwrap();
+    let by_element: std::collections::BTreeMap<_, _> = apps
+        .into_iter()
+        .map(|a| (a.element_name.clone(), a))
+        .collect();
+
+    assert_eq!(
+        by_element["intent"].application,
+        rounds::ContextApplicationState::Applied
+    );
+    assert!(by_element["intent"].effective_digest.is_some());
+    assert_eq!(
+        by_element["path_instructions"].application,
+        rounds::ContextApplicationState::NotApplied
+    );
+    assert_eq!(by_element["path_instructions"].effective_digest, None);
 }

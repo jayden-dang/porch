@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS review_rounds (
         CHECK (assurance_completion IN ('pending','complete','incomplete')),
     completion_reason TEXT,
     trusted_config_sha TEXT NOT NULL,
+    intent_source TEXT,
     protocol_schema_version INTEGER NOT NULL,
     fingerprint_version INTEGER NOT NULL,
     opened_at TEXT NOT NULL,
@@ -52,7 +53,7 @@ CREATE TABLE IF NOT EXISTS round_context_elements (
     source_reason TEXT,
     snapshot_state TEXT NOT NULL CHECK (snapshot_state IN ('stored','omitted')),
     snapshot_reason TEXT,
-    snapshot_digest TEXT REFERENCES content_blobs(digest),
+    snapshot_digest TEXT,
     PRIMARY KEY (round_id, element_name)
 );
 
@@ -122,5 +123,6 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     conn.execute_batch(ROUND_DDL)?;
+    ensure_column(conn, "review_rounds", "intent_source", "TEXT")?;
     Ok(())
 }
