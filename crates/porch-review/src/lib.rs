@@ -4,6 +4,7 @@
 //! (wrapper write/verify). Gate must not depend on this crate.
 
 mod agent_review;
+mod coverage_state;
 mod engine;
 mod home_config;
 mod identity;
@@ -24,6 +25,9 @@ pub use agent_review::{
     REVIEW_AGENT_BIN_ENV, REVIEW_ARTIFACT_REL, REVIEWER_PROMPT, RunAgentReviewOpts,
     agent_review_bin, assert_prompt_under_home, build_reviewer_prompt, parse_agent_review_json,
     review_uses_agent, run_agent_review, write_reviewer_prompt,
+};
+pub use coverage_state::{
+    CoverageEntry, CoverageState, PathSignal, ProducerOutput, StatusRow, derive_states,
 };
 pub use engine::{
     AGENT_DETECT_BINS, DetectedEngine, EngineKind, agent_detect_bins, known_engines, wrapper_script,
@@ -174,10 +178,16 @@ pub struct ReviewGroup {
 }
 
 /// One OCR manifest coverage item.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct CoverageItem {
     #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub authority: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<String>,
 }
 
 /// OCR coverage sets (optional).
@@ -441,6 +451,19 @@ pub fn assert_coverage(changed: &[String], covered: &[String]) -> Result<(), Err
         }
     }
     Ok(())
+}
+
+/// Derive structured coverage states for `changed`, then fail closed on shortfall.
+///
+/// # Errors
+///
+/// Returns [`Error::Coverage`] when a changed path lacks a producer claim, or
+/// [`Error::Msg`] when a failed/waived/completed signal omits required fields.
+pub fn assert_coverage_states(
+    changed: &[String],
+    output: &ProducerOutput,
+) -> Result<Vec<CoverageEntry>, Error> {
+    derive_states(changed, output)
 }
 
 /// Options for one range-review invocation.
