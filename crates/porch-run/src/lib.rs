@@ -292,6 +292,12 @@ fn run_review_phase(
     let changed = porch_git::diff_name_only(wt, &range)?;
 
     let opened = open_review_round(db, home, bare, &run, run_id, &from_sha, &head, &changed)?;
+    if let Some(reason) = opened.unsatisfied_floor.as_ref() {
+        finalize_incomplete(db, &opened.round_id, "floor_unresolved")?;
+        return Err(RunError::Review(porch_review::Error::FloorUnresolved {
+            reason: reason.clone(),
+        }));
+    }
     let spawned = spawn_review_for_round(
         db,
         &SpawnReviewCtx {
@@ -326,6 +332,7 @@ struct OpenedSlot {
 struct OpenedRound {
     round_id: RoundId,
     slots: Vec<OpenedSlot>,
+    unsatisfied_floor: Option<String>,
 }
 
 struct SpawnedReview {
@@ -349,24 +356,48 @@ fn engine_is_quality(home: &Path) -> bool {
         == Some(EngineKind::Quality)
 }
 
+enum ComposedRound {
+    Prepared(Vec<PreparedInvocation>),
+    FloorUnresolved { reason: String },
+}
+
 fn compose_prepared_invocations(
     home: &Path,
     intent: Option<&[u8]>,
     path_instructions: Option<&[u8]>,
-) -> Result<Vec<PreparedInvocation>> {
-    let floor = porch_review::floor::resolve()?;
-    let mut prepared = vec![floor];
-    if !engine_is_quality(home) {
-        prepared.push(prepare(&PrepareOpts {
-            porch_home: Some(home),
-            review_bin: None,
-            agent_bin: None,
-            prefer_agent: None,
-            intent,
-            path_instructions,
-        })?);
+) -> Result<ComposedRound> {
+    match porch_review::floor::resolve() {
+        Ok(floor) => {
+            let mut prepared = vec![floor];
+            if !engine_is_quality(home) {
+                prepared.push(prepare(&PrepareOpts {
+                    porch_home: Some(home),
+                    review_bin: None,
+                    agent_bin: None,
+                    prefer_agent: None,
+                    intent,
+                    path_instructions,
+                })?);
+            }
+            Ok(ComposedRound::Prepared(prepared))
+        }
+        Err(porch_review::Error::FloorUnresolved { reason }) => {
+            Ok(ComposedRound::FloorUnresolved { reason })
+        }
+        Err(e) => Ok(ComposedRound::FloorUnresolved {
+            reason: e.to_string(),
+        }),
     }
-    Ok(prepared)
+}
+
+fn unresolved_floor_requirement(reason: String) -> RequirementSpec {
+    RequirementSpec {
+        slot: 0,
+        role: Role::Floor,
+        resolution: Resolution::Unresolved,
+        expected_equivalence_digest: None,
+        reason: Some(reason),
+    }
 }
 
 fn producer_invocation(desc: &ProducerDescriptor) -> Result<ProducerInvocation> {
@@ -427,7 +458,7 @@ fn open_review_round(
         None
     };
 
-    let prepared = compose_prepared_invocations(
+    let composed = compose_prepared_invocations(
         home,
         intent_bytes.as_deref(),
         path_instructions_bytes.as_deref(),
@@ -463,8 +494,10 @@ fn open_review_round(
         ),
     ];
     let mut context_applications = Vec::new();
-    for (slot, inv) in prepared.iter().enumerate() {
-        context_applications.extend(applications_for_prepared(slot, inv));
+    if let ComposedRound::Prepared(prepared) = &composed {
+        for (slot, inv) in prepared.iter().enumerate() {
+            context_applications.extend(applications_for_prepared(slot, inv));
+        }
     }
 
     let mut bindings = rounds::RoundBindings {
@@ -484,19 +517,36 @@ fn open_review_round(
         bindings.inventory_digest = sha256_hex(b"porch-test-fail-round-open");
     }
 
-    let mut producers = Vec::with_capacity(prepared.len());
-    let mut requirements = Vec::with_capacity(prepared.len());
-    for (i, inv) in prepared.iter().enumerate() {
-        let slot =
-            i64::try_from(i).map_err(|_| RunError::Msg("producer slot exceeds i64".into()))?;
-        let role = if i == 0 { Role::Floor } else { Role::Judgment };
-        producers.push(producer_invocation(&inv.plan.descriptor)?);
-        requirements.push(resolved_requirement(slot, role, &inv.plan.descriptor));
-    }
-    let open_plan = OpenRoundPlan {
-        run_id: run_id.to_string(),
-        producers,
-        requirements,
+    let (open_plan, prepared, unsatisfied_floor) = match composed {
+        ComposedRound::FloorUnresolved { reason } => (
+            OpenRoundPlan {
+                run_id: run_id.to_string(),
+                producers: Vec::new(),
+                requirements: vec![unresolved_floor_requirement(reason.clone())],
+            },
+            Vec::new(),
+            Some(reason),
+        ),
+        ComposedRound::Prepared(prepared) => {
+            let mut producers = Vec::with_capacity(prepared.len());
+            let mut requirements = Vec::with_capacity(prepared.len());
+            for (i, inv) in prepared.iter().enumerate() {
+                let slot = i64::try_from(i)
+                    .map_err(|_| RunError::Msg("producer slot exceeds i64".into()))?;
+                let role = if i == 0 { Role::Floor } else { Role::Judgment };
+                producers.push(producer_invocation(&inv.plan.descriptor)?);
+                requirements.push(resolved_requirement(slot, role, &inv.plan.descriptor));
+            }
+            (
+                OpenRoundPlan {
+                    run_id: run_id.to_string(),
+                    producers,
+                    requirements,
+                },
+                prepared,
+                None,
+            )
+        }
     };
 
     let round_id = rounds::open_round(db, &open_plan, &bindings).map_err(|e| {
@@ -504,6 +554,13 @@ fn open_review_round(
             "failed to open review round before producer spawn: {e}"
         ))
     })?;
+    if unsatisfied_floor.is_some() {
+        return Ok(OpenedRound {
+            round_id,
+            slots: Vec::new(),
+            unsatisfied_floor,
+        });
+    }
     if std::env::var_os("PORCH_TEST_ABORT_AFTER_ROUND_OPEN").is_some() {
         return Err(RunError::Msg("test abort after round open".into()));
     }
@@ -523,7 +580,11 @@ fn open_review_round(
             plan: inv.plan.clone(),
         });
     }
-    Ok(OpenedRound { round_id, slots })
+    Ok(OpenedRound {
+        round_id,
+        slots,
+        unsatisfied_floor,
+    })
 }
 
 struct SpawnReviewCtx<'a> {
@@ -543,8 +604,13 @@ fn map_spawn_err(e: porch_review::Error) -> RunError {
     }
 }
 
-fn abort_slot(db: &Db, round_id: &RoundId, err: porch_review::Error) -> Result<SpawnedReview> {
-    finalize_incomplete(db, round_id, incomplete_reason(&err))?;
+fn abort_slot(
+    db: &Db,
+    round_id: &RoundId,
+    err: porch_review::Error,
+    role: Role,
+) -> Result<SpawnedReview> {
+    finalize_incomplete(db, round_id, incomplete_reason(&err, role))?;
     Err(map_spawn_err(err))
 }
 
@@ -593,9 +659,14 @@ fn spawn_review_for_round(db: &Db, ctx: &SpawnReviewCtx<'_>) -> Result<SpawnedRe
     let opened = ctx.opened;
     let mut findings = Vec::new();
     let mut coverage = Vec::new();
-    for slot in &opened.slots {
+    for (index, slot) in opened.slots.iter().enumerate() {
+        let role = if index == 0 {
+            Role::Floor
+        } else {
+            Role::Judgment
+        };
         if let Err(e) = check_artifacts_stable(&slot.plan) {
-            return abort_slot(db, &opened.round_id, e);
+            return abort_slot(db, &opened.round_id, e, role);
         }
         let spawn_result = run_review(&RunReviewOpts {
             work_tree: ctx.wt,
@@ -619,9 +690,9 @@ fn spawn_review_for_round(db: &Db, ctx: &SpawnReviewCtx<'_>) -> Result<SpawnedRe
                         findings.push((slot.producer_invocation_id.clone(), finding));
                     }
                 }
-                Err(e) => return abort_slot(db, &opened.round_id, e),
+                Err(e) => return abort_slot(db, &opened.round_id, e, role),
             },
-            Err(e) => return abort_slot(db, &opened.round_id, e),
+            Err(e) => return abort_slot(db, &opened.round_id, e, role),
         }
     }
     if std::env::var_os("PORCH_TEST_ABORT_BEFORE_ROUND_FINALIZE").is_some() {
@@ -630,12 +701,18 @@ fn spawn_review_for_round(db: &Db, ctx: &SpawnReviewCtx<'_>) -> Result<SpawnedRe
     Ok(SpawnedReview { findings, coverage })
 }
 
-fn incomplete_reason(err: &porch_review::Error) -> &'static str {
-    match err {
-        porch_review::Error::Timeout(_) => "producer_timeout",
-        porch_review::Error::Exit { .. } => "producer_exit",
-        porch_review::Error::Coverage(_) => "coverage_shortfall",
-        porch_review::Error::ProducerArtifactChanged => "producer_artifact_changed",
+fn incomplete_reason(err: &porch_review::Error, role: Role) -> &'static str {
+    match (role, err) {
+        (Role::Floor, porch_review::Error::Timeout(_)) => "floor_timeout",
+        (Role::Floor, porch_review::Error::Exit { .. }) => "floor_exit",
+        (Role::Floor, porch_review::Error::Coverage(_)) => "floor_coverage_shortfall",
+        (Role::Floor, porch_review::Error::ProducerArtifactChanged) => "floor_artifact_changed",
+        (Role::Floor, porch_review::Error::FloorUnresolved { .. }) => "floor_unresolved",
+        (Role::Floor, _) => "floor_malformed_output",
+        (_, porch_review::Error::Timeout(_)) => "producer_timeout",
+        (_, porch_review::Error::Exit { .. }) => "producer_exit",
+        (_, porch_review::Error::Coverage(_)) => "coverage_shortfall",
+        (_, porch_review::Error::ProducerArtifactChanged) => "producer_artifact_changed",
         _ => "malformed_output",
     }
 }

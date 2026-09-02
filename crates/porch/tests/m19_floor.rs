@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use porch_deliver::GH_BIN_ENV;
-use porch_gate::rounds::{self, Resolution, Role};
+use porch_gate::rounds::{self, AssuranceCompletion, ExecutionState, Resolution, Role};
 use porch_gate::{Db, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_AGENT_BIN_ENV;
@@ -191,6 +191,23 @@ done
 COV_JSON="$COV_JSON]"
 MODE="{mode}"
 case "$MODE" in
+  hang)
+    while true; do /bin/sleep 60; done
+    ;;
+  exit-fail)
+    echo "forced floor failure" >&2
+    exit 3
+    ;;
+  malformed)
+    printf 'this-is-not-json\n' > "$OUT"
+    ;;
+  missing-file)
+    printf '{{"comments":[],"files":[]}}\n' > "$OUT"
+    ;;
+  unstable)
+    printf '{{"comments":[],"files":%s,"coverage":%s}}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
+    printf 'x' >> "$0"
+    ;;
   blocking)
     TARGET=$(printf '%s\n' $FILES | head -n1)
     if [ -z "$TARGET" ]; then TARGET="README"; fi
@@ -224,9 +241,12 @@ struct Harness {
     _tmp: TempDir,
     work: PathBuf,
     home: PathBuf,
+    origin: PathBuf,
+    install: PathBuf,
+    path: String,
 }
 
-fn seed_origin_and_work(root: &Path) -> PathBuf {
+fn seed_origin_and_work(root: &Path) -> (PathBuf, PathBuf) {
     let origin = root.join("origin.git");
     let work = root.join("work");
     init_bare(&origin).unwrap();
@@ -253,10 +273,14 @@ fn seed_origin_and_work(root: &Path) -> PathBuf {
     let work = work.canonicalize().unwrap();
     git(&work, &["config", "user.email", "porch@example.com"]);
     git(&work, &["config", "user.name", "Porch"]);
-    work
+    (origin, work)
 }
 
 fn setup_engine(engine: &str, floor_mode: &str) -> Harness {
+    setup_with(engine, floor_mode, "10")
+}
+
+fn setup_with(engine: &str, floor_mode: &str, review_timeout: &str) -> Harness {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let home = root.join("home");
@@ -266,7 +290,11 @@ fn setup_engine(engine: &str, floor_mode: &str) -> Harness {
     fs::create_dir_all(&bin).unwrap();
 
     let porch_bin = copy_porch_launch(&install);
-    install_fake_floor(&install, floor_mode);
+    if floor_mode == "missing" {
+        install_fake_floor(&bin, "clean");
+    } else {
+        install_fake_floor(&install, floor_mode);
+    }
     let fake_gh = install_noop_gh(&bin);
     let fake_agent = if engine == "agent" {
         Some(install_fake_claude(&bin))
@@ -274,7 +302,7 @@ fn setup_engine(engine: &str, floor_mode: &str) -> Harness {
         None
     };
     let path = format!("{}:{}", install.display(), path_with(&bin));
-    let work = seed_origin_and_work(&root);
+    let (origin, work) = seed_origin_and_work(&root);
 
     Command::cargo_bin("porch")
         .unwrap()
@@ -302,7 +330,7 @@ fn setup_engine(engine: &str, floor_mode: &str) -> Harness {
     init.assert().success();
 
     kill_daemon(&home);
-    let timeout: &std::ffi::OsStr = "10".as_ref();
+    let timeout: &std::ffi::OsStr = review_timeout.as_ref();
     let mut extra: Vec<(&str, &std::ffi::OsStr)> = vec![
         (GH_BIN_ENV, fake_gh.as_os_str()),
         ("PATH", path.as_ref()),
@@ -318,6 +346,9 @@ fn setup_engine(engine: &str, floor_mode: &str) -> Harness {
         _tmp: tmp,
         work,
         home,
+        origin,
+        install,
+        path,
     }
 }
 
@@ -350,6 +381,45 @@ fn recorded_requirements(db: &Db, run_id: &str) -> Vec<porch_gate::rounds::Requi
     let rounds = rounds::rounds_for_run(db, run_id).unwrap();
     assert_eq!(rounds.len(), 1, "expected one round, got {rounds:?}");
     rounds::requirements_for_round(db, &rounds[0].id).unwrap()
+}
+
+fn origin_has_branch(origin: &Path, branch: &str) -> bool {
+    let out = StdCommand::new("git")
+        .args([
+            "--git-dir",
+            origin.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .status()
+        .unwrap();
+    out.success()
+}
+
+fn assert_failed_closed(db: &Db, run: &porch_gate::RunRow) {
+    assert_eq!(run.status, "failed", "err={:?}", run.error);
+    let steps = db.step_results_for_run(&run.id).unwrap();
+    assert!(
+        steps.iter().all(|s| s.status != "parked"),
+        "unsatisfied floor must not park: {steps:?}"
+    );
+    assert!(run.review_approved_head_sha.is_none(), "run={run:?}");
+}
+
+fn assert_incomplete_naming_floor(db: &Db, run_id: &str) -> porch_gate::rounds::RoundRecord {
+    let rounds = rounds::rounds_for_run(db, run_id).unwrap();
+    assert_eq!(rounds.len(), 1, "expected one round, got {rounds:?}");
+    let round = rounds[0].clone();
+    assert_eq!(round.execution, ExecutionState::Finished);
+    assert_eq!(round.assurance_completion, AssuranceCompletion::Incomplete);
+    let reason = round.completion_reason.as_deref().unwrap_or("");
+    assert!(
+        reason.contains("floor"),
+        "completion reason must name the floor, got {reason:?}"
+    );
+    round
 }
 
 #[test]
@@ -534,6 +604,204 @@ fn judgment_context_applications_exclude_floor_output() {
             .iter()
             .all(|a| a.element_name != "floor-output" && !a.element_name.contains("floor")),
         "judgment context must not include floor output: {judgment_apps:?}"
+    );
+
+    kill_daemon(&h.home);
+}
+
+#[test]
+fn unresolvable_floor_finalizes_incomplete_and_fails_closed() {
+    let h = setup_quality("missing");
+    let branch = "feat-floor-unresolved";
+    push_branch(&h.work, &h.home, branch);
+
+    let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&h.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed", "completed"],
+        Duration::from_secs(20),
+    );
+    assert_failed_closed(&db, &run);
+    let round = assert_incomplete_naming_floor(&db, &run.id);
+    let reqs = rounds::requirements_for_round(&db, &round.id).unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "expected the floor requirement, got {reqs:?}"
+    );
+    assert_eq!(reqs[0].role, Role::Floor);
+    assert_eq!(reqs[0].resolution, Resolution::Unresolved);
+    assert!(reqs[0].producer_invocation_id.is_none());
+    assert!(reqs[0].expected_equivalence_digest.is_none());
+    assert!(
+        reqs[0]
+            .reason
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty()),
+        "unresolved row must carry a reason, got {:?}",
+        reqs[0].reason
+    );
+
+    let order = fs::read_to_string(h.home.join("producer-order")).unwrap_or_default();
+    assert!(
+        !order.lines().any(|l| l == "judgment-start"),
+        "unresolved floor must not spawn judgment, order={order}"
+    );
+
+    kill_daemon(&h.home);
+}
+
+#[test]
+fn floor_operational_faults_finalize_incomplete_and_skip_judgment() {
+    let cases = [
+        ("hang", "feat-floor-timeout", "2"),
+        ("exit-fail", "feat-floor-exit", "10"),
+        ("malformed", "feat-floor-malformed", "10"),
+        ("missing-file", "feat-floor-coverage", "10"),
+        ("unstable", "feat-floor-artifact", "10"),
+    ];
+    for (mode, branch, timeout) in cases {
+        let h = setup_with("agent", mode, timeout);
+        push_branch(&h.work, &h.home, branch);
+
+        let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+        let repo_id = repo_id_for(&h.work);
+        let run = wait_status(
+            &db,
+            &repo_id,
+            &["parked", "failed", "completed"],
+            Duration::from_secs(25),
+        );
+        assert_failed_closed(&db, &run);
+        assert_incomplete_naming_floor(&db, &run.id);
+
+        let order = fs::read_to_string(h.home.join("producer-order")).unwrap_or_default();
+        assert!(
+            !order.lines().any(|l| l == "judgment-start"),
+            "{mode}: judgment must not spawn after floor fault, order={order}"
+        );
+
+        kill_daemon(&h.home);
+    }
+}
+
+#[test]
+fn unsatisfied_floor_keeps_records_and_does_not_forward() {
+    let h = setup_quality("missing");
+    let branch = "feat-floor-no-forward";
+    push_branch(&h.work, &h.home, branch);
+
+    let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&h.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed", "completed"],
+        Duration::from_secs(20),
+    );
+    assert_failed_closed(&db, &run);
+    assert_incomplete_naming_floor(&db, &run.id);
+
+    let reread = db
+        .run_by_id(&run.id)
+        .unwrap()
+        .expect("failed run must remain");
+    assert_eq!(reread.status, "failed");
+    assert_eq!(reread.id, run.id);
+    assert!(
+        !origin_has_branch(&h.origin, branch),
+        "unsatisfied floor must not forward {branch}"
+    );
+    assert!(
+        !h.home.join("gh-pr-state").exists(),
+        "unsatisfied floor must not open a pull request"
+    );
+
+    kill_daemon(&h.home);
+}
+
+#[test]
+fn rerun_after_unsatisfied_floor_starts_independent_run() {
+    let h = setup_quality("missing");
+    let branch = "feat-floor-rerun";
+    push_branch(&h.work, &h.home, branch);
+
+    let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&h.work);
+    let first = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed", "completed"],
+        Duration::from_secs(20),
+    );
+    assert_failed_closed(&db, &first);
+    assert_incomplete_naming_floor(&db, &first.id);
+    let first_id = first.id.clone();
+
+    install_fake_floor(&h.install, "clean");
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .env("PATH", &h.path)
+        .args(["rerun", "--run-id", &first_id])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("rerun started:"),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let start = Instant::now();
+    let second = loop {
+        let runs = db.runs_for_repo(&repo_id).unwrap();
+        if let Some(run) = runs.iter().rev().find(|r| r.id != first_id) {
+            if matches!(
+                run.status.as_str(),
+                "completed" | "failed" | "parked" | "cancelled"
+            ) {
+                break run.clone();
+            }
+        }
+        assert!(
+            start.elapsed() <= Duration::from_secs(30),
+            "rerun did not finish: {:?}",
+            db.runs_for_repo(&repo_id).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_ne!(second.id, first_id);
+    assert_ne!(second.status, "failed", "err={:?}", second.error);
+
+    let first_again = db.run_by_id(&first_id).unwrap().expect("prior run");
+    assert_eq!(first_again.status, "failed");
+    assert!(first_again.review_approved_head_sha.is_none());
+    assert_incomplete_naming_floor(&db, &first_id);
+
+    let reqs = recorded_requirements(&db, &second.id);
+    assert_eq!(
+        reqs.len(),
+        1,
+        "expected floor alone on the new run, got {reqs:?}"
+    );
+    assert_eq!(reqs[0].role, Role::Floor);
+    assert_eq!(reqs[0].resolution, Resolution::Resolved);
+    assert!(reqs[0].producer_invocation_id.is_some());
+    assert!(
+        second
+            .review_approved_head_sha
+            .as_ref()
+            .is_some_and(|s| !s.is_empty()),
+        "new run must authorize independently: {second:?}"
     );
 
     kill_daemon(&h.home);
