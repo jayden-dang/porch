@@ -5,7 +5,7 @@
 > `Execution-mode:`.
 
 Feature code: FLOOR
-Status: In-progress
+Status: Implemented
 Date: 2026-09-02
 Execution-mode: continuous
 Max-concurrency: auto
@@ -86,16 +86,16 @@ DB-resident compatibility fence. `porch-review` gains a `floor` resolver that re
 
 **Depends-on:** none
 
-- [ ] Test: a resolved row without an invocation reference or without a digest is rejected by the
+- [x] Test: a resolved row without an invocation reference or without a digest is rejected by the
       table; an unresolved row carrying either, or with a blank reason, is rejected.
-- [ ] Test: requirement rows are written inside `open_round`'s transaction — a forced failure
+- [x] Test: requirement rows are written inside `open_round`'s transaction — a forced failure
       leaves no round and no requirement rows.
-- [ ] Test: the digest changes when a slot's role, resolution, or expected digest changes, and does
+- [x] Test: the digest changes when a slot's role, resolution, or expected digest changes, and does
       **not** change when only `resolution_reason` changes.
-- [ ] Run `cargo test -p porch-gate --test m18_rounds` — expect failures on missing table and API.
-- [ ] Implement the table with its CHECK and composite FK, the row types, and the
+- [x] Run `cargo test -p porch-gate --test m18_rounds` — expect failures on missing table and API.
+- [x] Implement the table with its CHECK and composite FK, the row types, and the
       domain-separated length-delimited digest preimage.
-- [ ] Run tests; expect pass. Commit: `feat(porch-gate): record the required producer set per round`
+- [x] Run tests; expect pass. Commit: `feat(porch-gate): record the required producer set per round`
 
 _Requirements: FLOOR-2.1, FLOOR-2.2, FLOOR-2.3, FLOOR-2.4, FLOOR-2.9, FLOOR-5.1, FLOOR-9.3_
 
@@ -118,18 +118,18 @@ _Requirements: FLOOR-2.1, FLOOR-2.2, FLOOR-2.3, FLOOR-2.4, FLOOR-2.9, FLOOR-5.1,
 
 **Depends-on:** none
 
-- [ ] Test: with `PORCH_REVIEW_BIN`, `PORCH_REVIEW_AGENT_BIN`, `review.bin`, and a hostile
+- [x] Test: with `PORCH_REVIEW_BIN`, `PORCH_REVIEW_AGENT_BIN`, `review.bin`, and a hostile
       `$PORCH_HOME/bin/review` all pointing at a substitute executable, the resolved target is
       still the canonical sibling.
-- [ ] Test: a symlinked launch path resolves to the same canonical target on both invocations.
-- [ ] Test: when no executable sibling exists the call returns an unresolved outcome with a reason
+- [x] Test: a symlinked launch path resolves to the same canonical target on both invocations.
+- [x] Test: when no executable sibling exists the call returns an unresolved outcome with a reason
       and performs no PATH lookup.
-- [ ] Test: the recorded canonical path and the content-derived equivalence identity stay
+- [x] Test: the recorded canonical path and the content-derived equivalence identity stay
       consistent, and a replaced artifact fails the pre-spawn stability check.
-- [ ] Run `cargo test -p porch-review` — expect failure on the missing module.
-- [ ] Implement sibling derivation with the platform executable suffix, artifact observation and
+- [x] Run `cargo test -p porch-review` — expect failure on the missing module.
+- [x] Implement sibling derivation with the platform executable suffix, artifact observation and
       stamping, and a test-only injection seam that is absent from production builds.
-- [ ] Run tests; expect pass. Commit: `feat(porch-review): resolve the mandatory floor as a sibling`
+- [x] Run tests; expect pass. Commit: `feat(porch-review): resolve the mandatory floor as a sibling`
 
 _Requirements: FLOOR-1.2, FLOOR-4.1, FLOOR-4.2, FLOOR-4.3, FLOOR-4.4, FLOOR-4.5, FLOOR-8.10, FLOOR-8.11, FLOOR-9.2_
 
@@ -152,16 +152,16 @@ _Requirements: FLOOR-1.2, FLOOR-4.1, FLOOR-4.2, FLOOR-4.3, FLOOR-4.4, FLOOR-4.5,
 
 **Depends-on:** Task 1, Task 2
 
-- [ ] Test: on `engine: agent`, one round records a resolved floor requirement and a resolved
+- [x] Test: on `engine: agent`, one round records a resolved floor requirement and a resolved
       judgment requirement, and the floor's invocation finishes before the judgment spawn starts.
-- [ ] Test: on `engine: quality`, the round records the floor alone and still forwards.
-- [ ] Test: a floor result carrying blocking findings still runs the judgment producer, and the
+- [x] Test: on `engine: quality`, the round records the floor alone and still forwards.
+- [x] Test: a floor result carrying blocking findings still runs the judgment producer, and the
       run parks on the merged findings.
-- [ ] Test: the judgment producer's recorded context applications contain no floor-output element.
-- [ ] Run `cargo test -p porch --test m19_floor` — expect failure on single-producer composition.
-- [ ] Implement composition, the sequential spawn, and per-slot context application; update the
+- [x] Test: the judgment producer's recorded context applications contain no floor-output element.
+- [x] Run `cargo test -p porch --test m19_floor` — expect failure on single-producer composition.
+- [x] Implement composition, the sequential spawn, and per-slot context application; update the
       three existing suites that assert one review spawn per phase.
-- [ ] Run tests; expect pass. Commit: `feat(porch-run): compose the floor with the judgment layer`
+- [x] Run tests; expect pass. Commit: `feat(porch-run): compose the floor with the judgment layer`
 
 _Requirements: FLOOR-1.1, FLOOR-1.3, FLOOR-1.4, FLOOR-1.5, FLOOR-1.6, FLOOR-1.7, FLOOR-1.8, FLOOR-8.12, FLOOR-8.13, FLOOR-8.14_
 
@@ -182,17 +182,17 @@ _Requirements: FLOOR-1.1, FLOOR-1.3, FLOOR-1.4, FLOOR-1.5, FLOOR-1.6, FLOOR-1.7,
 
 **Depends-on:** Task 1
 
-- [ ] Test: a round whose producers no longer correspond one-to-one with its resolved requirements
+- [x] Test: a round whose producers no longer correspond one-to-one with its resolved requirements
       is not applicable, in both directions of the mismatch.
-- [ ] Test: a requirement whose `expected_equivalence_digest` differs from the referenced
+- [x] Test: a requirement whose `expected_equivalence_digest` differs from the referenced
       invocation's recorded digest is not applicable, even though the FK is satisfied.
-- [ ] Test: any unresolved requirement, and a round with zero requirement rows, never authorize.
-- [ ] Test: rounds differing only in selection source or declared engine kind stay applicable, and
+- [x] Test: any unresolved requirement, and a round with zero requirement rows, never authorize.
+- [x] Test: rounds differing only in selection source or declared engine kind stay applicable, and
       an unavailable producer version still never establishes equivalence.
-- [ ] Run `cargo test -p porch-gate --test m18_rounds` — expect failure while the required set is
+- [x] Run `cargo test -p porch-gate --test m18_rounds` — expect failure while the required set is
       still reconstructed.
-- [ ] Implement the recorded-set comparison, deleting the derivation in `decision_bindings_for_run`.
-- [ ] Run tests; expect pass. Commit: `fix(porch-gate): authorize from the recorded required set`
+- [x] Implement the recorded-set comparison, deleting the derivation in `decision_bindings_for_run`.
+- [x] Run tests; expect pass. Commit: `fix(porch-gate): authorize from the recorded required set`
 
 _Requirements: FLOOR-2.5, FLOOR-2.6, FLOOR-2.7, FLOOR-2.8, FLOOR-8.5, FLOOR-8.6, FLOOR-9.5_
 
@@ -213,16 +213,16 @@ _Requirements: FLOOR-2.5, FLOOR-2.6, FLOOR-2.7, FLOOR-2.8, FLOOR-8.5, FLOOR-8.6,
 
 **Depends-on:** Task 3
 
-- [ ] Test: an unresolvable floor finalizes the round `incomplete` with a reason naming the floor,
+- [x] Test: an unresolvable floor finalizes the round `incomplete` with a reason naming the floor,
       fails the run, and leaves it in no parked phase.
-- [ ] Test: floor timeout, non-zero exit, malformed output, coverage shortfall, and artifact
+- [x] Test: floor timeout, non-zero exit, malformed output, coverage shortfall, and artifact
       instability each finalize `incomplete` and never spawn the judgment producer.
-- [ ] Test: the failed run and its round survive as readable records, and no branch is forwarded.
-- [ ] Test: `porch rerun --run-id` on that run starts a new run that independently resolves the
+- [x] Test: the failed run and its round survive as readable records, and no branch is forwarded.
+- [x] Test: `porch rerun --run-id` on that run starts a new run that independently resolves the
       floor and carries no approval state forward.
-- [ ] Run `cargo test -p porch --test m19_floor` — expect failure.
-- [ ] Implement the terminal mapping and the fail-closed forward guard.
-- [ ] Run tests; expect pass. Commit: `feat(porch-run): fail closed when the floor is unsatisfiable`
+- [x] Run `cargo test -p porch --test m19_floor` — expect failure.
+- [x] Implement the terminal mapping and the fail-closed forward guard.
+- [x] Run tests; expect pass. Commit: `feat(porch-run): fail closed when the floor is unsatisfiable`
 
 _Requirements: FLOOR-3.1, FLOOR-3.2, FLOOR-3.3, FLOOR-3.5, FLOOR-3.8, FLOOR-3.9, FLOOR-8.22_
 
@@ -245,18 +245,18 @@ _Requirements: FLOOR-3.1, FLOOR-3.2, FLOOR-3.3, FLOOR-3.5, FLOOR-3.8, FLOOR-3.9,
 
 **Depends-on:** Task 1, Task 3
 
-- [ ] Test: the pin is set with the first round in one transaction; a forced failure leaves neither.
-- [ ] Test: a second round whose required-set digest matches proceeds; one that differs fails the
+- [x] Test: the pin is set with the first round in one transaction; a forced failure leaves neither.
+- [x] Test: a second round whose required-set digest matches proceeds; one that differs fails the
       run **before** `open_round`, creating no round.
-- [ ] Test: a mismatch is recorded on the run's `review` step with both the pinned and attempted
+- [x] Test: a mismatch is recorded on the run's `review` step with both the pinned and attempted
       digests and shapes, and strengthening is rejected exactly like weakening.
-- [ ] Test: a changed producer artifact identity is a mismatch even with unchanged configuration,
+- [x] Test: a changed producer artifact identity is a mismatch even with unchanged configuration,
       and a missing judgment producer is `incomplete` rather than a floor-only round.
-- [ ] Run `cargo test -p porch-gate --test m18_rounds` then `cargo test -p porch --test m19_floor`
+- [x] Run `cargo test -p porch-gate --test m18_rounds` then `cargo test -p porch --test m19_floor`
       — expect failure (one `--test` per package; cargo rejects a combined `-p`/`--test` set).
-- [ ] Implement the column, the `IS NULL`-guarded pin write, the pre-open comparison, and the
+- [x] Implement the column, the `IS NULL`-guarded pin write, the pre-open comparison, and the
       mismatch payload.
-- [ ] Run tests; expect pass. Commit: `feat(porch): pin the run assurance contract at first round`
+- [x] Run tests; expect pass. Commit: `feat(porch): pin the run assurance contract at first round`
 
 _Requirements: FLOOR-5.2, FLOOR-5.3, FLOOR-5.4, FLOOR-5.5, FLOOR-5.6, FLOOR-5.7, FLOOR-5.8_
 
@@ -277,18 +277,18 @@ _Requirements: FLOOR-5.2, FLOOR-5.3, FLOOR-5.4, FLOOR-5.5, FLOOR-5.6, FLOOR-5.7,
 
 **Depends-on:** Task 4
 
-- [ ] Test: rounds opened by this feature record protocol version 2; a version-1 round is never
+- [x] Test: rounds opened by this feature record protocol version 2; a version-1 round is never
       applicable and is left byte-for-byte unchanged with no requirement rows invented.
-- [ ] Test: a round recording a version above the one understood fails closed.
-- [ ] Test: opening an older database applies the additive tables and columns and leaves existing
+- [x] Test: a round recording a version above the one understood fails closed.
+- [x] Test: opening an older database applies the additive tables and columns and leaves existing
       rows readable; invocation rows keep non-null descriptor and digest; a second round still
       allocates ordinal 2 under an immediate transaction.
-- [ ] Test: finalization writes coverage, instances, terminal state and durations in one
+- [x] Test: finalization writes coverage, instances, terminal state and durations in one
       transaction or none, yields `Stale` on a changed revision, and per-producer plus total
       durations are readable afterwards.
-- [ ] Run `cargo test -p porch-gate --test m18_rounds` — expect failure.
-- [ ] Implement the version gate, the duration tables, and the finalization writes.
-- [ ] Run tests; expect pass. Commit: `feat(porch-gate): protocol 2 rounds with recorded durations`
+- [x] Run `cargo test -p porch-gate --test m18_rounds` — expect failure.
+- [x] Implement the version gate, the duration tables, and the finalization writes.
+- [x] Run tests; expect pass. Commit: `feat(porch-gate): protocol 2 rounds with recorded durations`
 
 _Requirements: FLOOR-6.1, FLOOR-6.2, FLOOR-6.3, FLOOR-8.1, FLOOR-8.2, FLOOR-8.3, FLOOR-8.4, FLOOR-8.7, FLOOR-8.9, FLOOR-9.1, FLOOR-9.4_
 
@@ -309,19 +309,19 @@ feature in `Cargo.toml`)
 
 **Depends-on:** Task 6, Task 7
 
-- [ ] Test: a connection without the registered function cannot insert a run and cannot write an
+- [x] Test: a connection without the registered function cannot insert a run and cannot write an
       approval; a registered connection can do both.
-- [ ] Test: the upgrade transaction installs marker and triggers, fails active legacy runs, and
+- [x] Test: the upgrade transaction installs marker and triggers, fails active legacy runs, and
       clears their undelivered approvals — all present or all absent after a forced mid-upgrade
       failure — and re-running it changes nothing.
-- [ ] Test: contending-run listing still counts only pending, running, and parked; daemon startup
+- [x] Test: contending-run listing still counts only pending, running, and parked; daemon startup
       still recovers stale runs and still refuses to serve when recovery fails.
-- [ ] Test (integration): a real `0.2.x` binary against an upgraded database cannot create a run
+- [x] Test (integration): a real `0.2.x` binary against an upgraded database cannot create a run
       or approve one.
-- [ ] Run `cargo test --workspace` — expect failure.
-- [ ] Implement the marker, the function with `SQLITE_UTF8 | SQLITE_DETERMINISTIC |
+- [x] Run `cargo test --workspace` — expect failure.
+- [x] Implement the marker, the function with `SQLITE_UTF8 | SQLITE_DETERMINISTIC |
       SQLITE_INNOCUOUS` and never `SQLITE_DIRECTONLY`, the two triggers, and the atomic upgrade.
-- [ ] Run tests; expect pass. Commit: `feat(porch-gate): fence the upgraded state root`
+- [x] Run tests; expect pass. Commit: `feat(porch-gate): fence the upgraded state root`
 
 _Requirements: FLOOR-6.4, FLOOR-6.5, FLOOR-8.8, FLOOR-8.21_
 
@@ -345,18 +345,18 @@ and the managed PR attestation block
 
 **Depends-on:** Task 6
 
-- [ ] Test: run status reports the shape for a floor-only and a floor+judgment run; legacy and
+- [x] Test: run status reports the shape for a floor-only and a floor+judgment run; legacy and
       unreviewed records report the shape as absent rather than a fabricated value.
-- [ ] Test: the delivered PR attestation states the shape while keeping its existing marker and
+- [x] Test: the delivered PR attestation states the shape while keeping its existing marker and
       head-SHA semantics.
-- [ ] Test: a failed floor-blocked run exposes no response verb at all, and its diagnostics carry a
+- [x] Test: a failed floor-blocked run exposes no response verb at all, and its diagnostics carry a
       copyable `porch rerun --run-id`, plus daemon-restart advice when the cause is resolution.
-- [ ] Test: a pin mismatch reports both the pinned and the attempted shape; setup detect, apply and
+- [x] Test: a pin mismatch reports both the pinned and the attempted shape; setup detect, apply and
       verify are unchanged.
-- [ ] Run `cargo test -p porch --test m19_floor` — expect failure.
-- [ ] Implement the record field and every reader, update the headless contract, and document
+- [x] Run `cargo test -p porch --test m19_floor` — expect failure.
+- [x] Implement the record field and every reader, update the headless contract, and document
       upgrade, rollback and recovery.
-- [ ] Run tests; expect pass. Commit: `feat(porch): surface the assurance shape to operators`
+- [x] Run tests; expect pass. Commit: `feat(porch): surface the assurance shape to operators`
 
 _Requirements: FLOOR-3.4, FLOOR-3.6, FLOOR-3.7, FLOOR-7.1, FLOOR-7.2, FLOOR-7.3, FLOOR-7.4, FLOOR-8.15_
 
@@ -376,14 +376,14 @@ _Requirements: FLOOR-3.4, FLOOR-3.6, FLOOR-3.7, FLOOR-7.1, FLOOR-7.2, FLOOR-7.3,
 
 **Depends-on:** Task 9
 
-- [ ] Test: a review park still accepts approve, fix, skip and abort, and a compose park still
+- [x] Test: a review park still accepts approve, fix, skip and abort, and a compose park still
       offers only respond, skip and abort with its branch taken before the review skip path.
-- [ ] Test: approve still records the head SHA, skip still leaves it unrecorded, and a post-fix
+- [x] Test: approve still records the head SHA, skip still leaves it unrecorded, and a post-fix
       round still leaves the originating `from_sha` unchanged.
-- [ ] Test: a pre-round parked run still answers approve, fix, skip, abort, notes and hunk lookup
+- [x] Test: a pre-round parked run still answers approve, fix, skip, abort, notes and hunk lookup
       through its legacy snapshot.
-- [ ] Run `cargo test --workspace` — expect any regression from Tasks 3–9 to surface here.
-- [ ] Fix whatever the sweep exposes without weakening the new fail-closed rules.
-- [ ] Run the full verify sequence; expect pass. Commit: `test(porch): guard park and legacy serve`
+- [x] Run `cargo test --workspace` — expect any regression from Tasks 3–9 to surface here.
+- [x] Fix whatever the sweep exposes without weakening the new fail-closed rules.
+- [x] Run the full verify sequence; expect pass. Commit: `test(porch): guard park and legacy serve`
 
 _Requirements: FLOOR-8.16, FLOOR-8.17, FLOOR-8.18, FLOOR-8.19, FLOOR-8.20_

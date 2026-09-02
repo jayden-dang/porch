@@ -1,7 +1,7 @@
 # Requirements: Mandatory Deterministic Floor
 
 Feature code: FLOOR
-Status: In-progress
+Status: Implemented
 Date: 2026-09-02
 
 <!--

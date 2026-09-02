@@ -1,19 +1,22 @@
 # Spec Index
 
-Feature-code registry: every requirements.md registers its code here before use.
-Codes are 2-12 chars, A-Z0-9, start with a letter, unique forever (never reuse a
-retired code).
+Domain router for the capability catalog. Feature cards live under
+`docs/specs/catalog/<domain>.md` — **not** in this file. Register a CODE in the
+owning shard before writing `requirements.md`. Codes are 2–12 chars, A-Z0-9,
+start with a letter, unique forever (never reuse a retired code).
 
-**Roadmap item** binds this feature CODE (delivery unit) to the `ROAD-N` program **slot** it
-implements, when the project has a `docs/roadmap/INDEX.md`. Write `—` when there is no
-roadmap layer, or when this work was not planned as a roadmap item. At most one live CODE
-may name a given ROAD (`R6`). The column is what lets `refresh-roadmap-status` join plan to
-spec; `specify-behavior` is the only writer of the Roadmap item and Spec cells.
+Agents query via pack `load-subgraph/references/catalog-query.md`; they must not
+paste the full catalog into context.
+
+**Roadmap item** on each shard card binds the feature CODE to a live `ROAD-N`
+when `docs/roadmap/INDEX.md` exists. Write `—` when there is no roadmap layer.
+At most one live CODE may name a given ROAD (`R6`). `specify-behavior` is the
+only writer of the **Roadmap item** cell on new features.
 
 `map-features` (dispose) is the writer of **Recognized** cards — rows describing a
 capability that exists in the code but has no triad yet (Spec `—`). It never mints a
 CODE without explicit confirmation, and never writes an `OBS-*` id into the Code cell.
-The `Observation` column carries the `OBS-<6hex>` provenance from the
+The `Observation` column on shard cards carries the `OBS-<6hex>` provenance from the
 `reconcile-features` run that surfaced the capability; it is audit provenance, not an ID
 anything cites.
 
@@ -21,22 +24,9 @@ anything cites.
 `reconcile-features` classify a changed path as `known-impact` on this CODE instead of
 reporting it as unowned. Keep them to at most 3 per card.
 
-This **flat** table is the default. Agents query it (see pack
-`load-subgraph/references/catalog-query.md`); they must not assume it stays small
-enough to paste whole into context. Optional later scale-out: replace this table
-with a Domain router + `docs/specs/catalog/<domain>.md` shards — not required at
-bootstrap.
-
-| Code | Feature | Capability | Match terms | Surface roots | Spec | Status | Roadmap item | Observation |
-|---|---|---|---|---|---|---|---|---|
-| GATE | Gate lifecycle | Accepts a pushed ref and owns run lifecycle and state: admit, hooks, notify, sqlite, daemon/RPC, eject | admit, hook, notify, daemon, eject, custody | `crates/porch-gate/src/`, `crates/porch-gate/tests/` | — | Recognized | — | OBS-95a5d4, OBS-11fc60 |
-| RUN | Run execution | Executes one gate run in a disposable worktree: intent, rebase, review, certify, deliver, agent respond | worktree, intent, rebase, certify, respond | `crates/porch-run/src/` | — | Recognized | — | OBS-5df730 |
-| REVIEW | Review adapter | Selects the review engine (coding-agent turn, quality, or CLI) and emits JSON findings | review, engine, findings, adapter, reviewer | `crates/porch-review/src/` | — | Recognized | — | OBS-208976 |
-| QUALITY | Quality engine | First-party review quality engine: diff, rules, grouping, relocation, coverage | quality, rules, grouping, relocation, coverage, diff | `crates/porch-quality/src/`, `tests/fixtures/quality/` | — | Recognized | — | OBS-9edece, OBS-dc9cb3 |
-| OPERATOR | Operator surface | clap entrypoint, doctor, setup, and the attach TUI | cli, doctor, setup, tui, attach | `crates/porch/src/` | — | Recognized | — | OBS-0861ba |
-| DELIVER | Delivery | Forwards the certified branch, opens the GitHub PR, babysits allowlisted checks | pr, forward, checks, allowlist, github | `crates/porch-deliver/src/` | — | Recognized | — | OBS-75c657 |
-| AGENT | Fixer adapter | Native fixer CLI adapter | agent, fixer, cli-adapter | `crates/porch-agent/src/` | — | Recognized | — | OBS-26ed45 |
-| GIT | Git wrapper | git CLI wrapper with absolute `--git-dir`; the only place the gate shells out to git | git, force-with-lease, fetch, push, worktree | `crates/porch-git/src/` | — | Recognized | — | OBS-5954b0 |
-| ROUND | Review round identity | Durable review-round records: input and review-context bindings, canonical fingerprints, finding instances, structured coverage, and interrupted-round reconciliation | round, fingerprint, finding instance, coverage state, audit identity | `crates/porch-gate/src/`, `crates/porch-run/src/`, `crates/porch-review/src/` | `./2026-08-30-review-round-identity/` | Implemented | ROAD-6 | — |
-| PRCMP | PR compose | Scaffold then park-compose for Agent-authored PR title/body: repo template or default narrative, no self-review theater, hidden attestation | compose, pr body, pr template, scaffold, park compose, attestation | `crates/porch-deliver/src/`, `crates/porch-run/src/deliver.rs`, `crates/porch-gate/src/`, `crates/porch/src/` | `./2026-08-30-pr-compose/` | Implemented | — | — |
-| FLOOR | Mandatory deterministic floor | Composes the deterministic floor as a required producer on every assurance run and makes authorization prove it ran: Porch-owned required-set policy, per-round requirement records, run-level assurance pin, protocol 2 boundary | floor, required producer, assurance shape, required set, protocol 2, resolver | `crates/porch-review/src/`, `crates/porch-run/src/`, `crates/porch-gate/src/rounds/` | `./2026-09-02-mandatory-floor/` | In-progress | ROAD-22 | — |
+| Domain | Scope | Surface roots | Feature catalog |
+|---|---|---|---|
+| gate | Admit, hooks, daemon/RPC, disposable-worktree execution, git CLI wrapper | `crates/porch-gate/`, `crates/porch-run/`, `crates/porch-git/` | [catalog](./catalog/gate.md) |
+| assurance | Review adapter, quality engine, round identity, mandatory deterministic floor | `crates/porch-review/`, `crates/porch-quality/`, `crates/porch-gate/src/rounds/` | [catalog](./catalog/assurance.md) |
+| delivery | Branch forward, GitHub PR, allowlisted checks, PR compose | `crates/porch-deliver/`, `crates/porch-run/src/deliver.rs` | [catalog](./catalog/delivery.md) |
+| operator | clap entrypoint, doctor, setup, attach TUI, fixer adapter | `crates/porch/`, `crates/porch-agent/` | [catalog](./catalog/operator.md) |
