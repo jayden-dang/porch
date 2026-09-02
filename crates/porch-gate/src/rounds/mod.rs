@@ -1,6 +1,12 @@
 //! Durable review-round store.
 
+mod applicability;
 mod schema;
+
+pub use applicability::{
+    Applicability, EquivalenceInput, ObservedVersionForEquivalence, applicable_round,
+    descriptor_equivalence_digest,
+};
 
 use std::cell::Cell;
 use std::fmt;
