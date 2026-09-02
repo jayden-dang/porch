@@ -231,7 +231,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// # Errors
 ///
 /// Returns a storage error when the transaction cannot commit, when a content
-/// digest collides with a different blob, or when producer/context rows are invalid.
+/// digest does not match the bytes (or collides with a different blob), or when
+/// producer/context rows are invalid.
 ///
 /// # Panics
 ///
@@ -423,6 +424,13 @@ pub fn producers_for_round(db: &Db, round_id: &RoundId) -> Result<Vec<ProducerRe
 }
 
 fn ensure_blob(tx: &Transaction<'_>, digest: &str, bytes: &[u8]) -> Result<()> {
+    let expected = sha256_hex(bytes);
+    if digest != expected {
+        return Err(Error::Other(format!(
+            "content blob digest {digest} does not match sha256 of provided bytes"
+        )));
+    }
+
     let byte_length =
         i64::try_from(bytes.len()).map_err(|_| Error::Other("blob length exceeds i64".into()))?;
 
