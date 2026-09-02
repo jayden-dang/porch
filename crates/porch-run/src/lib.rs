@@ -65,6 +65,11 @@ impl RunExecutor for PipelineExecutor {
     }
 
     fn recover_stale(&self, home: &Path) -> std::result::Result<(), String> {
+        if std::env::var_os("PORCH_TEST_FAIL_RECOVER_STALE").is_some() {
+            return Err("test recover_stale failure".into());
+        }
+        let db = Db::open(&db_path(home)).map_err(|e| e.to_string())?;
+        rounds::reconcile_stale(&db).map_err(|e| e.to_string())?;
         recover_stale_running(home).map_err(|e| e.to_string())
     }
 }
@@ -416,6 +421,9 @@ fn open_review_round(
             "failed to open review round before producer spawn: {e}"
         ))
     })?;
+    if std::env::var_os("PORCH_TEST_ABORT_AFTER_ROUND_OPEN").is_some() {
+        return Err(RunError::Msg("test abort after round open".into()));
+    }
     let producer_invocation_id = rounds::producers_for_round(db, &round_id)?
         .into_iter()
         .next()
@@ -461,7 +469,12 @@ fn spawn_review_for_round(
         artifact_dir: Some(&opened.artifact_dir),
     });
     match spawn_result {
-        Ok(o) => Ok(o),
+        Ok(o) => {
+            if std::env::var_os("PORCH_TEST_ABORT_BEFORE_ROUND_FINALIZE").is_some() {
+                return Err(RunError::Msg("test abort before round finalize".into()));
+            }
+            Ok(o)
+        }
         Err(e) => {
             finalize_incomplete(db, &opened.round_id, incomplete_reason(&e))?;
             Err(match e {
