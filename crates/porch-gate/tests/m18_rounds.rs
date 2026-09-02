@@ -4,9 +4,11 @@ use std::path::Path;
 
 use porch_gate::db_path;
 use porch_gate::rounds::{
-    self, AssuranceCompletion, ContextApplication, ContextElement, ContextSource, ExecutionState,
-    OpenRoundPlan, ProducerInvocation, RoundBindings, SNAPSHOT_CEILING_BYTES, SnapshotState,
-    SourceState, capture_context_element, context_applicability_digest, sha256_hex,
+    self, AssuranceCompletion, ContextApplication, ContextElement, ContextSource, CoverageState,
+    ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal, OpenRoundPlan,
+    ProducerInvocation, RoundBindings, RoundCoverageProposal, SNAPSHOT_CEILING_BYTES,
+    STALE_REVISION_RETRIES, SnapshotState, SourceState, capture_context_element,
+    context_applicability_digest, sha256_hex,
 };
 use porch_gate::{Db, Error};
 use rusqlite::Connection;
@@ -703,4 +705,281 @@ fn stored_context_snapshot_without_bytes_is_refused() {
         other => panic!("expected refuse, got {other:?}"),
     }
     assert!(rounds::rounds_for_run(&db, &run_id).unwrap().is_empty());
+}
+
+fn producer_id(db: &Db, round_id: &rounds::RoundId) -> String {
+    rounds::producers_for_round(db, round_id).unwrap()[0]
+        .id
+        .clone()
+}
+
+fn sample_complete_proposal(producer_invocation_id: &str) -> FinalizeProposal {
+    FinalizeProposal {
+        execution: ExecutionState::Finished,
+        assurance_completion: AssuranceCompletion::Complete,
+        completion_reason: None,
+        coverage: vec![RoundCoverageProposal {
+            producer_invocation_id: producer_invocation_id.into(),
+            path: "a.rs".into(),
+            state: CoverageState::Completed,
+            reason: None,
+            authority: None,
+            completion_evidence: Some("reviewed".into()),
+        }],
+        instances: vec![FindingInstanceProposal {
+            producer_invocation_id: producer_invocation_id.into(),
+            fingerprint: "fp-one".into(),
+            fingerprint_version: 1,
+            candidate_key: "ck-one".into(),
+            criterion_id: "rust/unwrap-in-lib".into(),
+            evidence: "unwrap here".into(),
+            consequence: "panic risk".into(),
+            action: "must-fix".into(),
+            severity: "error".into(),
+            provenance_json: r#"{"producer_key":"rust/unwrap-in-lib"}"#.into(),
+            confidence_value: None,
+            confidence_kind: None,
+            path: "a.rs".into(),
+            anchor_kind: "symbol".into(),
+            anchor_value: "foo".into(),
+        }],
+    }
+}
+
+fn bump_history_revision(home: &Path, run_id: &str) {
+    let conn = Connection::open(db_path(home)).unwrap();
+    conn.execute(
+        "UPDATE runs SET review_history_revision = review_history_revision + 1 WHERE id = ?1",
+        [run_id],
+    )
+    .unwrap();
+}
+
+#[test]
+fn finalize_is_atomic_coverage_instances_and_terminal_land_together() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-atomic\n";
+    let round_id =
+        rounds::open_round(&db, &sample_plan(&run_id), &sample_bindings(inventory)).unwrap();
+    let producer = producer_id(&db, &round_id);
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+
+    let mut bad = sample_complete_proposal(&producer);
+    bad.coverage.push(RoundCoverageProposal {
+        producer_invocation_id: producer.clone(),
+        path: "b.rs".into(),
+        state: CoverageState::Completed,
+        reason: None,
+        authority: None,
+        completion_evidence: None, // CHECK: completed requires evidence
+    });
+
+    let err = rounds::finalize_round(&db, &round_id, &bad, rev).unwrap_err();
+    match err {
+        Error::Sqlite(_) | Error::Other(_) => {}
+        other => panic!("expected finalize refuse, got {other:?}"),
+    }
+
+    let loaded = rounds::get_round(&db, &round_id).unwrap().unwrap();
+    assert_eq!(loaded.execution, ExecutionState::Running);
+    assert_eq!(loaded.assurance_completion, AssuranceCompletion::Pending);
+    assert!(loaded.finalized_at.is_none());
+    assert!(
+        rounds::coverage_for_round(&db, &round_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        rounds::instances_for_round(&db, &round_id)
+            .unwrap()
+            .is_empty()
+    );
+    let (rev_after, history) = rounds::read_history(&db, &run_id).unwrap();
+    assert_eq!(rev_after, rev);
+    assert!(history.is_empty());
+
+    let ok = sample_complete_proposal(&producer);
+    assert_eq!(
+        rounds::finalize_round(&db, &round_id, &ok, rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+    let loaded = rounds::get_round(&db, &round_id).unwrap().unwrap();
+    assert_eq!(loaded.execution, ExecutionState::Finished);
+    assert_eq!(loaded.assurance_completion, AssuranceCompletion::Complete);
+    assert!(loaded.finalized_at.is_some());
+    assert_eq!(rounds::coverage_for_round(&db, &round_id).unwrap().len(), 1);
+    assert_eq!(
+        rounds::instances_for_round(&db, &round_id).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn stale_revision_between_phases_yields_stale_without_durable_finalization() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-stale\n";
+    let round_id =
+        rounds::open_round(&db, &sample_plan(&run_id), &sample_bindings(inventory)).unwrap();
+    let producer = producer_id(&db, &round_id);
+    let (seen, _) = rounds::read_history(&db, &run_id).unwrap();
+
+    bump_history_revision(home, &run_id);
+
+    let outcome =
+        rounds::finalize_round(&db, &round_id, &sample_complete_proposal(&producer), seen).unwrap();
+    assert_eq!(outcome, FinalizeOutcome::Stale);
+
+    let loaded = rounds::get_round(&db, &round_id).unwrap().unwrap();
+    assert_eq!(loaded.execution, ExecutionState::Running);
+    assert_eq!(loaded.assurance_completion, AssuranceCompletion::Pending);
+    assert!(
+        rounds::coverage_for_round(&db, &round_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        rounds::instances_for_round(&db, &round_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn finding_instances_get_distinct_ids_even_when_fingerprints_match() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-ids\n";
+    let round_id =
+        rounds::open_round(&db, &sample_plan(&run_id), &sample_bindings(inventory)).unwrap();
+    let producer = producer_id(&db, &round_id);
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+
+    let mut proposal = sample_complete_proposal(&producer);
+    proposal.instances.push(FindingInstanceProposal {
+        producer_invocation_id: producer.clone(),
+        fingerprint: "fp-one".into(),
+        fingerprint_version: 1,
+        candidate_key: "ck-two".into(),
+        criterion_id: "rust/unwrap-in-lib".into(),
+        evidence: "another unwrap".into(),
+        consequence: "panic risk".into(),
+        action: "must-fix".into(),
+        severity: "error".into(),
+        provenance_json: "{}".into(),
+        confidence_value: None,
+        confidence_kind: None,
+        path: "a.rs".into(),
+        anchor_kind: "symbol".into(),
+        anchor_value: "bar".into(),
+    });
+
+    assert_eq!(
+        rounds::finalize_round(&db, &round_id, &proposal, rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+
+    let instances = rounds::instances_for_round(&db, &round_id).unwrap();
+    assert_eq!(instances.len(), 2);
+    assert_ne!(instances[0].id, instances[1].id);
+    assert_eq!(instances[0].fingerprint, "fp-one");
+    assert_eq!(instances[1].fingerprint, "fp-one");
+    assert_eq!(instances[0].fingerprint_version, 1);
+    assert_eq!(instances[1].round_id, round_id.as_str());
+
+    let (_, history) = rounds::read_history(&db, &run_id).unwrap();
+    assert_eq!(history.len(), 2);
+    assert_ne!(
+        history[0].finding_instance_id,
+        history[1].finding_instance_id
+    );
+}
+
+#[test]
+fn contention_free_finalization_commits_exactly_two_writes_beyond_preround() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-writes\n";
+
+    rounds::reset_committed_write_count();
+    let round_id =
+        rounds::open_round(&db, &sample_plan(&run_id), &sample_bindings(inventory)).unwrap();
+    let producer = producer_id(&db, &round_id);
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+    assert_eq!(
+        rounds::finalize_round(&db, &round_id, &sample_complete_proposal(&producer), rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+    assert_eq!(
+        rounds::take_committed_write_count(),
+        2,
+        "open + finalize only"
+    );
+}
+
+#[test]
+fn stale_retries_are_bounded_then_history_contention_closes() {
+    assert_eq!(STALE_REVISION_RETRIES, 3);
+
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-contend\n";
+    let round_id =
+        rounds::open_round(&db, &sample_plan(&run_id), &sample_bindings(inventory)).unwrap();
+    let producer = producer_id(&db, &round_id);
+
+    rounds::reset_committed_write_count();
+    rounds::reset_finalize_attempt_count();
+
+    for _ in 0..STALE_REVISION_RETRIES {
+        let (seen, _) = rounds::read_history(&db, &run_id).unwrap();
+        bump_history_revision(home, &run_id);
+        let outcome =
+            rounds::finalize_round(&db, &round_id, &sample_complete_proposal(&producer), seen)
+                .unwrap();
+        assert_eq!(outcome, FinalizeOutcome::Stale);
+    }
+
+    assert_eq!(
+        rounds::take_finalize_attempt_count(),
+        u64::from(STALE_REVISION_RETRIES)
+    );
+    assert_eq!(
+        rounds::take_committed_write_count(),
+        0,
+        "stale attempts must not commit finalization"
+    );
+    assert!(
+        rounds::coverage_for_round(&db, &round_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        rounds::instances_for_round(&db, &round_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    rounds::abandon_for_history_contention(&db, &round_id).unwrap();
+    assert_eq!(rounds::take_committed_write_count(), 1);
+
+    let loaded = rounds::get_round(&db, &round_id).unwrap().unwrap();
+    assert_eq!(loaded.execution, ExecutionState::Interrupted);
+    assert_eq!(loaded.assurance_completion, AssuranceCompletion::Incomplete);
+    assert_eq!(
+        loaded.completion_reason.as_deref(),
+        Some("history_contention")
+    );
+    assert!(loaded.finalized_at.is_some());
 }
