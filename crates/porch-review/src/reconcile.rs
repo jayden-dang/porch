@@ -8,10 +8,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::identity::{CandidateKey, FINGERPRINT_VERSION};
+use crate::identity::{CandidateKey, FINGERPRINT_VERSION, candidate_digest};
 
 const FINGERPRINT_DOMAIN: &[u8] = b"porch-fingerprint/v1";
-const CANDIDATE_DOMAIN: &[u8] = b"porch-candidate-key/v1";
 
 /// Inclusive source line range used only for within-round collapse evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,7 +205,7 @@ fn keys_match(current: &CandidateKey, prior: &CandidateKey, renames: &[RenameEvi
     if rewritten == prior.path_key {
         return false;
     }
-    let digest = candidate_key_digest(
+    let digest = candidate_digest(
         prior.fingerprint_version,
         &rewritten,
         &prior.criterion_id,
@@ -214,25 +213,6 @@ fn keys_match(current: &CandidateKey, prior: &CandidateKey, renames: &[RenameEvi
         &prior.anchor_value,
     );
     current.digest == digest
-}
-
-fn candidate_key_digest(
-    fingerprint_version: u32,
-    path_key: &str,
-    criterion_id: &str,
-    anchor_kind: &str,
-    anchor_value: &str,
-) -> String {
-    let ver = fingerprint_version.to_string();
-    let preimage = length_delimited_join(&[
-        CANDIDATE_DOMAIN,
-        ver.as_bytes(),
-        path_key.as_bytes(),
-        criterion_id.as_bytes(),
-        anchor_kind.as_bytes(),
-        anchor_value.as_bytes(),
-    ]);
-    hex::encode(Sha256::digest(preimage))
 }
 
 fn rewrite_path(path: &str, renames: &[RenameEvidence]) -> String {
@@ -322,7 +302,7 @@ mod tests {
 
     fn key(path: &str, criterion: &str, anchor_kind: &str, anchor_value: &str) -> CandidateKey {
         let path_key = crate::path_key(path);
-        let digest = candidate_key_digest(
+        let digest = candidate_digest(
             FINGERPRINT_VERSION,
             &path_key,
             criterion,

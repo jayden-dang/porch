@@ -249,7 +249,7 @@ pub fn path_key(path: &str) -> String {
     stripped.to_string()
 }
 
-fn candidate_digest(
+pub(crate) fn candidate_digest(
     fingerprint_version: u32,
     path_key: &str,
     criterion_id: &str,

@@ -19,9 +19,10 @@ use porch_agent::{
 };
 use porch_gate::rounds::{
     self, AssuranceCompletion, ContextApplication, ContextApplicationState, ContextSource,
-    ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal, OpenRoundPlan,
-    ProducerInvocation, RoundCoverageProposal, RoundId, STALE_REVISION_RETRIES,
-    capture_context_element, sha256_hex,
+    EquivalenceInput, ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal,
+    ObservedVersionForEquivalence, OpenRoundPlan, ProducerInvocation, RoundCoverageProposal,
+    RoundId, STALE_REVISION_RETRIES, capture_context_element, descriptor_equivalence_digest,
+    sha256_hex,
 };
 use porch_gate::{
     Db, RunExecutor, RunRow, StatusFindingDto, db_path, event_hub, load_finding_notes, repo_id_for,
@@ -417,7 +418,7 @@ fn open_review_round(
     let open_plan = OpenRoundPlan {
         run_id: run_id.to_string(),
         producers: vec![ProducerInvocation {
-            descriptor_equivalence_digest: descriptor_equivalence_digest(&prepared.plan.descriptor),
+            descriptor_equivalence_digest: producer_equivalence_digest(&prepared.plan.descriptor),
             descriptor_json,
         }],
     };
@@ -588,41 +589,25 @@ fn inventory_bytes(changed: &[String]) -> Vec<u8> {
     out
 }
 
-fn descriptor_equivalence_digest(desc: &ProducerDescriptor) -> String {
-    let adapter = match desc.adapter_kind {
+fn producer_equivalence_digest(desc: &ProducerDescriptor) -> String {
+    let adapter_kind = match desc.adapter_kind {
         AdapterKind::NativeAgent => "native_agent",
         AdapterKind::PorchJsonCli => "porch_json_cli",
     };
-    let argv = desc.invocation.argv_prefix.join("\u{1f}");
-    let observed = match &desc.observed_version_identity {
-        ObservedVersionIdentity::ArtifactSha256(hex) => hex.clone(),
-        ObservedVersionIdentity::Unavailable(_) => {
-            format!("unavailable\u{1f}{}", Ulid::new())
+    let observed_version = match &desc.observed_version_identity {
+        ObservedVersionIdentity::ArtifactSha256(hex) => {
+            ObservedVersionForEquivalence::ArtifactSha256(hex.clone())
         }
+        ObservedVersionIdentity::Unavailable(reason) => ObservedVersionForEquivalence::Unavailable {
+            reason: reason.clone(),
+        },
     };
-    let mut consumed = desc.consumed_context.clone();
-    consumed.sort();
-    let consumed_joined = consumed.join("\u{1f}");
-    let preimage = length_delimited_join(&[
-        b"porch-producer-equivalence/v1",
-        adapter.as_bytes(),
-        argv.as_bytes(),
-        observed.as_bytes(),
-        consumed_joined.as_bytes(),
-    ]);
-    sha256_hex(&preimage)
-}
-
-fn length_delimited_join(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
-            out.push(0x1F);
-        }
-        out.extend_from_slice(part.len().to_string().as_bytes());
-        out.extend_from_slice(part);
-    }
-    out
+    descriptor_equivalence_digest(&EquivalenceInput {
+        adapter_kind,
+        argv_prefix: &desc.invocation.argv_prefix,
+        observed_version,
+        consumed_context: &desc.consumed_context,
+    })
 }
 
 fn map_coverage_state(state: porch_review::CoverageState) -> rounds::CoverageState {

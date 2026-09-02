@@ -61,7 +61,7 @@ pub fn descriptor_equivalence_digest(input: &EquivalenceInput<'_>) -> String {
         }
     };
 
-    let preimage = length_delimited_join(&[
+    let preimage = super::length_delimited_join(&[
         EQUIVALENCE_DOMAIN,
         input.adapter_kind.as_bytes(),
         argv_joined.as_bytes(),
@@ -391,16 +391,4 @@ fn applications_match(
     }
 
     recorded_by_key.is_empty()
-}
-
-fn length_delimited_join(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
-            out.push(0x1F);
-        }
-        out.extend_from_slice(part.len().to_string().as_bytes());
-        out.extend_from_slice(part);
-    }
-    out
 }

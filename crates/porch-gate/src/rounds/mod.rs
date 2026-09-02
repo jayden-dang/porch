@@ -294,7 +294,7 @@ pub fn context_applicability_digest(
     sha256_hex(&preimage)
 }
 
-fn length_delimited_join(parts: &[&[u8]]) -> Vec<u8> {
+pub(super) fn length_delimited_join(parts: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         if i > 0 {
