@@ -598,9 +598,11 @@ fn producer_equivalence_digest(desc: &ProducerDescriptor) -> String {
         ObservedVersionIdentity::ArtifactSha256(hex) => {
             ObservedVersionForEquivalence::ArtifactSha256(hex.clone())
         }
-        ObservedVersionIdentity::Unavailable(reason) => ObservedVersionForEquivalence::Unavailable {
-            reason: reason.clone(),
-        },
+        ObservedVersionIdentity::Unavailable(reason) => {
+            ObservedVersionForEquivalence::Unavailable {
+                reason: reason.clone(),
+            }
+        }
     };
     descriptor_equivalence_digest(&EquivalenceInput {
         adapter_kind,
