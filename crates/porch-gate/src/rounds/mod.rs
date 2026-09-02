@@ -1,6 +1,7 @@
 //! Durable review-round store.
 
 mod applicability;
+pub mod retention;
 mod schema;
 
 pub use applicability::{
