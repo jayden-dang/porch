@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use porch_deliver::GH_BIN_ENV;
+use porch_gate::rounds::{self, Role};
 use porch_gate::{Db, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
@@ -289,6 +290,15 @@ fn clean_review_sets_approved_sha_and_completes() {
             .is_some_and(|s| !s.is_empty()),
         "approved sha missing: {run:?}"
     );
+    let round = &rounds::rounds_for_run(&db, &run.id).unwrap()[0];
+    let reqs = rounds::requirements_for_round(&db, &round.id).unwrap();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "cli review composes floor then judgment, got {reqs:?}"
+    );
+    assert_eq!(reqs[0].role, Role::Floor);
+    assert_eq!(reqs[1].role, Role::Judgment);
     let steps = db.step_results_for_run(&run.id).unwrap();
     assert_eq!(
         steps

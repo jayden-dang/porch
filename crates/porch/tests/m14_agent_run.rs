@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use porch_deliver::GH_BIN_ENV;
+use porch_gate::rounds::{self, Role};
 use porch_gate::{Db, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
@@ -292,8 +293,19 @@ fn agent_run_wait_stops_at_park() {
         .expect("jsonl line");
     let v: Value = serde_json::from_str(last).unwrap();
     assert_eq!(v["status"], "parked", "stdout={stdout}");
-    assert!(v.get("run_id").and_then(|x| x.as_str()).is_some());
+    let run_id = v.get("run_id").and_then(|x| x.as_str()).expect("run_id");
     assert!(v.get("findings").and_then(|x| x.as_array()).is_some());
+
+    let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+    let round = &rounds::rounds_for_run(&db, run_id).unwrap()[0];
+    let reqs = rounds::requirements_for_round(&db, &round.id).unwrap();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "agent run composes floor then judgment, got {reqs:?}"
+    );
+    assert_eq!(reqs[0].role, Role::Floor);
+    assert_eq!(reqs[1].role, Role::Judgment);
 
     kill_daemon(&h.home);
 }

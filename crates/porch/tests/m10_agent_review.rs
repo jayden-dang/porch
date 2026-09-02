@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use porch_deliver::GH_BIN_ENV;
+use porch_gate::rounds::{self, Role};
 use porch_gate::{Db, kill_group, repo_id_for};
 use porch_git::init_bare;
 use serde_json::Value;
@@ -376,6 +377,15 @@ fn agent_review_push_writes_prompt_and_completes() {
         Duration::from_secs(30),
     );
     assert_eq!(run.status, "parked", "err={:?}", run.error);
+    let round = &rounds::rounds_for_run(&db, &run.id).unwrap()[0];
+    let reqs = rounds::requirements_for_round(&db, &round.id).unwrap();
+    assert_eq!(
+        reqs.len(),
+        2,
+        "agent review composes floor then judgment, got {reqs:?}"
+    );
+    assert_eq!(reqs[0].role, Role::Floor);
+    assert_eq!(reqs[1].role, Role::Judgment);
 
     // ROUND moves prompts under runs/<id>/rounds/<round>/producers/<inv>/.
     let rounds_root = home.join("runs").join(&run.id).join("rounds");
