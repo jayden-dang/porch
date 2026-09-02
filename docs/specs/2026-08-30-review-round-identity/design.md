@@ -1,7 +1,7 @@
 # Design: Review Round Identity
 
 Feature code: ROUND
-Status: Draft
+Status: Approved
 Date: 2026-08-30
 Requirements: ./requirements.md
 
@@ -91,14 +91,15 @@ not covered by that binding; it is captured instead by the producer descriptor a
 artifact identity. Conflating them would either let a repository choose porch's executable or let
 an operator silently change repository-controlled rules.
 
-**ARCH-12 is deliberately not cited, and the reason is a dependency conflict worth recording.**
-`ARCH-12` requires the deterministic floor to run on every assurance run and never be substitutable.
-The shipped system cannot satisfy it: `EngineKind` selects exactly one engine
-(`porch-review/src/engine.rs:11-20`), and the milestone that makes the floor always-on is **ROAD-12
-under MILE-5**, which depends on MILE-2 — the milestone containing ROUND. ROUND therefore does
-**not** execute the floor. It models producer invocations as a set of size N so that ROAD-12 adds
-the floor as one further invocation with no schema change and no identity change. Claiming
-`Respects: ARCH-12` here would assert conformance the code cannot have.
+**ARCH-12 is honoured through a prerequisite, not weakened.** `ARCH-12` requires the deterministic
+floor to run on every assurance run and never be substitutable. The shipped system cannot satisfy
+that — `EngineKind` selects exactly one engine (`porch-review/src/engine.rs:11-20`). The invariant is
+made true by **ROAD-22**, a MILE-2 slot ordered *before* ROAD-6, which composes `porch-quality` as a
+required producer invocation on every assurance run. ROUND depends on that slot and relies on it:
+`ROUND-1.31`'s producer-set correspondence is only meaningful because the floor is a required member
+of every set — that is what stops a round carrying floor plus judgment from being equivalent to one
+carrying judgment alone. One-binary consolidation stays ROAD-12 in MILE-5. The invariant was not
+narrowed to fit the roadmap; the roadmap grew a slot to meet the invariant.
 
 ## Architecture
 
@@ -107,7 +108,7 @@ the floor as one further invocation with no schema change and no identity change
 Satisfies: ROUND-1.1, ROUND-1.2, ROUND-1.4, ROUND-1.5, ROUND-1.8, ROUND-1.11, ROUND-1.13,
 ROUND-1.15, ROUND-1.25, ROUND-1.26, ROUND-1.27, ROUND-1.28, ROUND-1.30, ROUND-2.1, ROUND-2.2,
 ROUND-2.3, ROUND-2.4, ROUND-2.5, ROUND-2.6, ROUND-2.7, ROUND-3.7, ROUND-3.8, ROUND-3.17,
-ROUND-3.22, ROUND-4.10, ROUND-5.5, ROUND-6.1, ROUND-6.2, ROUND-7.1, ROUND-7.2
+ROUND-3.22, ROUND-4.10, ROUND-5.5, ROUND-6.1, ROUND-6.2, ROUND-7.2, ROUND-7.4, ROUND-7.5
 Reuse: rung 2 — extends `porch-gate::db` (`Mutex<Connection>`, `ensure_column` at `db.rs:939`,
 `unchecked_transaction` at `db.rs:895`, ULID minting already in `insert_run`)
 Respects: ARCH-10, ARCH-11
@@ -139,7 +140,8 @@ ref removal stay explicit (§3).
 Finalization is two-phase: phase 1 reads history and the revision in one consistent read and closes
 it; matching runs outside the write lock; phase 2 opens `BEGIN IMMEDIATE`, re-verifies the revision
 and that the round is still `running`/`pending`, then writes coverage, instances, terminal state,
-and the incremented revision — one transaction, satisfying `ROUND-7.1`'s single added transaction.
+and the incremented revision — one committed transaction, which with the open transaction is the
+two-write bound of `ROUND-7.4`.
 
 #### Schema (additive; all `CREATE TABLE IF NOT EXISTS`, migrations via `ensure_column`)
 
@@ -264,17 +266,18 @@ Today the review phase issues up to three autocommit writes — `set_run_shas` a
 | History contention (retries exhausted) | 1 | shas + open + up to 3 rolled-back attempts + terminal close = 3..6 | **+2 … +5** |
 | Process death mid-producer | ≤1 | shas + open = 2 | **+1**, plus one reconciliation write at next startup |
 
-**This contradicts `ROUND-7.1` as written.** That criterion says the system shall add *at most one*
-additional transaction to the review phase. It holds on the two paths that dominate normal use and
-on process death, but not on the four failure paths — today they write nothing after `set_run_shas`,
-whereas ROUND must record an honest terminal state, which `ROUND-4.2`–`4.5` require. The extra write
-is not waste; it is the requirement. `ROUND-7.1` therefore needs superseding rather than the design
-being bent to fit it — see the open amendment below.
+The retired `ROUND-7.1` could not bound this: it asked for at most one added transaction, which
+fails on the four failure paths because today they write nothing after `set_run_shas`, while
+`ROUND-4.2`–`4.5` require an honest terminal state. The three bounds that replace it map onto this
+table directly — **ROUND-7.4** covers the contention-free rows (one open plus one terminal write),
+**ROUND-7.5** bounds the contention row to three further attempts that leave no durable
+finalization, and **ROUND-7.6** bounds the process-death row's later startup write to one. Tests
+count committed writes and rolled-back attempts separately.
 ### 2. Applicability — `porch-gate/src/rounds/applicability.rs`
 
 Satisfies: ROUND-1.23, ROUND-1.24, ROUND-1.31, ROUND-4.11, ROUND-4.12, ROUND-4.13, ROUND-4.14
 Reuse: rung 2 — extends the round store's stored digests
-Respects: ARCH-11
+Respects: ARCH-11, ARCH-12
 Interface: `applicable_round(run_id, current_bindings, required_producers) -> Applicable(RoundId) | Requires New Round(reason)`
 Depth: n/a — extends the round store
 Locality: same module tree — **extend**; no neighbour changes.
@@ -480,10 +483,17 @@ Inputs: current candidate keys; history = prior instances of the same run **whos
 `fingerprint_version` equals the current one**; optional rename evidence (`git diff -M` name pairs).
 
 ```
-1. within-round: group current findings by identical candidate_key.
-     a singleton group is unambiguous;
-     a group of size > 1 collapses to one fingerprint only if every member shares
-     path_key, criterion_id and anchor — otherwise every member is distinct.   (ROUND-3.20)
+1. within-round: group current findings by identical candidate_key. A singleton group is
+   unambiguous. A group of size > 1 collapses to ONE fingerprint only when ALL hold:
+     (a) every member comes from a different producer invocation;
+     (b) at most one member per producer invocation;
+     (c) every member carries a source range;
+     (d) all member ranges share one non-empty COMMON intersection.
+   A duplicated producer, a missing range, pairwise-but-not-common overlap, more than one
+   possible pairing, or any other ambiguity => every member is distinct.       (ROUND-3.20)
+   The signal is deliberately independent of the candidate key: line ranges are excluded
+   from the key by design, so this is evidence the key does not already assert. Each
+   occurrence remains its own finding instance regardless of the outcome.
 2. cross-round: for each unambiguous current group, collect prior instances with an equal
    candidate_key. Where the path differs, first rewrite the prior path_key through rename
    evidence and recompute the comparison.                                       (ROUND-3.23)
@@ -586,7 +596,7 @@ with a distinct `completion_reason`; process death → the row stays `running`/`
 (`ROUND-4.1`–`4.6`). Blocking findings do not affect completion (`ROUND-4.9`).
 ### 9. Startup reconciliation — `porch-gate/src/daemon.rs`, `executor.rs`
 
-Satisfies: ROUND-4.7, ROUND-4.8, ROUND-6.3, ROUND-6.6, ROUND-7.3
+Satisfies: ROUND-4.7, ROUND-4.8, ROUND-6.3, ROUND-6.6, ROUND-7.3, ROUND-7.6
 Reuse: rung 2 — extends `recover_stale` (`executor.rs:17`, invoked `daemon.rs:48-49`)
 Respects: ARCH-10
 Surface: the `RunExecutor` trait (`executor.rs:17`) — **replace**: stale-round reconciliation joins
@@ -725,7 +735,7 @@ after new-format rounds exist is unsupported.
 
 | Seam | Kind | Covers |
 |---|---|---|
-| `porch_gate::rounds` open/finalize/read_history | unit | ROUND-1.1, ROUND-1.2, ROUND-1.4, ROUND-1.5, ROUND-1.8, ROUND-1.11, ROUND-1.13, ROUND-1.15, ROUND-1.25, ROUND-1.26, ROUND-1.27, ROUND-1.28, ROUND-1.30, ROUND-2.1, ROUND-2.2, ROUND-2.3, ROUND-2.4, ROUND-2.5, ROUND-2.6, ROUND-2.7, ROUND-3.7, ROUND-3.8, ROUND-3.17, ROUND-3.22, ROUND-4.10, ROUND-7.1 |
+| `porch_gate::rounds` open/finalize/read_history | unit | ROUND-1.1, ROUND-1.2, ROUND-1.4, ROUND-1.5, ROUND-1.8, ROUND-1.11, ROUND-1.13, ROUND-1.15, ROUND-1.25, ROUND-1.26, ROUND-1.27, ROUND-1.28, ROUND-1.30, ROUND-2.1, ROUND-2.2, ROUND-2.3, ROUND-2.4, ROUND-2.5, ROUND-2.6, ROUND-2.7, ROUND-3.7, ROUND-3.8, ROUND-3.17, ROUND-3.22, ROUND-4.10, ROUND-7.4, ROUND-7.5 |
 | `porch_gate::rounds` migration on an existing database | integration | ROUND-5.5, ROUND-6.1, ROUND-6.2 |
 | `porch_gate::rounds::applicability` | unit | ROUND-1.23, ROUND-1.24, ROUND-1.31, ROUND-4.11, ROUND-4.12, ROUND-4.13, ROUND-4.14 |
 | `porch_gate::rounds::retention` + bare refs | integration | ROUND-1.12, ROUND-1.16, ROUND-1.29 |
@@ -734,7 +744,7 @@ after new-format rounds exist is unsupported.
 | `porch_review::reconcile` against the fixture corpus | unit | ROUND-3.5, ROUND-3.6, ROUND-3.9, ROUND-3.10, ROUND-3.11, ROUND-3.19, ROUND-3.20, ROUND-3.23 |
 | `porch_review::coverage_state` | unit | ROUND-2.8, ROUND-2.9, ROUND-6.10 |
 | `porch_run::run_review_phase` with a PATH-fake producer | integration | ROUND-1.3, ROUND-1.18, ROUND-1.32, ROUND-4.1, ROUND-4.2, ROUND-4.3, ROUND-4.4, ROUND-4.5, ROUND-4.9, ROUND-6.7, ROUND-6.8, ROUND-6.9, ROUND-6.14 |
-| daemon startup with fault injection at each boundary | integration | ROUND-4.6, ROUND-4.7, ROUND-4.8, ROUND-6.3, ROUND-6.6, ROUND-7.3 |
+| daemon startup with fault injection at each boundary | integration | ROUND-4.6, ROUND-4.7, ROUND-4.8, ROUND-6.3, ROUND-6.6, ROUND-7.3, ROUND-7.6 |
 | `porch_gate::rpc` snapshot + hunk | integration | ROUND-5.1, ROUND-5.2, ROUND-5.3, ROUND-5.4, ROUND-6.4, ROUND-6.5 |
 | `porch` TUI snapshot rendering | unit | ROUND-6.13 |
 | `porch-quality` CLI JSON output | integration | ROUND-6.12 |
@@ -746,9 +756,10 @@ store's public API.
 
 ## Coverage check
 
-All 97 live requirement IDs (94 behavioural + 3 NFR) appear in exactly one `Satisfies:` line.
-Retired IDs `ROUND-1.6`, `ROUND-1.7`, `ROUND-3.1`, and `ROUND-3.2` are deliberately unmapped —
-they were superseded and carry no obligation.
+All 99 live requirement IDs (94 behavioural + 5 NFR) appear in exactly one `Satisfies:` line, and
+each appears in at least one seam row. Retired IDs `ROUND-1.6`, `ROUND-1.7`, `ROUND-3.1`,
+`ROUND-3.2`, and `ROUND-7.1` are deliberately unmapped — they were superseded and carry no
+obligation.
 
 No `## UI design` section: the Step 2b predicate does not hold. No `Satisfies:` ID is delivered
 through a browser-rendered surface. `porch/src/tui.rs` is a terminal UI rendered by `ratatui`, not

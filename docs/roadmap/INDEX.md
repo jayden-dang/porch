@@ -37,6 +37,7 @@ and version, coverage state per changed file, findings, disposition and authorit
 and phase events.
 **Goals:** GOAL-2
 **Members:**
+- **ROAD-22** mandatory deterministic floor composition — compose the existing `porch-quality` engine as a required producer invocation on every assurance run, so the floor is never absent and never substituted — Surfaces: `crates/porch-review/src/engine.rs`, `crates/porch-run/src/lib.rs`
 - **ROAD-6** finding contract and audit identity — criterion, evidence, consequence, action, producer provenance, plus `review_round_id`, an immutable `finding_instance_id`, and a cross-round `fingerprint` distinct from that database identity — Surfaces: `crates/porch-review/src/lib.rs`, `crates/porch-run/src/lib.rs`, `crates/porch-gate/src/db.rs`, `crates/porch-quality/src/`
 - **ROAD-4** per-finding disposition history that survives a review round — Surfaces: `crates/porch-gate/src/db.rs`, `crates/porch-run/src/lib.rs`
 - **ROAD-5** phase start and end events, surfaced rather than only stored — Surfaces: `crates/porch-gate/src/db.rs`, `crates/porch-gate/src/rpc.rs`, `crates/porch/src/main.rs`
