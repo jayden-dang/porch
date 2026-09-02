@@ -278,8 +278,7 @@ count committed writes and rolled-back attempts separately.
 Satisfies: ROUND-1.23, ROUND-1.24, ROUND-1.31, ROUND-4.11, ROUND-4.12, ROUND-4.13, ROUND-4.14
 Reuse: rung 2 — extends the round store's stored digests
 Respects: ARCH-11, ARCH-12
-Interface: `applicable_round(db, run_id, current_bindings, required_producer_digests) -> Applicable(RoundId) | RequiresNew { reason }`
-· `descriptor_equivalence_digest(input) -> hex` (preimage below; unavailable mints a nonce)
+Interface: `applicable_round(run_id, current_bindings, required_producers) -> Applicable(RoundId) | Requires New Round(reason)`
 Depth: n/a — extends the round store
 Locality: same module tree — **extend**; no neighbour changes.
 
@@ -287,14 +286,7 @@ Comparison is over the **applicability binding** only, so audit-only fields (`in
 `reported_version`, `selection_source`, `declared_engine_kind`) are outside it by construction.
 Producer sets must correspond one-to-one by `descriptor_equivalence_digest`, so a round carrying
 floor plus judgment is never equivalent to one carrying judgment alone. An `unavailable` observed
-identity contributes no matching signal and therefore can never establish equivalence. Coverage
-must meet the required states (`completed` or `waived` on every recorded path); `selected` or
-`failed` is under-covered and never authorizes (`ROUND-4.12`). When no recorded round satisfies the
-tuple, the result is `RequiresNew` (`ROUND-4.13`).
-
-Rounds for a run are considered newest-ordinal-first; the first that satisfies the tuple is
-returned. A pending, incomplete, interrupted, unfinalized, or under-covered round is skipped, never
-selected.
+identity contributes no matching signal and therefore can never establish equivalence.
 
 #### Equivalence digest preimage
 
@@ -305,36 +297,29 @@ Fields joined with `0x1F`, each prefixed by its ASCII decimal byte length, SHA-2
   ⟂ observed_version_identity ⟂ consumed_context_sorted
 ```
 
-`argv_prefix_joined` and `consumed_context_sorted` each join their items with `0x1F` (context names
-sorted lexicographically before join). `selection_source`, `declared_engine_kind`, and
-`reported_version` are absent from the preimage, so `ROUND-1.22` and `ROUND-1.24` hold by
-construction. When `observed_version_identity` is `unavailable(reason)`, the field is written as the
-literal `unavailable` **plus a per-invocation nonce** (reason is not in the preimage), which
-guarantees the digest can never equal another invocation's — `ROUND-4.14` enforced arithmetically
-rather than by a comparison rule that could be forgotten. Callers store the digest at open; later
-required digests are computed the same way for the current plan.
+`selection_source`, `declared_engine_kind`, and `reported_version` are absent from the preimage, so
+`ROUND-1.22` and `ROUND-1.24` hold by construction. When `observed_version_identity` is
+`unavailable(reason)`, the field is written as the literal `unavailable` **plus a per-invocation
+nonce**, which guarantees the digest can never equal another invocation's — `ROUND-4.14` enforced
+arithmetically rather than by a comparison rule that could be forgotten.
 
 #### The complete applicability tuple
 
 A recorded round is applicable to the current change iff **all** hold:
 
 ```
-finalized_at IS NOT NULL
 execution = 'finished'  AND  assurance_completion = 'complete'
-every coverage path state ∈ {completed, waived}              (ROUND-4.12)
 from_sha, to_sha, inventory_digest            equal
 trusted_config_sha                            equal
 protocol_schema_version, fingerprint_version  equal
 for every context element: source_state       equal
-producer digests form a 1:1 multiset correspondence          (ROUND-1.31)
-for every (element, producer) application under that bijection:
+for every (element, producer) application:
     application state and effective_digest    equal
+multiset of descriptor_equivalence_digest     equal        (ROUND-1.31)
 ```
 
 Nothing else is compared. `intent_source`, `selection_source`, `declared_engine_kind`, and
 `reported_version` are outside the tuple by construction, which is `ROUND-1.15`, `1.22` and `1.24`.
-A differing input or review-context binding makes that round inapplicable (`ROUND-4.11`) without
-mutating it (`ROUND-4.10`).
 ### 3. Retention and the trusted-config ref — `porch-gate/src/rounds/retention.rs`
 
 Satisfies: ROUND-1.12, ROUND-1.16, ROUND-1.29

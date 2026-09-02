@@ -1087,7 +1087,7 @@ fn finalize_complete_with_coverage(
 }
 
 #[test]
-#[allow(clippy::too_many_lines)] // four authorization refusal paths in one ROUND-4.12 case
+#[allow(clippy::too_many_lines)] // four authorization refusal paths in one case
 fn pending_incomplete_interrupted_or_under_covered_round_never_authorizes() {
     let home = TempDir::new().unwrap();
     let home = home.path();

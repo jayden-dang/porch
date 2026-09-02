@@ -24,7 +24,7 @@ pub enum ObservedVersionForEquivalence {
     },
 }
 
-/// Equivalence-bearing producer fields (`ROUND-1.23`); audit-only fields omitted.
+/// Equivalence-bearing producer fields; audit-only fields omitted.
 #[derive(Debug, Clone)]
 pub struct EquivalenceInput<'a> {
     pub adapter_kind: &'a str,
@@ -44,7 +44,7 @@ pub enum Applicability {
 ///
 /// `selection_source`, `declared_engine_kind`, and `reported_version` are absent.
 /// An unavailable observed identity includes a per-invocation nonce so two calls
-/// never compare equal (`ROUND-4.14`).
+/// never compare equal.
 #[must_use]
 pub fn descriptor_equivalence_digest(input: &EquivalenceInput<'_>) -> String {
     let argv_joined = input.argv_prefix.join("\u{1f}");
