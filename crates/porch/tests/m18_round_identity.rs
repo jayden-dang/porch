@@ -1217,7 +1217,10 @@ fn inapplicable_finalized_round_is_not_served() {
         after.assurance_record
     );
     assert!(
-        after.findings.as_array().is_none_or(std::vec::Vec::is_empty),
+        after
+            .findings
+            .as_array()
+            .is_none_or(std::vec::Vec::is_empty),
         "must not project instances from an inapplicable round: {:?}",
         after.findings
     );
