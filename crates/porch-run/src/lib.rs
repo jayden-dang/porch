@@ -1800,6 +1800,7 @@ mod notes_tests {
             category: None,
             start_line: Some(1),
             end_line: Some(2),
+            ..Finding::default()
         }];
         let json = findings_json_with_notes(home, "run-n", &selected).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

@@ -9,9 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::{
-    Action, Error, Finding, ReviewComment, ReviewOutcome, Severity, assert_coverage, map_comment,
-};
+use crate::{Action, Error, Finding, ReviewComment, ReviewOutcome, Severity, assert_coverage};
 
 /// Env override for the review agent binary (`claude` / `codex` / PATH fake).
 pub const REVIEW_AGENT_BIN_ENV: &str = "PORCH_REVIEW_AGENT_BIN";
@@ -182,10 +180,17 @@ pub fn write_reviewer_prompt(
 /// Returns [`Error::Json`] when the payload is not valid JSON of either shape.
 pub fn parse_agent_review_json(bytes: &[u8]) -> Result<ReviewOutcome, Error> {
     let parsed: AgentReviewJson = serde_json::from_slice(bytes)?;
+    let mapping = crate::CriterionMapping::builtin();
     let mut findings = Vec::new();
     if parsed.findings.is_empty() {
         for (i, c) in parsed.comments.iter().enumerate() {
-            if let Some(mut f) = map_comment(c) {
+            let deterministic = c.rule_id.as_deref().is_some_and(|s| !s.trim().is_empty());
+            if let Some(mut f) = crate::enrich_from_comment(
+                c,
+                &mapping,
+                &crate::AnchorContext::default(),
+                deterministic,
+            ) {
                 f.id = format!("f{i}");
                 findings.push(f);
             }
@@ -219,8 +224,15 @@ fn map_agent_finding(raw: &AgentFindingIn) -> Finding {
         end_line: raw.end_line,
         category: raw.category.clone(),
         severity: raw.severity.clone(),
+        rule_id: None,
+        confidence: None,
     };
-    if let Some(mut f) = map_comment(&comment) {
+    if let Some(mut f) = crate::enrich_from_comment(
+        &comment,
+        &crate::CriterionMapping::builtin(),
+        &crate::AnchorContext::default(),
+        false,
+    ) {
         if let Some(action) = raw.action.as_deref() {
             f.action = parse_action(action);
         }
@@ -238,7 +250,6 @@ fn map_agent_finding(raw: &AgentFindingIn) -> Finding {
         _ => Severity::Warning,
     };
     Finding {
-        id: String::new(),
         path: raw.path.clone(),
         message,
         severity,
@@ -246,6 +257,7 @@ fn map_agent_finding(raw: &AgentFindingIn) -> Finding {
         category: raw.category.clone(),
         start_line: raw.start_line,
         end_line: raw.end_line,
+        ..Finding::default()
     }
 }
 

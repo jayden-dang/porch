@@ -6,6 +6,7 @@
 mod agent_review;
 mod engine;
 mod home_config;
+mod identity;
 mod pathutil;
 mod plan;
 mod setup;
@@ -30,6 +31,10 @@ pub use engine::{
 pub use home_config::{
     CONFIG_FILE, FixerConfig, GithubConfig, HomeConfig, ReviewConfig, ToolsConfig, config_path,
     load_home_config, write_home_config,
+};
+pub use identity::{
+    Anchor, AnchorContext, AnchorKind, CandidateKey, Confidence, ConfidenceKind, CriterionMapping,
+    FINGERPRINT_VERSION, Provenance, apply_contract, derive, enrich_from_comment, path_key,
 };
 pub use pathutil::{is_executable, resolve_bin, which};
 pub use plan::{
@@ -81,12 +86,49 @@ pub struct Finding {
     pub message: String,
     pub severity: Severity,
     pub action: Action,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_line: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_line: Option<u32>,
+    /// Porch-normalized criterion (optional on legacy rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub criterion_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consequence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<identity::Provenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<identity::Confidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_value: Option<String>,
+}
+
+impl Default for Finding {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            path: String::new(),
+            message: String::new(),
+            severity: Severity::Info,
+            action: Action::NoOp,
+            category: None,
+            start_line: None,
+            end_line: None,
+            criterion_id: None,
+            evidence: None,
+            consequence: None,
+            provenance: None,
+            confidence: None,
+            anchor_kind: None,
+            anchor_value: None,
+        }
+    }
 }
 
 impl Finding {
@@ -116,6 +158,12 @@ pub struct ReviewComment {
     pub category: Option<String>,
     #[serde(default)]
     pub severity: Option<String>,
+    /// Producer-local rule / finding key (provenance only).
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    /// Optional producer-supplied confidence.
+    #[serde(default)]
+    pub confidence: Option<identity::Confidence>,
 }
 
 /// OCR / generic file-group entry (optional coverage source).
@@ -267,7 +315,6 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
 
     if matches!(category.as_str(), "style" | "documentation") {
         return Some(Finding {
-            id: String::new(),
             path: comment.path.clone(),
             message: comment.content.clone(),
             severity: Severity::Info,
@@ -275,6 +322,7 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
             category: Some(category),
             start_line: comment.start_line,
             end_line: comment.end_line,
+            ..Finding::default()
         });
     }
 
@@ -302,7 +350,6 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
     };
 
     Some(Finding {
-        id: String::new(),
         path: comment.path.clone(),
         message: comment.content.clone(),
         severity,
@@ -310,6 +357,7 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
         category: Some(category),
         start_line: comment.start_line,
         end_line: comment.end_line,
+        ..Finding::default()
     })
 }
 
@@ -324,7 +372,16 @@ pub fn map_comment(comment: &ReviewComment) -> Option<Finding> {
 /// Returns [`Error::Json`] when the payload is not valid review JSON.
 pub fn parse_review_json(bytes: &[u8]) -> Result<ReviewOutcome, Error> {
     let parsed: ReviewJson = serde_json::from_slice(bytes)?;
-    let mut findings: Vec<Finding> = parsed.comments.iter().filter_map(map_comment).collect();
+    let mapping = CriterionMapping::builtin();
+    let mut findings: Vec<Finding> = parsed
+        .comments
+        .iter()
+        .filter_map(|c| {
+            // Quality (and other rule-keyed) producers are deterministic: never keep model confidence.
+            let deterministic = c.rule_id.as_deref().is_some_and(|s| !s.trim().is_empty());
+            enrich_from_comment(c, &mapping, &AnchorContext::default(), deterministic)
+        })
+        .collect();
     for (i, f) in findings.iter_mut().enumerate() {
         f.id = format!("f{i}");
     }
@@ -612,6 +669,8 @@ mod tests {
             end_line: Some(2),
             category: Some("bug".into()),
             severity: Some("high".into()),
+            rule_id: None,
+            confidence: None,
         };
         let f = map_comment(&c).unwrap();
         assert!(f.is_blocking());
@@ -629,6 +688,8 @@ mod tests {
             end_line: None,
             category: Some("style".into()),
             severity: Some("medium".into()),
+            rule_id: None,
+            confidence: None,
         };
         let f = map_comment(&c).unwrap();
         assert!(!f.is_blocking());
@@ -646,6 +707,8 @@ mod tests {
             end_line: None,
             category: Some("maintainability".into()),
             severity: Some("low".into()),
+            rule_id: None,
+            confidence: None,
         };
         let f = map_comment(&c).unwrap();
         assert!(f.is_blocking());

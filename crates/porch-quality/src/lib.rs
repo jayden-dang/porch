@@ -57,6 +57,9 @@ pub struct CommentOut {
     pub category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity: Option<String>,
+    /// First-party rule identity (`pack/rule`); optional for older callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
 }
 
 /// One JSON group.
@@ -137,6 +140,7 @@ pub fn run_quality(opts: &RunOpts<'_>) -> Result<ReviewOutput, Error> {
                     end_line: Some(line),
                     category: Some(raw.category),
                     severity: Some(raw.severity),
+                    rule_id: Some(raw.rule_id),
                 });
             }
             RelocateOutcome::Dropped { .. } => {
@@ -258,5 +262,26 @@ mod integration {
             "comments={:?}",
             out.comments
         );
+        let unwrap = out
+            .comments
+            .iter()
+            .find(|c| c.content.contains("unwrap-in-lib"))
+            .expect("unwrap comment");
+        assert_eq!(unwrap.rule_id.as_deref(), Some("rust/unwrap-in-lib"));
+
+        let json = serde_json::to_value(&out).unwrap();
+        let first_rule = json["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| {
+                c["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("unwrap-in-lib")
+            })
+            .and_then(|c| c.get("rule_id"))
+            .and_then(|v| v.as_str());
+        assert_eq!(first_rule, Some("rust/unwrap-in-lib"));
     }
 }
