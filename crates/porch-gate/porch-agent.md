@@ -52,13 +52,31 @@ Default: latest **parked** run for the cwd repo (`porch.repo-id` / worktree matc
       "start_line": 10,
       "end_line": 12
     }
-  ]
+  ],
+  "assurance_record": {
+    "kind": "round",
+    "review_round_id": "01H…",
+    "audit_identity": "available",
+    "assurance_shape": "floor+judgment"
+  }
 }
 ```
+
+`assurance_record.assurance_shape` is presentation only (`floor-only` or
+`floor+judgment`), derived from the round's recorded required producer set. It
+is **not** authorization identity. `kind` `legacy_snapshot` and `none` omit
+the field rather than inventing a shape.
 
 When `phase` is `"compose"`, status also includes `pr_url`, `compose_packet_path`
 (`$PORCH_HOME/runs/<run_id>/compose-packet.json`), and `allowed_actions`
 `["respond","skip","abort"]`.
+
+A **failed** run (including an unsatisfied floor) exposes **no** response verbs
+and is not parked. The `error` text includes a copyable
+`porch rerun --run-id <ULID>`. When the cause is floor resolution (missing
+sibling executable / daemon environment), it also advises restarting the daemon
+before rerunning. A pin mismatch names both the pinned and the attempted
+assurance shape.
 
 On error: `{"error":"…"}` or `{"error":"…","code":"usage"}`.
 

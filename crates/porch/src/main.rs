@@ -579,12 +579,22 @@ fn run_status(json: bool) -> Result<ExitCode> {
         println!("PORCH_HOME={}", home.display());
         match latest {
             Some(r) => {
+                let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                 println!(
-                    "latest: {} {} {}",
-                    r.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+                    "latest: {id} {} {}",
                     r.get("branch").and_then(|v| v.as_str()).unwrap_or("?"),
                     r.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
                 );
+                if let Ok(snap) = get_run(&home, id) {
+                    if let Some(shape) = snap.assurance_record.assurance_shape() {
+                        println!("assurance shape {shape}");
+                    }
+                    if snap.status == "failed" {
+                        if let Some(err) = snap.error.as_deref() {
+                            println!("{err}");
+                        }
+                    }
+                }
             }
             None => println!("latest: (none)"),
         }

@@ -40,8 +40,8 @@ pub use rpc::start_run as rpc_start_run;
 pub use rpc::{
     AssuranceRecord, AuditIdentity, FINDING_HUNK_MAX_BYTES, LegacyFindingDto, RunSnapshot,
     StatusFindingDto, StepSnapshot, UnavailableAudit, clear_rounds_for_run, compact_run_row,
-    get_finding_hunk, get_run, health_check, list_runs, resolve_run_assurance, round_for_decision,
-    subscribe_events,
+    get_finding_hunk, get_run, health_check, list_runs, operator_failure_report,
+    resolve_run_assurance, round_for_decision, subscribe_events,
 };
 pub use service::{
     ServicePaths, ServiceStatus, daemon_service_suffix, install_service, render_launchd_plist,

@@ -106,11 +106,13 @@ case "$CMD" in
     if [ -f "$STATE" ]; then /bin/cat "$STATE"; else printf '[]\n'; fi
     ;;
   create)
-    /bin/cat >/dev/null
+    /bin/cat > "$PORCH_HOME/gh-pr-body.txt"
     printf '[{"number":1,"url":"https://example.com/pull/1","title":"porch: created"}]\n' > "$STATE"
     echo "https://example.com/pull/1"
     ;;
-  edit) /bin/cat >/dev/null ;;
+  edit)
+    /bin/cat > "$PORCH_HOME/gh-pr-body.txt"
+    ;;
   view) printf '{"mergeable":"MERGEABLE","number":1,"url":"https://example.com/pull/1","title":"porch: created","body":""}\n' ;;
   checks) printf '[]\n' ;;
   *) echo "noop-gh: $*" >&2; exit 1 ;;
@@ -528,6 +530,25 @@ fn park_with_blocking_floor(h: &Harness, branch: &str) -> (Db, porch_gate::RunRo
     );
     assert_eq!(run.status, "parked", "err={:?}", run.error);
     (db, run)
+}
+
+fn agent_status_json(h: &Harness, run_id: &str) -> serde_json::Value {
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .env("PATH", &h.path)
+        .args(["agent", "status", "--run-id", run_id])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "status json: {e}; exit={:?} stdout={stdout} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
 }
 
 fn assert_shape_mismatch(
@@ -1104,6 +1125,206 @@ fn a_pre_floor_client_cannot_create_or_approve_on_an_upgraded_state_root() {
         approve_msg.contains("porch_writer_protocol"),
         "absence must fail closed, got {approve_msg}"
     );
+
+    kill_daemon(&h.home);
+}
+
+#[test]
+fn run_status_states_the_recorded_assurance_shape() {
+    {
+        let h = setup_quality("clean");
+        push_branch(&h.work, &h.home, "feat-shape-floor-only");
+        let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+        let repo_id = repo_id_for(&h.work);
+        let run = wait_status(
+            &db,
+            &repo_id,
+            &["parked", "failed", "completed"],
+            Duration::from_secs(30),
+        );
+        assert_ne!(run.status, "failed", "err={:?}", run.error);
+        let snap = porch_gate::get_run(&h.home, &run.id).unwrap();
+        let rec = serde_json::to_value(&snap.assurance_record).unwrap();
+        assert_eq!(rec["kind"], "round", "{rec}");
+        assert_eq!(rec["assurance_shape"], "floor-only", "{rec}");
+        let v = agent_status_json(&h, &run.id);
+        assert_eq!(v["assurance_record"]["kind"], "round");
+        assert_eq!(v["assurance_record"]["assurance_shape"], "floor-only");
+        kill_daemon(&h.home);
+    }
+
+    {
+        let h = setup_agent("clean");
+        push_branch(&h.work, &h.home, "feat-shape-floor-judgment");
+        let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+        let repo_id = repo_id_for(&h.work);
+        let run = wait_status(
+            &db,
+            &repo_id,
+            &["parked", "failed", "completed"],
+            Duration::from_secs(30),
+        );
+        assert_ne!(run.status, "failed", "err={:?}", run.error);
+        let snap = porch_gate::get_run(&h.home, &run.id).unwrap();
+        let rec = serde_json::to_value(&snap.assurance_record).unwrap();
+        assert_eq!(rec["kind"], "round", "{rec}");
+        assert_eq!(rec["assurance_shape"], "floor+judgment", "{rec}");
+        let v = agent_status_json(&h, &run.id);
+        assert_eq!(v["assurance_record"]["kind"], "round");
+        assert_eq!(v["assurance_record"]["assurance_shape"], "floor+judgment");
+        kill_daemon(&h.home);
+    }
+}
+
+#[test]
+fn delivered_attestation_states_the_assurance_shape() {
+    let h = setup_quality("clean");
+    push_branch(&h.work, &h.home, "feat-attest-shape");
+    let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&h.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed", "completed"],
+        Duration::from_secs(30),
+    );
+    assert_ne!(run.status, "failed", "err={:?}", run.error);
+    assert!(run.pr_url.is_some(), "run must open a PR: {run:?}");
+    let body = fs::read_to_string(h.home.join("gh-pr-body.txt")).expect("gh body");
+    assert!(body.contains("<!-- porch-attestation"), "{body}");
+    let start = body
+        .find("<!-- porch-attestation")
+        .and_then(|i| body[i..].find('{').map(|j| i + j))
+        .expect("attestation json");
+    let end = body[start..]
+        .find("-->")
+        .map(|i| start + i)
+        .expect("attestation close");
+    let json: serde_json::Value = serde_json::from_str(body[start..end].trim()).unwrap();
+    assert_eq!(json["assurance_shape"], "floor-only", "{json}");
+    let head = json["head_sha"].as_str().unwrap_or("");
+    assert!(!head.is_empty(), "attestation must keep head_sha: {json}");
+    assert_eq!(
+        Some(head),
+        run.head_sha.as_deref(),
+        "attestation head_sha must bind the delivered tip: {json}"
+    );
+    kill_daemon(&h.home);
+}
+
+#[test]
+fn unsatisfied_floor_exposes_no_response_and_rerun_diagnostics() {
+    let h = setup_quality("missing");
+    push_branch(&h.work, &h.home, "feat-floor-diag");
+    let db = Db::open(&h.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&h.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed", "completed"],
+        Duration::from_secs(20),
+    );
+    assert_failed_closed(&db, &run);
+
+    let v = agent_status_json(&h, &run.id);
+    assert_eq!(v["status"], "failed");
+    let actions = v["allowed_actions"].as_array();
+    assert!(
+        actions.is_none_or(Vec::is_empty),
+        "failed floor-blocked run must expose no response verbs: {v}"
+    );
+    if let Some(actions) = actions {
+        for verb in ["approve", "skip", "fix", "respond", "abort"] {
+            assert!(
+                !actions.iter().any(|x| x.as_str() == Some(verb)),
+                "failed floor-blocked run exposed {verb}: {v}"
+            );
+        }
+    }
+    let blob = v.to_string();
+    let rerun = format!("porch rerun --run-id {}", run.id);
+    assert!(
+        blob.contains(&rerun),
+        "diagnostics must carry copyable {rerun}: {v}"
+    );
+    let lower = blob.to_ascii_lowercase();
+    assert!(
+        lower.contains("restart") && lower.contains("daemon"),
+        "resolution failure must advise restarting the daemon: {v}"
+    );
+
+    let respond = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .env("PATH", &h.path)
+        .args(["agent", "respond", "approve", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    let respond_v: serde_json::Value = serde_json::from_slice(&respond.stdout)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&respond.stdout) }));
+    assert_ne!(
+        respond_v.get("status").and_then(|s| s.as_str()),
+        Some("parked")
+    );
+    assert_ne!(
+        respond_v.get("status").and_then(|s| s.as_str()),
+        Some("completed")
+    );
+    let after = db.run_by_id(&run.id).unwrap().expect("run");
+    assert_eq!(after.status, "failed");
+    assert!(after.review_approved_head_sha.is_none());
+
+    kill_daemon(&h.home);
+}
+
+#[test]
+fn pin_mismatch_reports_both_shapes_and_setup_is_unchanged() {
+    let h = setup_agent("blocking");
+    Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .env("PATH", &h.path)
+        .env_remove("PORCH_REVIEW_BIN")
+        .args(["setup", "--verify"])
+        .assert()
+        .success();
+
+    let (db, run) = park_with_blocking_floor(&h, "feat-pin-report");
+    set_home_engine(&h.home, "quality");
+    let _ = respond_fix(&h, &run.id, &[]);
+    assert_shape_mismatch(&db, &run, "floor+judgment", "floor-only");
+
+    let v = agent_status_json(&h, &run.id);
+    let err = v["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("floor+judgment") && err.contains("floor-only"),
+        "mismatch must name both shapes: {v}"
+    );
+    assert!(
+        err.contains("pinned") && err.contains("attempted"),
+        "mismatch must label pinned vs attempted: {v}"
+    );
+
+    Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .env("PATH", &h.path)
+        .env_remove("PORCH_REVIEW_BIN")
+        .args(["setup", "--yes", "--engine", "quality"])
+        .assert()
+        .success();
+    Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .env("PATH", &h.path)
+        .env_remove("PORCH_REVIEW_BIN")
+        .args(["setup", "--verify"])
+        .assert()
+        .success();
 
     kill_daemon(&h.home);
 }

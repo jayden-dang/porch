@@ -1266,6 +1266,11 @@ fn legacy_parked_run_answers_actions_and_unreviewed_is_none() {
         assert_eq!(snap.assurance_record.kind_str(), "legacy_snapshot");
         assert!(snap.assurance_record.review_round_id().is_none());
         assert!(!snap.assurance_record.audit_identity_available());
+        let rec = serde_json::to_value(&snap.assurance_record).unwrap();
+        assert!(
+            rec.get("assurance_shape").is_none() || rec["assurance_shape"].is_null(),
+            "legacy must not fabricate an assurance shape: {rec}"
+        );
         assert_eq!(snap.findings[0]["message"], instances[0].evidence);
         assert!(snap.findings[0].get("criterion_id").is_none());
 
@@ -1413,6 +1418,11 @@ fn legacy_parked_run_answers_actions_and_unreviewed_is_none() {
         assert_eq!(record.kind_str(), "none");
         assert!(record.review_round_id().is_none());
         assert!(!record.audit_identity_available());
+        let rec = serde_json::to_value(&record).unwrap();
+        assert!(
+            rec.get("assurance_shape").is_none() || rec["assurance_shape"].is_null(),
+            "unreviewed must not fabricate an assurance shape: {rec}"
+        );
         assert!(findings.is_empty());
         kill_daemon(&s.home);
     }

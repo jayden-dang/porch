@@ -2343,7 +2343,9 @@ pub(crate) fn status_from_run(
         review_approved_head_sha: run.review_approved_head_sha.clone(),
         findings,
         assurance_record,
-        error: run.error.clone(),
+        error: porch_gate::operator_failure_report(db, run)
+            .map_err(|e| e.to_string())?
+            .or_else(|| run.error.clone()),
         pr_url: run.pr_url.clone(),
         compose_packet_path,
         allowed_actions,

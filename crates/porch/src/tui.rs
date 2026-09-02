@@ -98,6 +98,11 @@ impl App {
             list_state.select(Some(0));
         }
         let sync_msg = sync_hint_for(home, work_tree).unwrap_or_default();
+        let message = if snapshot.status == "failed" {
+            snapshot.error.clone().unwrap_or(sync_msg)
+        } else {
+            sync_msg
+        };
         Self {
             snapshot,
             findings,
@@ -106,7 +111,7 @@ impl App {
             activity: Vec::new(),
             abort_armed: false,
             working: false,
-            message: sync_msg,
+            message,
             show_detail: false,
             detail_hunk: String::new(),
             notes: notes.into_iter().collect(),
@@ -405,7 +410,19 @@ impl App {
         let area = frame.area();
         let detail_h = if self.show_detail { 8u16 } else { 0 };
         let note_h = if self.note_editing.is_some() { 3u16 } else { 0 };
-        let pipeline_h = if self.compose_parked() { 7u16 } else { 5u16 };
+        let mut pipeline_h = 5u16;
+        if self.snapshot.assurance_record.assurance_shape().is_some() {
+            pipeline_h = pipeline_h.saturating_add(1);
+        }
+        if self.snapshot.status == "failed" {
+            if let Some(err) = &self.snapshot.error {
+                let extra = u16::try_from(err.lines().count()).unwrap_or(3);
+                pipeline_h = pipeline_h.saturating_add(extra);
+            }
+        }
+        if self.compose_parked() {
+            pipeline_h = pipeline_h.saturating_add(2);
+        }
         let [pipeline, findings, detail, note_bar, activity, footer] = Layout::vertical([
             Constraint::Length(pipeline_h),
             Constraint::Percentage(if self.show_detail { 30 } else { 45 }),
@@ -465,6 +482,16 @@ impl App {
             .collect::<Vec<_>>()
             .join("  ");
         let mut pipeline_text = format!("branch {branch}  status {status}\n{phase_line}");
+        if let Some(shape) = self.snapshot.assurance_record.assurance_shape() {
+            let _ = write!(pipeline_text, "\nassurance shape {shape}");
+        }
+        if self.snapshot.status == "failed" {
+            if let Some(err) = &self.snapshot.error {
+                for line in err.lines() {
+                    let _ = write!(pipeline_text, "\n{line}");
+                }
+            }
+        }
         if self.compose_parked() {
             let packet =
                 run_artifact_dir(&self.home, &self.snapshot.run_id).join("compose-packet.json");
@@ -880,6 +907,40 @@ mod tests {
         assert!(app.selected.contains("f0"));
         let _ = app.handle_key(KeyCode::Char(' '));
         assert!(!app.selected.contains("f0"));
+    }
+
+    #[test]
+    fn failed_run_shows_rerun_and_hides_response_keys() {
+        let home = PathBuf::from("/tmp");
+        let mut snap = parked_snapshot();
+        snap.status = "failed".into();
+        snap.error = Some(
+            "floor unresolved: sibling missing\nporch rerun --run-id 01TEST\nRestart the porch daemon before rerunning so it resolves the floor executable."
+                .into(),
+        );
+        let mut app = App::from_snapshot(snap, &home, &home);
+        assert!(!app.actions_enabled());
+        let s = render_to_string(&mut app, 120, 28);
+        assert!(s.contains("porch rerun --run-id 01TEST"), "buffer={s}");
+        assert!(
+            !s.contains("a approve") && !s.contains("s skip") && !s.contains("f fix"),
+            "failed run must not show response keys: {s}"
+        );
+    }
+
+    #[test]
+    fn render_shows_assurance_shape_from_the_record() {
+        let home = PathBuf::from("/tmp");
+        let mut snap = parked_snapshot();
+        snap.assurance_record =
+            porch_gate::AssuranceRecord::round_with_shape("01ROUND", Some("floor+judgment".into()));
+        let mut app = App::from_snapshot(snap, &home, &home);
+        let s = render_to_string(&mut app, 100, 24);
+        assert!(s.contains("assurance shape floor+judgment"), "buffer={s}");
+        assert!(
+            s.contains("a approve"),
+            "shape display must not hide park actions: {s}"
+        );
     }
 
     #[test]

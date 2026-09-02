@@ -31,7 +31,7 @@ fn resolve_gh_bin() -> String {
     }
     gh_bin()
 }
-use porch_gate::{Db, event_hub, run_artifact_dir};
+use porch_gate::{Db, event_hub, resolve_run_assurance, run_artifact_dir};
 use porch_git::{
     GitDir, PushDecision, RemoteTip, ls_remote_sha, push_exact_sha, remote_commits_incorporated,
     resolve_push_decision,
@@ -319,6 +319,7 @@ fn assemble_scaffold(
     let attestation = Attestation {
         head_sha: head_sha.to_string(),
         steps: snapshots,
+        assurance_shape: attestation_shape(db, run)?,
     };
 
     let trusted_sha = run.trusted_config_sha.as_deref().ok_or_else(|| {
@@ -590,10 +591,19 @@ fn attestation_post_compose(
         step: "deliver".into(),
         status: "completed".into(),
     });
+    let run = db
+        .run_by_id(run_id)?
+        .ok_or_else(|| DeliverError::Msg(format!("unknown run {run_id}")))?;
     Ok(Attestation {
         head_sha: head_sha.to_string(),
         steps: snapshots,
+        assurance_shape: attestation_shape(db, &run)?,
     })
+}
+
+fn attestation_shape(db: &Db, run: &porch_gate::RunRow) -> Result<Option<String>, DeliverError> {
+    let (record, _) = resolve_run_assurance(db, run)?;
+    Ok(record.assurance_shape().map(str::to_string))
 }
 
 fn commit_subjects(wt: &Path, base_sha: Option<&str>, head_sha: &str) -> Vec<String> {

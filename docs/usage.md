@@ -140,6 +140,11 @@ Non-TTY `porch` / `attach` prints a snapshot (never raw mode).
 
 When `phase=compose`, `porch agent status` also shows `pr_url`, `compose_packet_path` (`$PORCH_HOME/runs/<run_id>/compose-packet.json`), and `allowed_actions` `respond` | `skip` | `abort`.
 
+`porch agent status` and `porch status` state the run's **assurance shape**
+(`floor-only` or `floor+judgment`) on `assurance_record` when a round backs the
+run. Legacy and unreviewed records omit the shape. A delivered PR's hidden
+`porch-attestation` comment includes the same shape next to `head_sha`.
+
 ## I. Parked review (TUI)
 
 When `status=parked` and `phase=review`:
@@ -277,17 +282,39 @@ porch agent sync                    # if local branch lags pipeline
 | compose respond rejected | Drop gate theater headings from the body; do not paste Review/Certify/Pipeline boards |
 | deliver no PR | `gh auth status`; doctor `gh` ok |
 | old `~/.porch` still OCR | `porch setup --yes` again |
+| run failed: floor unresolved / missing `porch-quality` | Restart the porch daemon, then `porch rerun --run-id <ULID>` (copy from status). Do not approve or skip — there is no park |
+| run failed: assurance shape mismatch | Status names pinned vs attempted shape. Fix review config, then `porch rerun --run-id <ULID>` |
 
 ## Q. What porch is not
 
 Not CI. Not deploy. Not a merge bot. Not team governance. It sits **in front of** production rings; it does not swallow them.
 
-## R. Upgrading porch (review round identity)
+## R. Upgrading porch (review round identity and the mandatory floor)
 
 Finish parked runs before upgrading when you can. An upgrade **preserves** a parked legacy run
 (`runs.findings_json`) so approve / fix / skip / abort, notes, and hunk lookup still work, but it
 **cannot** give that run round identity retroactively. A **fresh run after upgrade** is how a
 change gets a durable review round.
+
+This release also installs a **database-resident compatibility fence** (protocol 2). The first
+open of an upgraded `$PORCH_HOME` terminalizes any still-active run that has no protocol-2
+round and clears undelivered legacy approvals. New runs after that point always require the
+deterministic floor.
+
+**Rollback** to a pre-floor (`0.2.x`) binary against an upgraded state root is **unsupported**.
+The fence refuses new runs and approvals from a writer that does not understand protocol 2.
+Restore a backup of `$PORCH_HOME` taken before the upgrade if you must run an older binary.
+
+**Recovery** after an unsatisfied floor or a shape mismatch: fix the cause (install
+`porch-quality` next to `porch`, or restore the review engine), **restart the porch daemon**
+when the recorded cause is resolution / missing executable, then:
+
+```sh
+porch rerun --run-id <ULID>
+```
+
+That allocates a new run from the prior tip and intent. It does not reuse the failed run's
+authorization.
 
 Back up `$PORCH_HOME` before upgrading. **Downgrade** after new-format round rows exist is
 **unsupported**.

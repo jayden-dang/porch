@@ -11,7 +11,9 @@ use crate::Result;
 use crate::db::{Db, RunRow, StepResultRow};
 use crate::events::{Event, EventHub};
 use crate::home::socket_path;
-use crate::rounds::{self, Applicability, FindingInstanceRecord, RoundId};
+use crate::rounds::{
+    self, Applicability, AssuranceCompletion, FindingInstanceRecord, RequirementRow, Role, RoundId,
+};
 
 /// Soft cap for on-demand finding hunk / diff payloads (bytes).
 pub const FINDING_HUNK_MAX_BYTES: usize = 16_384;
@@ -39,23 +41,38 @@ pub enum AssuranceRecord {
     Round {
         review_round_id: String,
         audit_identity: AuditIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assurance_shape: Option<String>,
     },
     LegacySnapshot {
         review_round_id: Option<String>,
         audit_identity: AuditIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assurance_shape: Option<String>,
     },
     None {
         review_round_id: Option<String>,
         audit_identity: AuditIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assurance_shape: Option<String>,
     },
 }
 
 impl AssuranceRecord {
     #[must_use]
     pub fn round(review_round_id: impl Into<String>) -> Self {
+        Self::round_with_shape(review_round_id, None)
+    }
+
+    #[must_use]
+    pub fn round_with_shape(
+        review_round_id: impl Into<String>,
+        assurance_shape: Option<String>,
+    ) -> Self {
         Self::Round {
             review_round_id: review_round_id.into(),
             audit_identity: AuditIdentity::Available("available".into()),
+            assurance_shape,
         }
     }
 
@@ -68,6 +85,7 @@ impl AssuranceRecord {
                     reason: "predates_round_identity".into(),
                 },
             },
+            assurance_shape: None,
         }
     }
 
@@ -80,6 +98,7 @@ impl AssuranceRecord {
                     reason: "not_reviewed".into(),
                 },
             },
+            assurance_shape: None,
         }
     }
 
@@ -111,6 +130,32 @@ impl AssuranceRecord {
     pub fn audit_identity_available(&self) -> bool {
         matches!(self, Self::Round { .. })
     }
+
+    #[must_use]
+    pub fn assurance_shape(&self) -> Option<&str> {
+        match self {
+            Self::Round {
+                assurance_shape, ..
+            }
+            | Self::LegacySnapshot {
+                assurance_shape, ..
+            }
+            | Self::None {
+                assurance_shape, ..
+            } => assurance_shape.as_deref(),
+        }
+    }
+}
+
+fn shape_from_requirements(rows: &[RequirementRow]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+    Some(if rows.iter().any(|row| row.role == Role::Judgment) {
+        "floor+judgment".into()
+    } else {
+        "floor-only".into()
+    })
 }
 
 impl Default for AssuranceRecord {
@@ -221,7 +266,11 @@ pub fn resolve_run_assurance(
             .enumerate()
             .map(|(i, inst)| status_from_instance(i, inst))
             .collect();
-        return Ok((AssuranceRecord::round(round_id.as_str()), findings));
+        let rows = rounds::requirements_for_round(db, &round_id)?;
+        return Ok((
+            AssuranceRecord::round_with_shape(round_id.as_str(), shape_from_requirements(&rows)),
+            findings,
+        ));
     }
 
     match run.findings_json.as_deref() {
@@ -234,6 +283,77 @@ pub fn resolve_run_assurance(
         }
         None => Ok((AssuranceRecord::none(), Vec::new())),
     }
+}
+
+/// Operator-facing failure copy: recovery command and, when needed, daemon restart advice.
+///
+/// # Errors
+///
+/// Returns a storage error when round rows cannot be read.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn operator_failure_report(db: &Db, run: &RunRow) -> Result<Option<String>> {
+    if run.status != "failed" {
+        return Ok(None);
+    }
+    let mut lines = Vec::new();
+    if let Some(raw) = run.error.as_deref() {
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(raw) {
+            if payload.get("kind").and_then(|v| v.as_str()) == Some("assurance_shape_mismatch") {
+                let pinned = payload["pinned_shape"].as_str().unwrap_or("unknown");
+                let attempted = payload["attempted_shape"].as_str().unwrap_or("unknown");
+                lines.push(format!(
+                    "Assurance shape mismatch: pinned {pinned}, attempted {attempted}."
+                ));
+            } else {
+                lines.push(raw.to_string());
+            }
+        } else {
+            lines.push(raw.to_string());
+        }
+    }
+    if floor_requirement_unsatisfied(db, run)? || shape_mismatch_payload(run).is_some() {
+        lines.push(format!("porch rerun --run-id {}", run.id));
+    }
+    if floor_resolution_cause(run) {
+        lines.push(
+            "Restart the porch daemon before rerunning so it resolves the floor executable.".into(),
+        );
+    }
+    if lines.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(lines.join("\n")))
+    }
+}
+
+fn shape_mismatch_payload(run: &RunRow) -> Option<serde_json::Value> {
+    let raw = run.error.as_deref()?;
+    let payload: serde_json::Value = serde_json::from_str(raw).ok()?;
+    (payload.get("kind").and_then(|v| v.as_str()) == Some("assurance_shape_mismatch"))
+        .then_some(payload)
+}
+
+fn floor_resolution_cause(run: &RunRow) -> bool {
+    run.error
+        .as_deref()
+        .is_some_and(|e| e.contains("floor unresolved"))
+}
+
+fn floor_requirement_unsatisfied(db: &Db, run: &RunRow) -> Result<bool> {
+    if floor_resolution_cause(run) {
+        return Ok(true);
+    }
+    let rounds = rounds::rounds_for_run(db, &run.id)?;
+    Ok(rounds.iter().any(|round| {
+        round.assurance_completion == AssuranceCompletion::Incomplete
+            && round
+                .completion_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("floor"))
+    }))
 }
 
 /// Remove all round rows for a run (cascade). Used by tests simulating pre-migration state.
@@ -338,7 +458,7 @@ pub fn build_run_snapshot(
         head_sha: run.head_sha.clone(),
         base_sha: run.base_sha.clone(),
         review_approved_head_sha: run.review_approved_head_sha.clone(),
-        error: run.error.clone(),
+        error: operator_failure_report(db, run)?.or_else(|| run.error.clone()),
         pr_url: run.pr_url.clone(),
         worktree_dir: run
             .worktree_dir

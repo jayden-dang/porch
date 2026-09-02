@@ -412,6 +412,8 @@ pub struct Attestation {
     pub head_sha: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StepSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assurance_shape: Option<String>,
 }
 
 /// Placeholder facts for the default scaffold (not a path-list dump).
@@ -1217,6 +1219,7 @@ mod tests {
                 step: "review".into(),
                 status: "completed".into(),
             }],
+            assurance_shape: None,
         }
     }
 
@@ -1310,6 +1313,7 @@ mod tests {
             &Attestation {
                 head_sha: "newsha".into(),
                 steps: vec![],
+                assurance_shape: None,
             },
         );
         assert!(merged.contains("operator note"), "{merged}");
