@@ -30,11 +30,12 @@ Never the operator's checkout.
 _Avoid_: "sandbox", "container" — no isolation boundary beyond the filesystem is implied.
 
 **Review**:
-The layered assurance stage of the **Assurance protocol**: a mandatory
-**Deterministic floor** over the diff, plus a session-free **Judgment layer**
-that emits findings as JSON. The judgment layer is porch-native by default and
-may be supplied by an external **Producer** that meets the declared bar; the
-floor never is.
+The layered assurance stage of the **Assurance protocol**. It always includes the
+mandatory **Deterministic floor** over the diff, and may also include a
+session-free **Judgment layer** that emits findings as JSON — optional, but never
+implicit: which layers a round required is recorded as its **Assurance shape**.
+The judgment layer is porch-native by default and may be supplied by an external
+**Producer** that meets the declared bar; the floor never is.
 _Avoid_: "lint" — lint is a certification check, not review.
 
 **Review round**:
@@ -89,6 +90,19 @@ The layer above the floor that exercises judgment on the change. Supplied by the
 porch-native review by default, or by an external **Producer** that meets the
 declared bar.
 _Avoid_: "the reviewer" — that names the turn, not the layer.
+
+**Required producer set**:
+The producers a **Review round** was required to have, recorded when the round is
+opened and never reconstructed from the producers that actually ran. Porch owns
+it; the floor is always in it. Authorization compares against this record.
+_Avoid_: "expected producers", "producer list" — those name what ran.
+
+**Assurance shape**:
+Which layers a round's **Required producer set** demanded — floor-only, or floor
+plus judgment. Pinned per **Run** at its first round and identical for every later
+round of that run. Its human-readable name is presentation; the authorization
+identity is the canonical digest over the required set.
+_Avoid_: "review mode", "engine" — the engine is a selection, not the shape.
 
 **Independence**:
 Context and process isolation of review from the writing of the change, so
