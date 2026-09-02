@@ -6,9 +6,10 @@ use ulid::Ulid;
 
 use super::{
     AssuranceCompletion, ContextApplication, ContextApplicationRecord, ContextElement,
-    CoverageState, ExecutionState, RequirementRow, Resolution, RoundBindings, RoundId,
-    capture_context_element, context_applications_for_round, context_elements_for_round,
-    coverage_for_round, get_round, producers_for_round, requirements_for_round, rounds_for_run,
+    CoverageState, ExecutionState, PROTOCOL_SCHEMA_VERSION, RequirementRow, Resolution,
+    RoundBindings, RoundId, capture_context_element, context_applications_for_round,
+    context_elements_for_round, coverage_for_round, get_round, producers_for_round,
+    required_set_digest, requirements_for_round, rounds_for_run, run_required_set_digest,
     sha256_hex,
 };
 use super::{ContextSource, SnapshotState};
@@ -273,6 +274,16 @@ fn round_is_applicable(
         return Ok(false);
     };
 
+    if round.protocol_schema_version > PROTOCOL_SCHEMA_VERSION {
+        return Err(crate::Error::Other(format!(
+            "round protocol schema version {} is greater than understood version {PROTOCOL_SCHEMA_VERSION}",
+            round.protocol_schema_version
+        )));
+    }
+    if round.protocol_schema_version < PROTOCOL_SCHEMA_VERSION {
+        return Ok(false);
+    }
+
     if round.finalized_at.is_none()
         || round.execution != ExecutionState::Finished
         || round.assurance_completion != AssuranceCompletion::Complete
@@ -316,6 +327,12 @@ fn round_is_applicable(
     let producers = producers_for_round(db, round_id)?;
     let recorded = requirements_for_round(db, round_id)?;
     if !recorded_set_matches_invocations(&producers, &recorded) {
+        return Ok(false);
+    }
+    let Some(pin) = run_required_set_digest(db, &round.run_id)? else {
+        return Ok(false);
+    };
+    if required_set_digest(round.protocol_schema_version, &recorded) != pin {
         return Ok(false);
     }
     let Some(bijection) = producer_bijection(&producers, required) else {

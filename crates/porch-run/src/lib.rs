@@ -9,6 +9,7 @@ mod sync;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 /// Serialize fetch + tip resolve across concurrent rebases in this process.
 static FETCH_RESOLVE_LOCK: Mutex<()> = Mutex::new(());
@@ -20,10 +21,10 @@ use porch_agent::{
 use porch_gate::rounds::{
     self, AssuranceCompletion, ContextApplication, ContextApplicationState, ContextSource,
     EquivalenceInput, ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal,
-    ObservedVersionForEquivalence, OpenRoundPlan, ProducerInvocation, RequirementRow,
-    RequirementSpec, Resolution, Role, RoundCoverageProposal, RoundId, STALE_REVISION_RETRIES,
-    capture_context_element, descriptor_equivalence_digest, required_set_digest,
-    run_required_set_digest, sha256_hex,
+    ObservedVersionForEquivalence, OpenRoundPlan, ProducerDuration, ProducerInvocation,
+    RequirementRow, RequirementSpec, Resolution, Role, RoundCoverageProposal, RoundId,
+    STALE_REVISION_RETRIES, capture_context_element, descriptor_equivalence_digest,
+    required_set_digest, run_required_set_digest, sha256_hex,
 };
 use porch_gate::{
     Db, RunExecutor, RunRow, StatusFindingDto, db_path, event_hub, load_finding_notes, repo_id_for,
@@ -267,8 +268,7 @@ enum ReviewPhase {
     Parked,
 }
 
-/// Protocol schema version recorded on every round opened by this binary.
-const PROTOCOL_SCHEMA_VERSION: i64 = 1;
+const PROTOCOL_SCHEMA_VERSION: i64 = rounds::PROTOCOL_SCHEMA_VERSION;
 
 fn run_review_phase(
     db: &Db,
@@ -348,6 +348,8 @@ struct OpenedRound {
 struct SpawnedReview {
     findings: Vec<(String, Finding)>,
     coverage: Vec<RoundCoverageProposal>,
+    producer_durations: Vec<ProducerDuration>,
+    review_duration_ms: i64,
 }
 
 impl SpawnedReview {
@@ -779,6 +781,8 @@ fn spawn_review_for_round(db: &Db, ctx: &SpawnReviewCtx<'_>) -> Result<SpawnedRe
     let opened = ctx.opened;
     let mut findings = Vec::new();
     let mut coverage = Vec::new();
+    let mut producer_durations = Vec::new();
+    let review_started = Instant::now();
     for (index, slot) in opened.slots.iter().enumerate() {
         let role = if index == 0 {
             Role::Floor
@@ -788,6 +792,7 @@ fn spawn_review_for_round(db: &Db, ctx: &SpawnReviewCtx<'_>) -> Result<SpawnedRe
         if let Err(e) = check_artifacts_stable(&slot.plan) {
             return abort_slot(db, &opened.round_id, e, role);
         }
+        let spawn_started = Instant::now();
         let spawn_result = run_review(&RunReviewOpts {
             work_tree: ctx.wt,
             from_sha: ctx.from_sha,
@@ -801,10 +806,15 @@ fn spawn_review_for_round(db: &Db, ctx: &SpawnReviewCtx<'_>) -> Result<SpawnedRe
             plan: Some(&slot.plan),
             artifact_dir: Some(&slot.artifact_dir),
         });
+        let duration_ms = millis_i64(spawn_started.elapsed());
         match spawn_result {
             Ok(outcome) => match slot_coverage(ctx.changed, &slot.producer_invocation_id, &outcome)
             {
                 Ok(rows) => {
+                    producer_durations.push(ProducerDuration {
+                        producer_invocation_id: slot.producer_invocation_id.clone(),
+                        duration_ms,
+                    });
                     coverage.extend(rows);
                     for finding in outcome.findings {
                         findings.push((slot.producer_invocation_id.clone(), finding));
@@ -818,7 +828,16 @@ fn spawn_review_for_round(db: &Db, ctx: &SpawnReviewCtx<'_>) -> Result<SpawnedRe
     if std::env::var_os("PORCH_TEST_ABORT_BEFORE_ROUND_FINALIZE").is_some() {
         return Err(RunError::Msg("test abort before round finalize".into()));
     }
-    Ok(SpawnedReview { findings, coverage })
+    Ok(SpawnedReview {
+        findings,
+        coverage,
+        producer_durations,
+        review_duration_ms: millis_i64(review_started.elapsed()),
+    })
+}
+
+fn millis_i64(elapsed: std::time::Duration) -> i64 {
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
 fn incomplete_reason(err: &porch_review::Error, role: Role) -> &'static str {
@@ -869,7 +888,7 @@ fn finalize_complete_round(
         &opened.round_id,
         &current,
         &provisional,
-        &spawned.coverage,
+        spawned,
     )?;
     Ok(())
 }
@@ -999,7 +1018,7 @@ fn finalize_with_reconcile(
     round_id: &RoundId,
     current: &[CurrentFinding],
     provisional: &[(String, &Finding, porch_review::CandidateKey, String)],
-    coverage: &[RoundCoverageProposal],
+    spawned: &SpawnedReview,
 ) -> Result<()> {
     let mut attempts = 0_u32;
     loop {
@@ -1025,8 +1044,10 @@ fn finalize_with_reconcile(
             execution: ExecutionState::Finished,
             assurance_completion: AssuranceCompletion::Complete,
             completion_reason: None,
-            coverage: coverage.to_vec(),
+            coverage: spawned.coverage.clone(),
             instances,
+            producer_durations: spawned.producer_durations.clone(),
+            review_duration_ms: Some(spawned.review_duration_ms),
         };
         match rounds::finalize_round(db, round_id, &fin, rev)? {
             FinalizeOutcome::Finalized => return Ok(()),
@@ -1056,6 +1077,8 @@ fn finalize_incomplete(db: &Db, round_id: &RoundId, reason: &str) -> Result<()> 
             completion_reason: Some(reason.into()),
             coverage: Vec::new(),
             instances: Vec::new(),
+            producer_durations: Vec::new(),
+            review_duration_ms: None,
         };
         match rounds::finalize_round(db, round_id, &fin, rev)? {
             FinalizeOutcome::Finalized => return Ok(()),

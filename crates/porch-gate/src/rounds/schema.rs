@@ -136,6 +136,15 @@ CREATE TABLE IF NOT EXISTS round_required_producers (
             AND length(trim(resolution_reason)) > 0)
     )
 );
+
+CREATE TABLE IF NOT EXISTS round_producer_durations (
+    round_id TEXT NOT NULL REFERENCES review_rounds(id) ON DELETE CASCADE,
+    producer_invocation_id TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+    PRIMARY KEY (round_id, producer_invocation_id),
+    FOREIGN KEY (round_id, producer_invocation_id)
+        REFERENCES round_producers(round_id, id)
+);
 ";
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -147,6 +156,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     )?;
     conn.execute_batch(ROUND_DDL)?;
     ensure_column(conn, "review_rounds", "intent_source", "TEXT")?;
+    ensure_column(conn, "review_rounds", "review_duration_ms", "INTEGER")?;
     rebuild_context_elements_without_snapshot_blob_fk(conn)?;
     Ok(())
 }

@@ -91,7 +91,7 @@ fn sample_bindings(inventory: &[u8]) -> RoundBindings {
         inventory_digest: digest,
         inventory_bytes: inventory.to_vec(),
         trusted_config_sha: "config".into(),
-        protocol_schema_version: 1,
+        protocol_schema_version: 2,
         fingerprint_version: 1,
         intent_source: Some("flag".into()),
         context_elements: vec![intent.clone()],
@@ -135,6 +135,7 @@ fn opening_legacy_database_adds_round_tables_and_keeps_existing_rows() {
         "finding_instances",
         "content_blobs",
         "round_required_producers",
+        "round_producer_durations",
     ] {
         let exists: i64 = conn
             .query_row(
@@ -209,7 +210,7 @@ fn open_round_commits_before_returning_id_and_allocates_ordinals() {
     assert_eq!(loaded.to_sha, "to");
     assert_eq!(loaded.inventory_digest, digest);
     assert_eq!(loaded.trusted_config_sha, "config");
-    assert_eq!(loaded.protocol_schema_version, 1);
+    assert_eq!(loaded.protocol_schema_version, 2);
     assert_eq!(loaded.fingerprint_version, 1);
 
     let producers = rounds::producers_for_round(&db, &first).unwrap();
@@ -742,6 +743,8 @@ fn sample_complete_proposal(producer_invocation_id: &str) -> FinalizeProposal {
             authority: None,
             completion_evidence: Some("reviewed".into()),
         }],
+        producer_durations: Vec::new(),
+        review_duration_ms: None,
         instances: vec![FindingInstanceProposal {
             producer_invocation_id: producer_invocation_id.into(),
             fingerprint: "fp-one".into(),
@@ -1085,7 +1088,7 @@ fn bindings_for_producers(inventory: &[u8], producer_count: usize) -> RoundBindi
         inventory_digest: digest,
         inventory_bytes: inventory.to_vec(),
         trusted_config_sha: "config".into(),
-        protocol_schema_version: 1,
+        protocol_schema_version: 2,
         fingerprint_version: 1,
         intent_source: Some("flag".into()),
         context_elements: vec![intent],
@@ -1106,6 +1109,8 @@ fn finalize_complete_with_coverage(
         assurance_completion: AssuranceCompletion::Complete,
         completion_reason: None,
         coverage,
+        producer_durations: Vec::new(),
+        review_duration_ms: None,
         instances: vec![FindingInstanceProposal {
             producer_invocation_id: producer,
             fingerprint: "fp-auth".into(),
@@ -1238,6 +1243,8 @@ fn pending_incomplete_interrupted_or_under_covered_round_never_authorizes() {
                 completion_reason: Some("coverage_shortfall".into()),
                 coverage: vec![],
                 instances: vec![],
+                producer_durations: Vec::new(),
+                review_duration_ms: None,
             },
             rev,
         )
@@ -2283,4 +2290,454 @@ fn later_round_must_keep_the_pinned_required_set() {
         Some(pinned.as_str()),
         "a mismatched open must not re-pin"
     );
+}
+
+fn snapshot_table(
+    conn: &Connection,
+    table: &str,
+    key_column: &str,
+    key: &str,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT * FROM {table} WHERE {key_column} = ?1"))
+        .unwrap();
+    let columns = stmt.column_count();
+    let mut rows = stmt.query([key]).unwrap();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().unwrap() {
+        let mut values = Vec::with_capacity(columns);
+        for i in 0..columns {
+            values.push(row.get(i).unwrap());
+        }
+        out.push(values);
+    }
+    out
+}
+
+fn requirement_count(conn: &Connection, round_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM round_required_producers WHERE round_id = ?1",
+        [round_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn this_feature_records_protocol_two_and_leaves_legacy_rounds_untouched() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let inventory = b"inv-protocol-two\n";
+    let digest = floor_equiv_digest();
+
+    let current_run = seed_run(&db, home);
+    let current_id = rounds::open_round(
+        &db,
+        &plan_with_digests(&current_run, &[digest.as_str()]),
+        &bindings_for_producers(inventory, 1),
+    )
+    .unwrap();
+    let current = rounds::get_round(&db, &current_id).unwrap().unwrap();
+    assert_eq!(
+        current.protocol_schema_version, 2,
+        "rounds opened by this feature must record protocol version 2"
+    );
+
+    let legacy_run = {
+        db.upsert_repo("repo-v1", home, &home.join("bare-v1.git"), "main")
+            .unwrap();
+        db.insert_run("repo-v1", "feat", "deadbeef", Some("intent"), Some("flag"))
+            .unwrap()
+            .id
+    };
+    let mut v1_bindings = bindings_for_producers(inventory, 1);
+    v1_bindings.protocol_schema_version = 1;
+    let legacy_id = rounds::open_round(
+        &db,
+        &plan_with_digests(&legacy_run, &[digest.as_str()]),
+        &v1_bindings,
+    )
+    .unwrap();
+    finish_round(&db, &legacy_id, &legacy_run);
+
+    let conn = Connection::open(db_path(home)).unwrap();
+    let before_round = snapshot_table(&conn, "review_rounds", "id", legacy_id.as_str());
+    let before_producers = snapshot_table(&conn, "round_producers", "round_id", legacy_id.as_str());
+    let before_required = snapshot_table(
+        &conn,
+        "round_required_producers",
+        "round_id",
+        legacy_id.as_str(),
+    );
+    let required_before = requirement_count(&conn, legacy_id.as_str());
+    assert!(
+        required_before > 0,
+        "precondition: the version-1 round already has a recorded required set"
+    );
+
+    match applicable_round(
+        &db,
+        &legacy_run,
+        &v1_bindings,
+        &required_rows(&[digest.as_str()]),
+    )
+    .unwrap()
+    {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => {
+            panic!("a version-1 round must never authorize, got {id}")
+        }
+    }
+
+    assert_eq!(
+        snapshot_table(&conn, "review_rounds", "id", legacy_id.as_str()),
+        before_round,
+        "a version-1 round must stay byte-for-byte unchanged"
+    );
+    assert_eq!(
+        snapshot_table(&conn, "round_producers", "round_id", legacy_id.as_str()),
+        before_producers
+    );
+    assert_eq!(
+        snapshot_table(
+            &conn,
+            "round_required_producers",
+            "round_id",
+            legacy_id.as_str()
+        ),
+        before_required
+    );
+    assert_eq!(
+        requirement_count(&conn, legacy_id.as_str()),
+        required_before,
+        "authorization must not invent requirement rows for a version-1 round"
+    );
+}
+
+#[test]
+fn a_round_above_the_understood_protocol_fails_closed() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let inventory = b"inv-protocol-future\n";
+    let digest = floor_equiv_digest();
+    let run_id = seed_run(&db, home);
+    let round_id = open_and_finish(
+        &db,
+        &plan_with_digests(&run_id, &[digest.as_str()]),
+        1,
+        inventory,
+    );
+
+    let conn = Connection::open(db_path(home)).unwrap();
+    conn.execute(
+        "UPDATE review_rounds SET protocol_schema_version = 3 WHERE id = ?1",
+        [round_id.as_str()],
+    )
+    .unwrap();
+
+    let err = match applicable_round_for_run(&db, &db.run_by_id(&run_id).unwrap().unwrap()) {
+        Ok(Applicability::Applicable(id)) => {
+            panic!("a future protocol round must not authorize, got {id}")
+        }
+        Ok(Applicability::RequiresNew { reason }) => {
+            panic!("a future protocol round must fail closed, not skip: {reason}")
+        }
+        Err(e) => e,
+    };
+    match err {
+        Error::Other(msg) => assert!(
+            msg.contains("protocol") && (msg.contains('3') || msg.contains("understood")),
+            "unexpected fail-closed message: {msg}"
+        ),
+        other => panic!("expected a fail-closed error, got {other:?}"),
+    }
+}
+
+fn seed_pre_floor_round_db(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE repos (
+            id TEXT PRIMARY KEY,
+            worktree_path TEXT NOT NULL,
+            bare_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            default_branch TEXT NOT NULL DEFAULT 'main'
+        );
+        CREATE TABLE runs (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            sha TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(repo_id) REFERENCES repos(id)
+        );
+        CREATE TABLE content_blobs (
+            digest TEXT PRIMARY KEY,
+            byte_length INTEGER NOT NULL,
+            bytes BLOB NOT NULL,
+            CHECK (byte_length = length(bytes))
+        );
+        CREATE TABLE review_rounds (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            from_sha TEXT NOT NULL,
+            to_sha TEXT NOT NULL,
+            inventory_digest TEXT NOT NULL REFERENCES content_blobs(digest),
+            execution TEXT NOT NULL CHECK (execution IN ('running','finished','interrupted')),
+            assurance_completion TEXT NOT NULL
+                CHECK (assurance_completion IN ('pending','complete','incomplete')),
+            completion_reason TEXT,
+            trusted_config_sha TEXT NOT NULL,
+            protocol_schema_version INTEGER NOT NULL,
+            fingerprint_version INTEGER NOT NULL,
+            opened_at TEXT NOT NULL,
+            finalized_at TEXT,
+            UNIQUE (run_id, ordinal)
+        );
+        CREATE TABLE round_producers (
+            id TEXT PRIMARY KEY,
+            round_id TEXT NOT NULL REFERENCES review_rounds(id) ON DELETE CASCADE,
+            slot INTEGER NOT NULL,
+            descriptor_json TEXT NOT NULL,
+            descriptor_equivalence_digest TEXT NOT NULL,
+            UNIQUE (round_id, slot),
+            UNIQUE (round_id, id)
+        );
+        INSERT INTO repos (id, worktree_path, bare_path, created_at, default_branch)
+        VALUES ('repo-old', '/tmp/wt', '/tmp/bare.git', '1', 'main');
+        INSERT INTO runs (id, repo_id, branch, sha, status, created_at)
+        VALUES ('run-old', 'repo-old', 'feat', 'abc', 'parked', '2');
+        INSERT INTO content_blobs (digest, byte_length, bytes)
+        VALUES ('inv-old', 7, x'6f6c642e72730a');
+        INSERT INTO review_rounds (
+            id, run_id, ordinal, from_sha, to_sha, inventory_digest,
+            execution, assurance_completion, completion_reason,
+            trusted_config_sha, protocol_schema_version, fingerprint_version,
+            opened_at, finalized_at
+        ) VALUES (
+            'round-old', 'run-old', 1, 'from', 'to', 'inv-old',
+            'finished', 'complete', NULL,
+            'config', 1, 1,
+            '3', '4'
+        );
+        INSERT INTO round_producers (
+            id, round_id, slot, descriptor_json, descriptor_equivalence_digest
+        ) VALUES (
+            'prod-old', 'round-old', 0, '{"adapter_kind":"porch_json_cli"}', 'equiv-old'
+        );
+        "#,
+    )
+    .unwrap();
+}
+
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    count == 1
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let name: String = row.get(1).unwrap();
+        if name == column {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn opening_an_older_database_adds_duration_storage_and_keeps_invocations() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home).unwrap();
+    let path = db_path(home);
+    seed_pre_floor_round_db(&path);
+
+    let db = Db::open(&path).unwrap();
+    let conn = Connection::open(&path).unwrap();
+
+    assert!(
+        table_exists(&conn, "round_producer_durations"),
+        "opening an older database must add round_producer_durations"
+    );
+    assert!(
+        column_exists(&conn, "review_rounds", "review_duration_ms"),
+        "opening an older database must add review_rounds.review_duration_ms"
+    );
+
+    let run = db.run_by_id("run-old").unwrap().expect("legacy run");
+    assert_eq!(run.status, "parked");
+    let rounds = rounds::rounds_for_run(&db, "run-old").unwrap();
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(rounds[0].ordinal, 1);
+    assert_eq!(rounds[0].protocol_schema_version, 1);
+    assert_eq!(rounds[0].id.as_str(), "round-old");
+
+    let producers = rounds::producers_for_round(&db, &rounds[0].id).unwrap();
+    assert_eq!(producers.len(), 1);
+    assert!(
+        !producers[0].descriptor_json.is_empty(),
+        "invocation descriptor must stay non-null"
+    );
+    assert_eq!(producers[0].descriptor_equivalence_digest, "equiv-old");
+
+    let fresh = seed_run(&db, home);
+    let first = rounds::open_round(&db, &sample_plan(&fresh), &sample_bindings(b"a.rs\n"))
+        .expect("first open after migrate");
+    let second = rounds::open_round(&db, &sample_plan(&fresh), &sample_bindings(b"a.rs\n"))
+        .expect("second open after migrate");
+    assert_eq!(rounds::get_round(&db, &first).unwrap().unwrap().ordinal, 1);
+    assert_eq!(rounds::get_round(&db, &second).unwrap().unwrap().ordinal, 2);
+}
+
+#[test]
+fn finalization_writes_durations_with_terminal_state_or_not_at_all() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let inventory = b"inv-durations\n";
+    let round_id =
+        rounds::open_round(&db, &sample_plan(&run_id), &sample_bindings(inventory)).unwrap();
+    let producer = producer_id(&db, &round_id);
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+
+    let mut bad = sample_complete_proposal(&producer);
+    bad.coverage.push(RoundCoverageProposal {
+        producer_invocation_id: producer.clone(),
+        path: "b.rs".into(),
+        state: CoverageState::Completed,
+        reason: None,
+        authority: None,
+        completion_evidence: None,
+    });
+    bad.producer_durations.push(rounds::ProducerDuration {
+        producer_invocation_id: producer.clone(),
+        duration_ms: 7,
+    });
+    bad.review_duration_ms = Some(11);
+    let err = rounds::finalize_round(&db, &round_id, &bad, rev).unwrap_err();
+    match err {
+        Error::Sqlite(_) | Error::Other(_) => {}
+        other => panic!("expected finalize refuse, got {other:?}"),
+    }
+    assert!(
+        rounds::producer_durations_for_round(&db, &round_id)
+            .unwrap()
+            .is_empty()
+    );
+    let loaded = rounds::get_round(&db, &round_id).unwrap().unwrap();
+    assert_eq!(loaded.execution, ExecutionState::Running);
+    assert_eq!(loaded.review_duration_ms, None);
+    assert!(
+        rounds::coverage_for_round(&db, &round_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        rounds::instances_for_round(&db, &round_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    bump_history_revision(home, &run_id);
+    let mut stale_proposal = sample_complete_proposal(&producer);
+    stale_proposal
+        .producer_durations
+        .push(rounds::ProducerDuration {
+            producer_invocation_id: producer.clone(),
+            duration_ms: 7,
+        });
+    stale_proposal.review_duration_ms = Some(11);
+    assert_eq!(
+        rounds::finalize_round(&db, &round_id, &stale_proposal, rev).unwrap(),
+        FinalizeOutcome::Stale
+    );
+    assert!(
+        rounds::producer_durations_for_round(&db, &round_id)
+            .unwrap()
+            .is_empty()
+    );
+    let loaded = rounds::get_round(&db, &round_id).unwrap().unwrap();
+    assert_eq!(loaded.execution, ExecutionState::Running);
+    assert_eq!(loaded.review_duration_ms, None);
+
+    let (current, _) = rounds::read_history(&db, &run_id).unwrap();
+    let mut ok = sample_complete_proposal(&producer);
+    ok.producer_durations.push(rounds::ProducerDuration {
+        producer_invocation_id: producer.clone(),
+        duration_ms: 7,
+    });
+    ok.review_duration_ms = Some(11);
+    assert_eq!(
+        rounds::finalize_round(&db, &round_id, &ok, current).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+    let loaded = rounds::get_round(&db, &round_id).unwrap().unwrap();
+    assert_eq!(loaded.execution, ExecutionState::Finished);
+    assert_eq!(loaded.assurance_completion, AssuranceCompletion::Complete);
+    assert_eq!(loaded.review_duration_ms, Some(11));
+    assert_eq!(rounds::coverage_for_round(&db, &round_id).unwrap().len(), 1);
+    assert_eq!(
+        rounds::instances_for_round(&db, &round_id).unwrap().len(),
+        1
+    );
+    let durations = rounds::producer_durations_for_round(&db, &round_id).unwrap();
+    assert_eq!(durations.len(), 1);
+    assert_eq!(durations[0].producer_invocation_id, producer);
+    assert_eq!(durations[0].duration_ms, 7);
+}
+
+#[test]
+fn authorization_requires_the_recorded_required_set_to_match_the_run_pin() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let inventory = b"inv-pin-auth\n";
+    let digest = floor_equiv_digest();
+    let run_id = seed_run(&db, home);
+    let round_id = open_and_finish(
+        &db,
+        &plan_with_digests(&run_id, &[digest.as_str()]),
+        1,
+        inventory,
+    );
+    match run_applicability(&db, &run_id) {
+        Applicability::Applicable(id) => assert_eq!(id, round_id),
+        Applicability::RequiresNew { reason } => {
+            panic!("precondition: a matching pin must authorize, got {reason}")
+        }
+    }
+
+    let conn = Connection::open(db_path(home)).unwrap();
+    conn.execute(
+        "UPDATE runs SET required_set_digest = '0000000000000000000000000000000000000000000000000000000000000000' WHERE id = ?1",
+        [&run_id],
+    )
+    .unwrap();
+
+    match run_applicability(&db, &run_id) {
+        Applicability::RequiresNew { .. } => {}
+        Applicability::Applicable(id) => {
+            panic!(
+                "a round whose required-set digest differs from the run pin must not authorize, got {id}"
+            )
+        }
+    }
 }

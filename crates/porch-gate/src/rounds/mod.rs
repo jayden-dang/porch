@@ -27,6 +27,9 @@ use crate::{Error, Result};
 
 pub(crate) use schema::migrate;
 
+/// Protocol schema version this binary records and understands.
+pub const PROTOCOL_SCHEMA_VERSION: i64 = 2;
+
 /// Max stale phase-2 attempts before `abandon_for_history_contention`.
 pub const STALE_REVISION_RETRIES: u32 = 3;
 
@@ -381,6 +384,7 @@ pub struct RoundRecord {
     pub fingerprint_version: i64,
     pub opened_at: String,
     pub finalized_at: Option<String>,
+    pub review_duration_ms: Option<i64>,
 }
 
 /// Persisted review-context element.
@@ -492,6 +496,13 @@ pub struct FindingInstanceProposal {
     pub anchor_value: String,
 }
 
+/// Per-producer execution duration recorded at finalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerDuration {
+    pub producer_invocation_id: String,
+    pub duration_ms: i64,
+}
+
 /// Terminal payload for phase-2 finalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalizeProposal {
@@ -500,6 +511,8 @@ pub struct FinalizeProposal {
     pub completion_reason: Option<String>,
     pub coverage: Vec<RoundCoverageProposal>,
     pub instances: Vec<FindingInstanceProposal>,
+    pub producer_durations: Vec<ProducerDuration>,
+    pub review_duration_ms: Option<i64>,
 }
 
 /// Result of a revision-guarded finalize attempt.
@@ -734,7 +747,7 @@ pub fn get_round(db: &Db, id: &RoundId) -> Result<Option<RoundRecord>> {
         "SELECT id, run_id, ordinal, from_sha, to_sha, inventory_digest,
                 execution, assurance_completion, completion_reason,
                 trusted_config_sha, intent_source, protocol_schema_version, fingerprint_version,
-                opened_at, finalized_at
+                opened_at, finalized_at, review_duration_ms
          FROM review_rounds WHERE id = ?1",
     )?;
     let mut rows = stmt.query([id.as_str()])?;
@@ -759,7 +772,7 @@ pub fn rounds_for_run(db: &Db, run_id: &str) -> Result<Vec<RoundRecord>> {
         "SELECT id, run_id, ordinal, from_sha, to_sha, inventory_digest,
                 execution, assurance_completion, completion_reason,
                 trusted_config_sha, intent_source, protocol_schema_version, fingerprint_version,
-                opened_at, finalized_at
+                opened_at, finalized_at, review_duration_ms
          FROM review_rounds WHERE run_id = ?1 ORDER BY ordinal",
     )?;
     let mut rows = stmt.query([run_id])?;
@@ -981,6 +994,7 @@ pub fn finalize_round(
 
     insert_coverage(&tx, round_id, &proposal.coverage)?;
     insert_instances(&tx, round_id, &proposal.instances)?;
+    insert_producer_durations(&tx, round_id, &proposal.producer_durations)?;
 
     let finalized_at = now_secs();
     tx.execute(
@@ -988,13 +1002,15 @@ pub fn finalize_round(
          SET execution = ?1,
              assurance_completion = ?2,
              completion_reason = ?3,
-             finalized_at = ?4
-         WHERE id = ?5",
+             finalized_at = ?4,
+             review_duration_ms = ?5
+         WHERE id = ?6",
         rusqlite::params![
             proposal.execution.as_str(),
             proposal.assurance_completion.as_str(),
             proposal.completion_reason,
             finalized_at,
+            proposal.review_duration_ms,
             round_id.as_str(),
         ],
     )?;
@@ -1206,6 +1222,54 @@ pub fn instances_for_round(db: &Db, round_id: &RoundId) -> Result<Vec<FindingIns
     Ok(out)
 }
 
+/// Per-producer durations recorded for a round.
+///
+/// # Errors
+///
+/// Returns a storage error if the query fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn producer_durations_for_round(db: &Db, round_id: &RoundId) -> Result<Vec<ProducerDuration>> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT producer_invocation_id, duration_ms
+         FROM round_producer_durations
+         WHERE round_id = ?1
+         ORDER BY producer_invocation_id",
+    )?;
+    let mut rows = stmt.query([round_id.as_str()])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(ProducerDuration {
+            producer_invocation_id: row.get(0)?,
+            duration_ms: row.get(1)?,
+        });
+    }
+    Ok(out)
+}
+
+fn insert_producer_durations(
+    tx: &Transaction<'_>,
+    round_id: &RoundId,
+    durations: &[ProducerDuration],
+) -> Result<()> {
+    for row in durations {
+        tx.execute(
+            "INSERT INTO round_producer_durations (
+                round_id, producer_invocation_id, duration_ms
+             ) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                round_id.as_str(),
+                row.producer_invocation_id,
+                row.duration_ms
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn insert_coverage(
     tx: &Transaction<'_>,
     round_id: &RoundId,
@@ -1357,6 +1421,7 @@ fn map_round(row: &rusqlite::Row<'_>) -> Result<RoundRecord> {
         fingerprint_version: row.get(12)?,
         opened_at: row.get(13)?,
         finalized_at: row.get(14)?,
+        review_duration_ms: row.get(15)?,
     })
 }
 
