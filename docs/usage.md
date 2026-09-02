@@ -281,3 +281,14 @@ porch agent sync                    # if local branch lags pipeline
 ## Q. What porch is not
 
 Not CI. Not deploy. Not a merge bot. Not team governance. It sits **in front of** production rings; it does not swallow them.
+
+## R. Upgrading porch (review round identity)
+
+Finish parked runs before upgrading when you can. An upgrade **preserves** a parked legacy run
+(`runs.findings_json`) so approve / fix / skip / abort, notes, and hunk lookup still work, but it
+**cannot** give that run round identity retroactively. A **fresh run after upgrade** is how a
+change gets a durable review round.
+
+Back up `$PORCH_HOME` before upgrading. **Downgrade** after new-format round rows exist is
+**unsupported**.
+
