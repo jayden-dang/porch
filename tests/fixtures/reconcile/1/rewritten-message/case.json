@@ -1,0 +1,41 @@
+{
+  "case": "rewritten-message",
+  "fingerprint_version": 1,
+  "prior_rounds": [
+    {
+      "ordinal": 1,
+      "findings": [
+        {
+          "ref": "p1",
+          "path": "src/lib.rs",
+          "criterion_id": "rust/unwrap-in-lib",
+          "anchor": { "kind": "symbol", "value": "fn parse" },
+          "lines": [4, 4],
+          "producer": "quality",
+          "message": "avoid unwrap here"
+        }
+      ]
+    }
+  ],
+  "current_round": {
+    "producers": ["quality"],
+    "findings": [
+      {
+        "ref": "c1",
+        "path": "src/lib.rs",
+        "criterion_id": "rust/unwrap-in-lib",
+        "anchor": { "kind": "symbol", "value": "fn parse" },
+        "lines": [4, 4],
+        "producer": "quality",
+        "message": "prefer ? instead of unwrap in library code"
+      }
+    ]
+  },
+  "rename_evidence": [],
+  "expect": {
+    "reuse": [{ "current": "c1", "prior": "p1" }],
+    "equivalence_groups": [],
+    "minted": [],
+    "disappeared": []
+  }
+}

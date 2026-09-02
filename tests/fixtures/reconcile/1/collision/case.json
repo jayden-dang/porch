@@ -1,0 +1,33 @@
+{
+  "case": "collision",
+  "fingerprint_version": 1,
+  "prior_rounds": [],
+  "current_round": {
+    "producers": ["quality"],
+    "findings": [
+      {
+        "ref": "c1",
+        "path": "src/a.rs",
+        "criterion_id": "rust/unwrap-in-lib",
+        "anchor": { "kind": "symbol", "value": "fn load" },
+        "lines": [10, 12],
+        "producer": "quality"
+      },
+      {
+        "ref": "c2",
+        "path": "src/a.rs",
+        "criterion_id": "rust/unwrap-in-lib",
+        "anchor": { "kind": "symbol", "value": "fn load" },
+        "lines": [40, 41],
+        "producer": "quality"
+      }
+    ]
+  },
+  "rename_evidence": [],
+  "expect": {
+    "reuse": [],
+    "equivalence_groups": [],
+    "minted": ["c1", "c2"],
+    "disappeared": []
+  }
+}

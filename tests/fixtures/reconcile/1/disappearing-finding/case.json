@@ -1,0 +1,47 @@
+{
+  "case": "disappearing-finding",
+  "fingerprint_version": 1,
+  "prior_rounds": [
+    {
+      "ordinal": 1,
+      "findings": [
+        {
+          "ref": "p1",
+          "path": "src/a.rs",
+          "criterion_id": "rust/unwrap-in-lib",
+          "anchor": { "kind": "symbol", "value": "fn load" },
+          "lines": [10, 12],
+          "producer": "quality"
+        },
+        {
+          "ref": "p2",
+          "path": "src/a.rs",
+          "criterion_id": "rust/unwrap-in-lib",
+          "anchor": { "kind": "symbol", "value": "fn save" },
+          "lines": [40, 41],
+          "producer": "quality"
+        }
+      ]
+    }
+  ],
+  "current_round": {
+    "producers": ["quality"],
+    "findings": [
+      {
+        "ref": "c1",
+        "path": "src/a.rs",
+        "criterion_id": "rust/unwrap-in-lib",
+        "anchor": { "kind": "symbol", "value": "fn load" },
+        "lines": [10, 12],
+        "producer": "quality"
+      }
+    ]
+  },
+  "rename_evidence": [],
+  "expect": {
+    "reuse": [{ "current": "c1", "prior": "p1" }],
+    "equivalence_groups": [],
+    "minted": [],
+    "disappeared": ["p2"]
+  }
+}
