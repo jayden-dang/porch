@@ -75,6 +75,8 @@ Status stays a **compact** live snapshot (`findings[]` display handles, optional
 ```sh
 porch agent audit
 porch agent audit --run-id <ULID>
+porch audit                   # human alias; same builder / pretty JSON
+porch audit --run-id <ULID>
 ```
 
 Default: latest **parked** run for the cwd repo (same resolution as `status`).
@@ -118,16 +120,16 @@ porch agent respond abort
 
 | Verb / form | Phase | Effect |
 |---|---|---|
-| `approve` | review | Accept current findings; continue certify → deliver. Writes `review_approved_head_sha`. |
-| `skip` | review | Skip remaining review gate for this run; does **not** write `review_approved_head_sha`. |
+| `approve` | review | Accept current findings; continue certify → deliver. Writes `review_approved_head_sha`. Modern rounds also append one bulk `review_approved` disposition/authority event (frozen context membership). |
+| `skip` | review | Skip remaining review gate for this run; does **not** write `review_approved_head_sha`. Modern rounds append `review_skipped`. |
 | `skip` | compose | Accept the scaffold PR body; complete deliver (does **not** skip certify/deliver). |
-| `abort` | rebase / review / compose | Fail/cancel the run. Compose abort leaves the GitHub PR open (no `gh pr close`). |
-| `fix` | review / rebase | Spawn native fixer (`PORCH_FIXER_BIN`), then **session-free** rereview (or rebase retry). |
+| `abort` | rebase / review / compose | Fail/cancel the run. Modern review abort appends `review_aborted`. Compose abort leaves the GitHub PR open (no `gh pr close`). |
+| `fix` | review / rebase | On modern review: append `fix_requested` (selected instances as targets) **before** spawning the native fixer (`PORCH_FIXER_BIN`), then **session-free** rereview. Rebase parks: fixer then rebase retry (no disposition event). |
 | `--body-file` [+ `--title`] | compose | Merge Agent prose into porch-managed PR regions; complete deliver. |
 
-`--findings` and `--yes` are only valid with `fix`. `--findings` defaults to all blocking ids. `--yes` means **one** fix round then approve remaining (standing consent; never the default). There is **no** default yolo on the whole gate — review auto-fix stays off (D6). Unattended agents may use `respond fix --yes` for a single round only. Do not combine `--body-file` with approve/skip/abort/fix.
+`--findings` and `--yes` are only valid with `fix`. `--findings` defaults to all blocking ids. `--yes` means **one** fix round then approve remaining (standing consent; never the default). On a modern round porch appends a `review_approved` event that cites the durable `fix_requested` and fails closed if that cite (or the applicable round / reviewed HEAD) is missing or stale — it does **not** authorize from `review_approved_head_sha` alone. There is **no** default yolo on the whole gate — review auto-fix stays off (D6). Unattended agents may use `respond fix --yes` for a single round only. Do not combine `--body-file` with approve/skip/abort/fix.
 
-Stdout after respond is the same shape as `status` for the updated run.
+Stdout after respond is the same shape as `status` for the updated run. Reconstruct disposition/authority with `porch agent audit` (or `porch audit`); status stays compact.
 
 Phase rules (rebase/review verbs unchanged):
 

@@ -221,6 +221,21 @@ case "$MODE" in
   noop)
     printf '{"summary":"noop","session_id":"sess-1"}\n'
     ;;
+  drop-cite)
+    # Test seam: remove durable fix_requested so standing consent cannot cite it.
+    python3 - <<'PY'
+import os, sqlite3
+home = os.environ["PORCH_HOME"]
+db = sqlite3.connect(os.path.join(home, "state.sqlite"))
+db.execute(
+    "DELETE FROM authority_event_members WHERE event_id IN "
+    "(SELECT id FROM authority_events WHERE kind = 'fix_requested')"
+)
+db.execute("DELETE FROM authority_events WHERE kind = 'fix_requested'")
+db.commit()
+PY
+    printf '{"summary":"noop-drop-cite","session_id":"sess-1"}\n'
+    ;;
   apply)
     TARGET=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[0]["path"] if d else "README")' "$FINDINGS" 2>/dev/null || echo README)
     if [ ! -f "$TARGET" ]; then TARGET=README; fi
@@ -1658,6 +1673,156 @@ fn agent_audit_prints_builder_json_while_status_stays_compact() {
         64,
         "subscribe mailbox cap must stay frozen"
     );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn modern_yes_without_fix_cite_does_not_authorize() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-missing-cite", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    assert!(
+        round_for_decision(&db, &run).unwrap().is_some(),
+        "modern decision round required"
+    );
+
+    let out = agent_fix_modes(
+        &work,
+        &home,
+        &fake,
+        &run.id,
+        &["--yes"],
+        "blocking",
+        "drop-cite",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "missing cite must fail closed; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("fix_requested") || err.contains("standing consent") || err.contains("cite"),
+        "expected missing-cite error, got {v}"
+    );
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert!(
+        run.review_approved_head_sha.is_none(),
+        "must not authorize without citing fix_requested; got {:?}",
+        run.review_approved_head_sha
+    );
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert!(
+        events
+            .iter()
+            .all(|e| e.kind != AuthorityKind::ReviewApproved),
+        "must not write review_approved without cite; got {events:?}"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn human_audit_cli_prints_same_builder_document() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-human-audit", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let expected = get_audit(&home, &run.id).unwrap();
+    let expected_json = serde_json::to_value(&expected).unwrap();
+
+    let path = format!(
+        "{}:{}",
+        fake.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let audit_out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .env(REVIEW_BIN_ENV, &fake)
+        .env("PATH", &path)
+        .args(["audit", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert!(
+        audit_out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&audit_out.stdout),
+        String::from_utf8_lossy(&audit_out.stderr)
+    );
+    let printed: Value = serde_json::from_slice(&audit_out.stdout).unwrap();
+    assert_eq!(printed["schema_version"], expected_json["schema_version"]);
+    assert_eq!(printed["run_id"], run.id);
+    assert_eq!(printed["watermark"], expected_json["watermark"]);
+    assert_eq!(printed["events"], expected_json["events"]);
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn audit_watermark_survives_daemon_restart_without_writes() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-audit-restart", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let before = get_audit(&home, &run.id).unwrap();
+    let before_rev = before.watermark.audit_rev;
+    let before_history = before.watermark.review_history_revision;
+
+    kill_daemon(&home);
+    let bin = assert_cmd::cargo::cargo_bin("porch");
+    let fake_fixer = fake.parent().unwrap().join("fake-fixer");
+    let fake_gh = fake.parent().unwrap().join("fake-gh");
+    let path = format!(
+        "{}:{}",
+        fake.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    porch_gate::spawn_detached_with_env(
+        &bin,
+        &home,
+        &[
+            (REVIEW_BIN_ENV, fake.as_os_str()),
+            (FIXER_BIN_ENV, fake_fixer.as_os_str()),
+            (GH_BIN_ENV, fake_gh.as_os_str()),
+            ("PORCH_FAKE_REVIEW_MODE", "blocking".as_ref()),
+            ("PORCH_FAKE_FIXER_MODE", "noop".as_ref()),
+            ("PATH", path.as_ref()),
+            ("PORCH_REVIEW_TIMEOUT_SECS", "5".as_ref()),
+        ],
+    )
+    .unwrap();
+    porch_gate::wait_for_health(&home, Duration::from_secs(5)).unwrap();
+
+    let after = get_audit(&home, &run.id).unwrap();
+    assert_eq!(
+        after.watermark.audit_rev, before_rev,
+        "audit_rev must be unchanged across restart with no writes"
+    );
+    assert_eq!(
+        after.watermark.review_history_revision, before_history,
+        "review_history_revision must be unchanged across restart with no writes"
+    );
+    assert_eq!(after.run_id, before.run_id);
+    assert_eq!(after.completeness, before.completeness);
 
     kill_daemon(&home);
 }

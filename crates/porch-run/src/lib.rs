@@ -1928,6 +1928,12 @@ fn respond_review_abort(
         }
     } else {
         // Legacy findings_json park: abort still records, with identity unavailable.
+        tracing::warn!(
+            run_id = %run.id,
+            kind = "review_aborted",
+            reason = "legacy",
+            "abort recording with identity_unavailable (no decision round)"
+        );
         PersistAuthorityPlan {
             run_id: run.id.clone(),
             kind: AuthorityKind::ReviewAborted,
@@ -1944,6 +1950,12 @@ fn respond_review_abort(
     match persist_authority_with_run_effects(db, plan, effects) {
         Ok(_) => {}
         Err(AuthorityError::Stale) => {
+            tracing::warn!(
+                run_id = %run.id,
+                kind = "review_aborted",
+                reason = "stale",
+                "authority persist rejected: applicable round or reviewed HEAD drifted"
+            );
             return Err(UsageOrFail::Fail(
                 "authority persist rejected: applicable round or reviewed HEAD drifted".into(),
             ));
@@ -2020,6 +2032,12 @@ where
     let Some(round_id) =
         round_for_decision(db, run).map_err(|e| UsageOrFail::Fail(e.to_string()))?
     else {
+        tracing::warn!(
+            run_id = %run.id,
+            kind = kind.as_str(),
+            reason = "legacy",
+            "authority persist falling back to legacy path (no decision round)"
+        );
         return legacy(db, run);
     };
     let round = rounds::get_round(db, &round_id)
@@ -2049,9 +2067,17 @@ where
     };
     match persist_authority_with_run_effects(db, plan, effects) {
         Ok(_) => Ok(()),
-        Err(AuthorityError::Stale) => Err(UsageOrFail::Fail(
-            "authority persist rejected: applicable round or reviewed HEAD drifted".into(),
-        )),
+        Err(AuthorityError::Stale) => {
+            tracing::warn!(
+                run_id = %run.id,
+                kind = kind.as_str(),
+                reason = "stale",
+                "authority persist rejected: applicable round or reviewed HEAD drifted"
+            );
+            Err(UsageOrFail::Fail(
+                "authority persist rejected: applicable round or reviewed HEAD drifted".into(),
+            ))
+        }
         Err(AuthorityError::Storage(e)) => Err(UsageOrFail::Fail(e.to_string())),
     }
 }
@@ -2263,7 +2289,7 @@ fn respond_fix(
         ));
     }
 
-    persist_fix_requested(db, home, run, wt, &selected)?;
+    persist_fix_requested(db, run, wt, &selected)?;
 
     let Some(pre_fix_head) = spawn_and_wait_fixer(db, home, run, bare, wt, &selected)? else {
         // Fixer failed closed; run already marked failed.
@@ -2283,7 +2309,6 @@ fn respond_fix(
 /// Legacy parks (`round_for_decision` none, `findings_json`): skip persist, no event.
 fn persist_fix_requested(
     db: &Db,
-    home: &Path,
     run: &RunRow,
     wt: &Path,
     selected: &[Finding],
@@ -2291,6 +2316,12 @@ fn persist_fix_requested(
     let Some(round_id) =
         round_for_decision(db, run).map_err(|e| UsageOrFail::Fail(e.to_string()))?
     else {
+        tracing::warn!(
+            run_id = %run.id,
+            kind = "fix_requested",
+            reason = "legacy",
+            "skipping fix_requested authority event (no decision round)"
+        );
         return Ok(());
     };
     let round = rounds::get_round(db, &round_id)
@@ -2330,21 +2361,21 @@ fn persist_fix_requested(
         identity_unavailable: false,
         members,
     };
-    let event_id = match persist_authority(db, plan) {
-        Ok(id) => id,
+    match persist_authority(db, plan) {
+        Ok(_) => Ok(()),
         Err(AuthorityError::Stale) => {
-            return Err(UsageOrFail::Fail(
+            tracing::warn!(
+                run_id = %run.id,
+                kind = "fix_requested",
+                reason = "stale",
+                "authority persist rejected: applicable round or reviewed HEAD drifted"
+            );
+            Err(UsageOrFail::Fail(
                 "authority persist rejected: applicable round or reviewed HEAD drifted".into(),
-            ));
+            ))
         }
-        Err(AuthorityError::Storage(e)) => return Err(UsageOrFail::Fail(e.to_string())),
-    };
-    // Minimal handoff for Task 5 `--yes` citing this fix_requested id.
-    let art = run_artifact_dir(home, &run.id);
-    std::fs::create_dir_all(&art).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    std::fs::write(art.join("last_fix_requested_event_id"), &event_id)
-        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    Ok(())
+        Err(AuthorityError::Storage(e)) => Err(UsageOrFail::Fail(e.to_string())),
+    }
 }
 
 /// Returns `Ok(None)` when the fixer failed closed (run already marked failed).
@@ -2431,7 +2462,7 @@ fn finish_rereview(
             if yes {
                 let head = porch_git::rev_parse_c(wt, "HEAD")
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-                persist_standing_consent_approve(db, home, run, &head)?;
+                persist_standing_consent_approve(db, run, &head)?;
                 clear_uncertified_if_certified(db, wt, &run.repo_id, &run.branch, &head)
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
                 let repo = db
@@ -2458,36 +2489,21 @@ fn finish_rereview(
     Ok(())
 }
 
-/// `--yes` standing consent: porch `review_approved` citing `fix_requested`, or legacy column write.
+/// `--yes` standing consent: porch `review_approved` citing durable `fix_requested`, or legacy column write.
 fn persist_standing_consent_approve(
     db: &Db,
-    home: &Path,
     run: &RunRow,
     live_head: &str,
 ) -> std::result::Result<(), UsageOrFail> {
     let Some(round_id) =
         round_for_decision(db, run).map_err(|e| UsageOrFail::Fail(e.to_string()))?
     else {
-        db.set_review_approved_head_sha(&run.id, Some(live_head))
-            .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-        record_step(
-            db,
-            &run.id,
-            "review",
-            "completed",
-            Some("approved remaining after --yes"),
-        )
-        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-        return Ok(());
-    };
-
-    let fix_id = std::fs::read_to_string(
-        run_artifact_dir(home, &run.id).join("last_fix_requested_event_id"),
-    )
-    .ok()
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty());
-    let Some(fix_id) = fix_id else {
+        tracing::warn!(
+            run_id = %run.id,
+            kind = "review_approved",
+            reason = "legacy",
+            "standing consent falling back to legacy approve (no decision round)"
+        );
         db.set_review_approved_head_sha(&run.id, Some(live_head))
             .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
         record_step(
@@ -2503,11 +2519,23 @@ fn persist_standing_consent_approve(
 
     let events =
         rounds::events_for_run(db, &run.id).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    let fix_event = events.iter().find(|e| e.id == fix_id).ok_or_else(|| {
-        UsageOrFail::Fail(format!(
-            "fix_requested event {fix_id} missing for standing consent"
-        ))
-    })?;
+    // Cite the latest durable fix_requested for this run (authority log is SoT).
+    let Some(fix_event) = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == AuthorityKind::FixRequested)
+    else {
+        tracing::warn!(
+            run_id = %run.id,
+            kind = "review_approved",
+            reason = "missing_cite",
+            "standing consent refused: no fix_requested authority event to cite"
+        );
+        return Err(UsageOrFail::Fail(
+            "standing consent requires a prior fix_requested authority event".into(),
+        ));
+    };
+    let fix_id = fix_event.id.clone();
     let fix_reviewed_head = fix_event.reviewed_head.as_deref().unwrap_or("");
     let head_changed = live_head != fix_reviewed_head;
 
@@ -2546,9 +2574,17 @@ fn persist_standing_consent_approve(
     };
     match persist_authority_with_run_effects(db, plan, effects) {
         Ok(_) => Ok(()),
-        Err(AuthorityError::Stale) => Err(UsageOrFail::Fail(
-            "authority persist rejected: applicable round or reviewed HEAD drifted".into(),
-        )),
+        Err(AuthorityError::Stale) => {
+            tracing::warn!(
+                run_id = %run.id,
+                kind = "review_approved",
+                reason = "stale",
+                "standing consent rejected: applicable round or reviewed HEAD drifted"
+            );
+            Err(UsageOrFail::Fail(
+                "authority persist rejected: applicable round or reviewed HEAD drifted".into(),
+            ))
+        }
         Err(AuthorityError::Storage(e)) => Err(UsageOrFail::Fail(e.to_string())),
     }
 }

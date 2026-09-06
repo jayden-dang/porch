@@ -102,6 +102,12 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Pretty-print the derived audit document for a run (same builder as `porch agent audit`).
+    Audit {
+        /// Run id (ULID). Defaults to latest parked run for the cwd repo.
+        #[arg(long)]
+        run_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -310,9 +316,12 @@ fn main_inner() -> Result<ExitCode> {
                 recover,
             )))
         }
-        Some(Command::Agent {
-            command: AgentCommand::Audit { run_id },
-        }) => {
+        Some(
+            Command::Agent {
+                command: AgentCommand::Audit { run_id },
+            }
+            | Command::Audit { run_id },
+        ) => {
             let home = porch_home();
             let work = env::current_dir()?;
             Ok(emit_agent(&run_agent_audit(

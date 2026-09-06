@@ -160,6 +160,7 @@ When `status=parked` and `phase=review`:
 | `f` | Fix selected (or all blocking); needs fixer |
 | `y` | One `fix --yes` round (not whole-gate yolo) |
 | `s` | Skip review for this run (no approved SHA) |
+| `h` | Toggle history / audit panel (lazy `get_audit`; not on live subscribe) |
 | `x` then `x` | Abort |
 | `q` / `Esc` | Detach (run keeps going) |
 
@@ -183,6 +184,8 @@ Compose `skip` ≠ review `skip`: it accepts the scaffold and **continues** deli
 
 ```sh
 porch agent status
+porch agent audit                 # or: porch audit [--run-id]
+porch audit --run-id <ULID>
 # review park
 porch agent respond approve
 porch agent respond skip
@@ -201,16 +204,18 @@ Stdout is JSON (JSONL with `agent run --wait`). Exit `0` ok/parked/completed, `1
 
 | Verb / form | Phase | Effect |
 |---|---|---|
-| `approve` | review | Continue; writes `review_approved_head_sha` |
-| `skip` | review | Skip remaining review; **no** approved SHA |
+| `approve` | review | Continue; writes `review_approved_head_sha`. Modern rounds also append a bulk `review_approved` disposition/authority event |
+| `skip` | review | Skip remaining review; **no** approved SHA. Modern rounds append `review_skipped` |
 | `skip` | compose | Accept scaffold PR body; complete deliver (does **not** skip certify/deliver) |
-| `abort` | rebase / review / compose | Cancel the run. Compose abort leaves the GitHub PR open |
-| `fix` | review / rebase | Native fixer, then **session-free** rereview (or rebase retry) |
+| `abort` | rebase / review / compose | Cancel the run. Modern review abort appends `review_aborted`. Compose abort leaves the GitHub PR open |
+| `fix` | review / rebase | Native fixer, then **session-free** rereview (or rebase retry). Modern review fix appends `fix_requested` **before** the fixer spawns |
 | `--body-file` [+ `--title`] | compose | Merge Agent prose into porch-managed PR regions; complete deliver |
+
+Status / `get_run` stay a **compact** live snapshot (findings, optional `audit_available`). Reconstruct disposition/authority from `porch agent audit` or `porch audit` (same typed audit document as daemon `get_audit` / TUI `h`).
 
 Read the packet at `compose_packet_path` before writing `--body-file`. Empty or theater-shaped bodies (gate Review/Certify/Pipeline boards) are rejected; the run stays parked. Do not combine `--body-file` with approve/skip/abort/fix.
 
-`--yes` is **one** fix round then approve remaining — never the default, never the whole gate.
+`--yes` is **one** fix round then approve remaining — never the default, never the whole gate. On a modern round it requires a durable `fix_requested` cite and fails closed if that cite is missing.
 
 **Never merge the PR from the skill.** **Never babysit deploy / spend-money E2E.**
 
