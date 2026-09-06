@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use porch_deliver::GH_BIN_ENV;
+use porch_gate::rounds;
 use porch_gate::{Db, kill_group, repo_id_for, run_worktree_dir};
 use porch_git::init_bare;
 use porch_review::{HomeConfig, REVIEW_BIN_ENV, ToolsConfig, write_home_config};
@@ -379,7 +380,7 @@ fn rebase_conflict_parks_with_phase_rebase() {
     let body = String::from_utf8_lossy(&status.stdout);
     assert!(body.contains("\"phase\": \"rebase\""), "{body}");
 
-    // approve refused on rebase park
+    // approve/skip refused on rebase park
     let approve = Command::cargo_bin("porch")
         .unwrap()
         .current_dir(&h.work)
@@ -388,6 +389,14 @@ fn rebase_conflict_parks_with_phase_rebase() {
         .output()
         .unwrap();
     assert_eq!(approve.status.code(), Some(2));
+    let skip = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&h.work)
+        .env("PORCH_HOME", &h.home)
+        .args(["agent", "respond", "skip", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert_eq!(skip.status.code(), Some(2));
 
     let fixer = install_noop_fixer(&h.bin_dir);
     let abort = Command::cargo_bin("porch")
@@ -402,6 +411,11 @@ fn rebase_conflict_parks_with_phase_rebase() {
     assert_eq!(abort.status.code(), Some(1));
     let run = db.run_by_id(&run.id).unwrap().unwrap();
     assert_eq!(run.status, "cancelled");
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert!(
+        events.is_empty(),
+        "rebase abort must not write disposition events: {events:?}"
+    );
 }
 
 #[test]
@@ -504,6 +518,24 @@ printf '{{"summary":"rewrote tip onto base"}}\n'
         "expected rebase completed after fix: {steps:?} run={final_run:?}"
     );
     assert_ne!(final_run.status, "failed", "run={final_run:?}");
+    for round in rounds::rounds_for_run(&db, &final_run.id).unwrap() {
+        for inst in rounds::instances_for_round(&db, &round.id).unwrap() {
+            assert_ne!(
+                inst.id.as_str(),
+                "rebase0",
+                "rebase0 fixer input must not become a durable finding instance"
+            );
+        }
+    }
+    for event in rounds::events_for_run(&db, &final_run.id).unwrap() {
+        assert!(
+            event
+                .members
+                .iter()
+                .all(|m| m.finding_instance_id != "rebase0"),
+            "rebase0 must not appear as an authority member: {event:?}"
+        );
+    }
 }
 
 #[test]

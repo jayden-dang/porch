@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use porch_deliver::{GH_BIN_ENV, MANAGED_BEGIN, MANAGED_END};
+use porch_gate::rounds;
 use porch_gate::{Db, kill_group, repo_id_for, run_artifact_dir};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
@@ -864,6 +865,17 @@ fn compose_abort_fails_run_and_leaves_pr_open() {
     assert!(
         !log.contains("pr close"),
         "must not auto-close PR on abort: {log}"
+    );
+    assert!(
+        !log.contains("pr edit")
+            && !log.contains("pr ready")
+            && !log.lines().any(|l| l.contains("draft")),
+        "compose abort must not mutate the PR via gh: {log}"
+    );
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert!(
+        events.is_empty(),
+        "compose abort must not write disposition events: {events:?}"
     );
 
     kill_daemon(&s.home);

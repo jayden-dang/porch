@@ -1500,6 +1500,17 @@ fn legacy_parked_run_answers_actions_and_unreviewed_is_none() {
         assert!(hunk.get("error").is_none(), "hunk={hunk}");
 
         porch_gate::set_finding_note(&s.home, &run.id, "f0", "operator note").unwrap();
+        let notes_path = porch_gate::finding_notes_path(&s.home, &run.id);
+        assert!(
+            notes_path.ends_with("finding_notes.json"),
+            "notes must stay in finding_notes.json, got {notes_path:?}"
+        );
+        assert!(notes_path.is_file(), "missing {notes_path:?}");
+        let notes_raw = std::fs::read_to_string(&notes_path).unwrap();
+        assert!(
+            notes_raw.contains("\"f0\"") && notes_raw.contains("operator note"),
+            "notes must stay keyed by display fN in the file: {notes_raw}"
+        );
         let notes = porch_gate::load_finding_notes(&s.home, &run.id).unwrap();
         assert_eq!(notes.get("f0").map(String::as_str), Some("operator note"));
 
@@ -1524,6 +1535,12 @@ fn legacy_parked_run_answers_actions_and_unreviewed_is_none() {
         assert!(events[0].identity_unavailable);
         assert!(events[0].review_round_id.is_none());
         assert!(events[0].members.is_empty());
+        let notes_after = porch_gate::load_finding_notes(&s.home, &run.id).unwrap();
+        assert_eq!(
+            notes_after.get("f0").map(String::as_str),
+            Some("operator note"),
+            "abort must leave finding_notes.json untouched"
+        );
         kill_daemon(&s.home);
     }
 

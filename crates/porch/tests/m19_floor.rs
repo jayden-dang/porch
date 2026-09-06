@@ -1082,7 +1082,8 @@ fn matching_later_round_proceeds_and_a_shape_change_fails_closed() {
         );
         assert_eq!(
             run_required_set_digest(&db, &run.id).unwrap().as_deref(),
-            Some(pinned.as_str())
+            Some(pinned.as_str()),
+            "authorize must keep using the recorded required set"
         );
         kill_daemon(&h.home);
     }
