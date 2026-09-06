@@ -27,7 +27,9 @@ pub use audit::{
 pub use daemon::{ensure_daemon, run_daemon, wait_for_health};
 pub use db::{Db, RepoRow, RunRow, StepResultRow, UncertifiedPipelineRange};
 pub use eject::{EjectOptions, EjectResult, eject};
-pub use events::{Event, EventHub, Subscriber, clear_event_hub, event_hub, install_event_hub};
+pub use events::{
+    Event, EventHub, MAILBOX_CAP, Subscriber, clear_event_hub, event_hub, install_event_hub,
+};
 pub use executor::RunExecutor;
 pub use home::{
     db_path, lock_path, logs_dir, pid_path, porch_home, repos_dir, run_artifact_dir,

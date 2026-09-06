@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use porch_gate::{
-    Event, RunSnapshot, get_finding_hunk, get_run, load_finding_notes, run_artifact_dir,
-    set_finding_note, subscribe_events,
+    AuditDocument, Event, RunSnapshot, get_audit, get_finding_hunk, get_run, load_finding_notes,
+    run_artifact_dir, set_finding_note, subscribe_events,
 };
 use porch_run::{AgentResponse, agent_respond, sync_hint_for};
 use ratatui::backend::CrosstermBackend;
@@ -62,6 +62,7 @@ pub enum KeyAction {
 }
 
 /// Unit-testable UI model for one attached run.
+#[allow(clippy::struct_excessive_bools)] // independent UI latches (abort/working/detail/history)
 pub struct App {
     pub snapshot: RunSnapshot,
     pub findings: Vec<FindingRow>,
@@ -75,6 +76,12 @@ pub struct App {
     pub show_detail: bool,
     /// Cached hunk text for the detail panel.
     pub detail_hunk: String,
+    /// Show on-demand audit/history panel (lazy `get_audit` on open).
+    pub show_history: bool,
+    /// Cached audit document for the history panel.
+    pub history_audit: Option<AuditDocument>,
+    /// How many times history open called `get_audit` (subscribe path never bumps this).
+    pub audit_fetch_count: u32,
     /// Per-finding operator notes (also persisted under `$PORCH_HOME/runs/<id>/`).
     pub notes: HashMap<String, String>,
     /// When set, keystrokes edit the note for this finding id.
@@ -114,6 +121,9 @@ impl App {
             message,
             show_detail: false,
             detail_hunk: String::new(),
+            show_history: false,
+            history_audit: None,
+            audit_fetch_count: 0,
             notes: notes.into_iter().collect(),
             note_editing: None,
             note_draft: String::new(),
@@ -209,6 +219,7 @@ impl App {
             }
             KeyCode::Char(' ') => self.toggle_selection(),
             KeyCode::Char('d') => self.toggle_detail(),
+            KeyCode::Char('h') => self.toggle_history(),
             KeyCode::Char('n') if self.actions_enabled() && !self.compose_parked() => {
                 self.begin_note_edit();
             }
@@ -294,6 +305,32 @@ impl App {
             self.refresh_detail_hunk();
         } else {
             self.detail_hunk.clear();
+        }
+    }
+
+    fn toggle_history(&mut self) {
+        if self.show_history {
+            self.show_history = false;
+        } else {
+            self.show_history = true;
+            self.refresh_history_audit();
+        }
+    }
+
+    /// Fetch the derived audit document once when the history view opens.
+    ///
+    /// Live `State` / `StreamGap` refresh goes through [`Self::apply_snapshot`] and
+    /// must not call this.
+    pub fn refresh_history_audit(&mut self) {
+        self.audit_fetch_count = self.audit_fetch_count.saturating_add(1);
+        match get_audit(&self.home, &self.snapshot.run_id) {
+            Ok(doc) => {
+                self.history_audit = Some(doc);
+            }
+            Err(e) => {
+                self.history_audit = None;
+                self.message = format!("audit error: {e}");
+            }
         }
     }
 
@@ -409,6 +446,7 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         let detail_h = if self.show_detail { 8u16 } else { 0 };
+        let history_h = if self.show_history { 8u16 } else { 0 };
         let note_h = if self.note_editing.is_some() { 3u16 } else { 0 };
         let mut pipeline_h = 5u16;
         if self.snapshot.assurance_record.assurance_shape().is_some() {
@@ -423,10 +461,24 @@ impl App {
         if self.compose_parked() {
             pipeline_h = pipeline_h.saturating_add(2);
         }
-        let [pipeline, findings, detail, note_bar, activity, footer] = Layout::vertical([
+        let findings_pct = if self.show_detail || self.show_history {
+            25
+        } else {
+            45
+        };
+        let [
+            pipeline,
+            findings,
+            detail,
+            history,
+            note_bar,
+            activity,
+            footer,
+        ] = Layout::vertical([
             Constraint::Length(pipeline_h),
-            Constraint::Percentage(if self.show_detail { 30 } else { 45 }),
+            Constraint::Percentage(findings_pct),
             Constraint::Length(detail_h),
+            Constraint::Length(history_h),
             Constraint::Length(note_h),
             Constraint::Fill(1),
             Constraint::Length(2),
@@ -443,6 +495,16 @@ impl App {
                         .title("detail (d toggle)"),
                 ),
                 detail,
+            );
+        }
+        if self.show_history {
+            frame.render_widget(
+                Paragraph::new(history_panel_text(self.history_audit.as_ref())).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("history (h toggle)"),
+                ),
+                history,
             );
         }
         if self.note_editing.is_some() {
@@ -565,14 +627,31 @@ fn footer_keys(app: &App) -> &'static str {
     if app.note_editing.is_some() {
         "Enter save  Esc cancel"
     } else if app.actions_enabled() && app.compose_parked() {
-        "s skip  x abort  q detach  (compose: agent respond --body-file; see packet)"
+        "s skip  x abort  h history  q detach  (compose: agent respond --body-file; see packet)"
     } else if app.actions_enabled() {
-        "a approve  f fix  y fix--yes  s skip  x abort  d detail  n note  q detach"
+        "a approve  f fix  y fix--yes  s skip  x abort  d detail  h history  n note  q detach"
     } else if app.working {
         "working…  q detach"
     } else {
-        "d detail  q detach (actions when parked)"
+        "d detail  h history  q detach (actions when parked)"
     }
+}
+
+fn history_panel_text(doc: Option<&AuditDocument>) -> String {
+    let Some(doc) = doc else {
+        return "audit unavailable".into();
+    };
+    format!(
+        "completeness {}  status {}  audit_rev {}  history_rev {}\nevents {}  instances {}  rounds {}  related {}",
+        doc.completeness,
+        doc.run_status,
+        doc.watermark.audit_rev,
+        doc.watermark.review_history_revision,
+        doc.events.len(),
+        doc.instances.len(),
+        doc.rounds.len(),
+        doc.related_occurrences.len(),
+    )
 }
 
 fn respond_footer_message(label: &str, result: &porch_run::AgentCliResult) -> String {
@@ -1204,5 +1283,77 @@ mod tests {
             findings_panel_title(&porch_gate::AssuranceRecord::round("r1")),
             "findings"
         );
+    }
+
+    #[test]
+    fn history_view_fetches_audit_once_on_open_not_on_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let db = Db::open(&db_path(&home)).unwrap();
+        db.upsert_repo("repo1", &home, &home.join("bare.git"), "main")
+            .unwrap();
+        let run = db
+            .insert_run("repo1", "feat/demo", "abc123", None, None)
+            .unwrap();
+        db.set_run_status(&run.id, "parked", None).unwrap();
+        db.set_worktree_dir(&run.id, &wt).unwrap();
+        db.set_findings_json(
+            &run.id,
+            Some(
+                r#"[{"id":"f0","severity":"warning","path":"src/a.rs","message":"todo","action":"ask-user"}]"#,
+            ),
+        )
+        .unwrap();
+
+        let exec: Arc<dyn porch_gate::RunExecutor> = Arc::new(NoopExecutor);
+        let home_d = home.clone();
+        let daemon = std::thread::spawn(move || {
+            let _ = porch_gate::run_daemon(&home_d, &exec);
+        });
+        wait_for_health(&home, Duration::from_secs(5)).unwrap();
+
+        let snap = get_run(&home, &run.id).unwrap();
+        let mut app = App::from_snapshot(snap, &home, &wt);
+        assert!(!app.show_history);
+        assert_eq!(app.audit_fetch_count, 0);
+        assert!(app.history_audit.is_none());
+
+        apply_gap_and_snapshot(&mut app, get_run(&home, &run.id).unwrap());
+        assert_eq!(
+            app.audit_fetch_count, 0,
+            "State/StreamGap refresh must not call get_audit"
+        );
+        assert!(app.history_audit.is_none());
+
+        let _ = app.handle_key(KeyCode::Char('h'));
+        assert!(app.show_history);
+        assert_eq!(app.audit_fetch_count, 1);
+        let loaded = app
+            .history_audit
+            .as_ref()
+            .expect("history open loads audit");
+        assert_eq!(loaded.run_id, run.id);
+        assert_eq!(loaded.schema_version, 1);
+
+        apply_gap_and_snapshot(&mut app, get_run(&home, &run.id).unwrap());
+        assert_eq!(
+            app.audit_fetch_count, 1,
+            "live snapshot refresh must not refetch audit"
+        );
+
+        let _ = app.handle_key(KeyCode::Char('h'));
+        assert!(!app.show_history);
+        let _ = app.handle_key(KeyCode::Char('h'));
+        assert!(app.show_history);
+        assert_eq!(
+            app.audit_fetch_count, 2,
+            "each history open fetches audit once"
+        );
+
+        std::mem::forget(daemon);
     }
 }

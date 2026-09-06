@@ -7,13 +7,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use porch_gate::{
-    EjectOptions, InitOptions, admit_push, eject, ensure_daemon, get_run, git_dir_from_env,
-    health_check, init, install_service, list_runs, notify_push, porch_home, repo_id_for,
-    run_daemon, service_status, start_service, stop_daemon, uninstall_service,
+    EjectOptions, InitOptions, admit_push, eject, ensure_daemon, get_audit, get_run,
+    git_dir_from_env, health_check, init, install_service, list_runs, notify_push, porch_home,
+    repo_id_for, run_daemon, service_status, start_service, stop_daemon, uninstall_service,
 };
 use porch_run::{
-    AgentResponse, AgentRunOpts, PipelineExecutor, agent_respond, agent_run, agent_status,
-    agent_sync, rerun,
+    AgentCliResult, AgentResponse, AgentRunOpts, PipelineExecutor, agent_respond, agent_run,
+    agent_status, agent_sync, rerun,
 };
 
 mod doctor;
@@ -187,6 +187,12 @@ enum AgentCommand {
         #[arg(long)]
         recover: bool,
     },
+    /// Pretty-print the derived audit document JSON for a run.
+    Audit {
+        /// Run id (ULID). Defaults to latest parked run for the cwd repo.
+        #[arg(long)]
+        run_id: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -304,6 +310,55 @@ fn main_inner() -> Result<ExitCode> {
                 recover,
             )))
         }
+        Some(Command::Agent {
+            command: AgentCommand::Audit { run_id },
+        }) => {
+            let home = porch_home();
+            let work = env::current_dir()?;
+            Ok(emit_agent(&run_agent_audit(
+                &home,
+                run_id.as_deref(),
+                &work,
+            )))
+        }
+    }
+}
+
+fn run_agent_audit(home: &Path, run_id: Option<&str>, work_tree: &Path) -> AgentCliResult {
+    let resolved = if let Some(id) = run_id {
+        id.to_string()
+    } else {
+        let status = agent_status(home, None, work_tree);
+        if status.exit_code != 0 {
+            return status;
+        }
+        let Some(id) = serde_json::from_str::<serde_json::Value>(&status.json)
+            .ok()
+            .and_then(|v| {
+                v.get("run_id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
+        else {
+            return AgentCliResult {
+                exit_code: 1,
+                json: serde_json::json!({"error": "status missing run_id"}).to_string(),
+                already_emitted: false,
+            };
+        };
+        id
+    };
+    match get_audit(home, &resolved) {
+        Ok(doc) => AgentCliResult {
+            exit_code: 0,
+            json: serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()),
+            already_emitted: false,
+        },
+        Err(e) => AgentCliResult {
+            exit_code: 1,
+            json: serde_json::json!({"error": e.to_string()}).to_string(),
+            already_emitted: false,
+        },
     }
 }
 

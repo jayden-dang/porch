@@ -1575,3 +1575,89 @@ fn audit_document_exposes_head_changed_false_on_porch_approve() {
 
     kill_daemon(&home);
 }
+
+#[test]
+fn agent_audit_prints_builder_json_while_status_stays_compact() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(
+        &work,
+        &home,
+        "feat-dispo-agent-audit-cli",
+        &fake,
+        "blocking",
+    );
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let expected = get_audit(&home, &run.id).unwrap();
+    let expected_json = serde_json::to_value(&expected).unwrap();
+
+    let path = format!(
+        "{}:{}",
+        fake.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let audit_out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .env(REVIEW_BIN_ENV, fake)
+        .env("PATH", &path)
+        .args(["agent", "audit", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert!(
+        audit_out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&audit_out.stdout),
+        String::from_utf8_lossy(&audit_out.stderr)
+    );
+    let printed: Value = serde_json::from_slice(&audit_out.stdout).unwrap();
+    assert_eq!(printed["schema_version"], expected_json["schema_version"]);
+    assert_eq!(printed["run_id"], run.id);
+    assert_eq!(printed["watermark"], expected_json["watermark"]);
+    assert_eq!(printed["events"], expected_json["events"]);
+    assert_eq!(
+        printed["related_occurrences"],
+        expected_json["related_occurrences"]
+    );
+    assert!(
+        printed.get("schema_version").is_some(),
+        "agent audit must emit the typed audit document"
+    );
+
+    let status_out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .args(["agent", "status", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert!(
+        status_out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&status_out.stdout),
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(status["run_id"], run.id);
+    assert_eq!(status["status"], "parked");
+    assert!(status.get("schema_version").is_none());
+    assert!(status.get("events").is_none());
+    assert!(status.get("related_occurrences").is_none());
+    assert!(status.get("watermark").is_none());
+    let findings = status["findings"].as_array().expect("compact findings");
+    assert!(!findings.is_empty());
+    assert_eq!(findings[0]["id"], "f0");
+
+    assert_eq!(
+        porch_gate::MAILBOX_CAP,
+        64,
+        "subscribe mailbox cap must stay frozen"
+    );
+
+    kill_daemon(&home);
+}

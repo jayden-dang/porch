@@ -67,6 +67,23 @@ Default: latest **parked** run for the cwd repo (`porch.repo-id` / worktree matc
 is **not** authorization identity. `kind` `legacy_snapshot` and `none` omit
 the field rather than inventing a shape.
 
+Status stays a **compact** live snapshot (`findings[]` display handles, optional
+`audit_available`). It is not the audit document.
+
+## Audit
+
+```sh
+porch agent audit
+porch agent audit --run-id <ULID>
+```
+
+Default: latest **parked** run for the cwd repo (same resolution as `status`).
+Pretty-printed JSON from the same typed audit-document builder as daemon
+`get_audit` — rounds, finding instances, disposition/authority events with
+members, related-occurrence groups, watermark (`audit_rev` +
+`review_history_revision`), and inferred phase. Use this for reconstruction;
+keep using `status` for park decisions.
+
 When `phase` is `"compose"`, status also includes `pr_url`, `compose_packet_path`
 (`$PORCH_HOME/runs/<run_id>/compose-packet.json`), and `allowed_actions`
 `["respond","skip","abort"]`.
