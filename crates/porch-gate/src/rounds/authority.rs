@@ -113,6 +113,33 @@ pub struct PersistAuthorityPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepEffect {
+    pub step: String,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEffects {
+    pub status: Option<String>,
+    pub error: Option<String>,
+    pub approved_head: Option<String>,
+    pub steps: Vec<StepEffect>,
+}
+
+impl RunEffects {
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            status: None,
+            error: None,
+            approved_head: None,
+            steps: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorityMemberRecord {
     pub finding_instance_id: String,
     pub role: MemberRole,
@@ -154,6 +181,24 @@ pub enum AuthorityError {
 pub fn persist_authority(
     db: &Db,
     plan: PersistAuthorityPlan,
+) -> std::result::Result<String, AuthorityError> {
+    persist_authority_with_run_effects(db, plan, RunEffects::none())
+}
+
+/// Append one authority event and optional run status / HEAD / step rows in one Immediate txn.
+///
+/// # Errors
+///
+/// Returns [`AuthorityError::Stale`] when expected round/HEAD drift is observed, or a
+/// storage error when the transaction cannot commit.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn persist_authority_with_run_effects(
+    db: &Db,
+    plan: PersistAuthorityPlan,
+    effects: RunEffects,
 ) -> std::result::Result<String, AuthorityError> {
     if plan.identity_unavailable {
         if plan.kind != AuthorityKind::ReviewAborted {
@@ -243,6 +288,8 @@ pub fn persist_authority(
         .map_err(crate::Error::from)?;
     }
 
+    apply_run_effects_tx(&tx, &run_id, effects)?;
+
     tx.execute(
         "UPDATE runs SET audit_rev = audit_rev + 1 WHERE id = ?1",
         [&run_id],
@@ -251,6 +298,43 @@ pub fn persist_authority(
 
     tx.commit().map_err(crate::Error::from)?;
     Ok(event_id)
+}
+
+fn apply_run_effects_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    effects: RunEffects,
+) -> std::result::Result<(), AuthorityError> {
+    let RunEffects {
+        status,
+        error,
+        approved_head,
+        steps,
+    } = effects;
+    if let Some(status) = status.as_deref() {
+        tx.execute(
+            "UPDATE runs SET status = ?1, error = ?2 WHERE id = ?3",
+            rusqlite::params![status, error, run_id],
+        )
+        .map_err(crate::Error::from)?;
+    }
+    if let Some(head) = approved_head.as_deref() {
+        tx.execute(
+            "UPDATE runs SET review_approved_head_sha = ?1 WHERE id = ?2",
+            rusqlite::params![head, run_id],
+        )
+        .map_err(crate::Error::from)?;
+    }
+    for step in steps {
+        let id = Ulid::new().to_string();
+        tx.execute(
+            "INSERT INTO step_results (id, run_id, step, status, error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, run_id, step.step, step.status, step.error, now_secs()],
+        )
+        .map_err(crate::Error::from)?;
+    }
+    Ok(())
 }
 
 fn guard_applicable(

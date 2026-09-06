@@ -12,7 +12,8 @@ pub use applicability::{
 };
 pub use authority::{
     ActorKind, AuthorityError, AuthorityEventRecord, AuthorityKind, AuthorityMemberRecord,
-    MemberRole, PersistAuthorityPlan, events_for_run, persist_authority,
+    MemberRole, PersistAuthorityPlan, RunEffects, StepEffect, events_for_run, persist_authority,
+    persist_authority_with_run_effects,
 };
 pub use requirements::{
     RequirementRow, RequirementSpec, Resolution, Role, assurance_shape, assurance_shape_for_rows,

@@ -3511,10 +3511,7 @@ fn modern_review_aborted_and_skipped_persist_with_context_freeze() {
         Some(skip_round.as_str())
     );
     assert_eq!(skip_events[0].members.len(), 1);
-    assert_eq!(
-        skip_events[0].members[0].finding_instance_id,
-        skip_instance
-    );
+    assert_eq!(skip_events[0].members[0].finding_instance_id, skip_instance);
 }
 
 #[test]
@@ -3586,7 +3583,10 @@ fn identity_unavailable_rejected_for_non_abort_kinds_without_writing() {
             members: vec![],
         },
     );
-    assert!(legacy_ok.is_ok(), "legacy abort with identity_unavailable still succeeds");
+    assert!(
+        legacy_ok.is_ok(),
+        "legacy abort with identity_unavailable still succeeds"
+    );
 }
 
 #[test]
@@ -3643,4 +3643,126 @@ fn authority_members_store_instance_ids_never_display_handles() {
         )
         .unwrap();
     assert_eq!(bad, 0);
+}
+
+#[test]
+fn abort_with_cancelled_commits_together_and_rolls_back_on_write_failure() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let (run_id, round_id, instance_id) = park_finished_round(&db, home);
+    db.set_run_status(&run_id, "parked", None).unwrap();
+
+    let abort_plan = rounds::PersistAuthorityPlan {
+        run_id: run_id.clone(),
+        kind: rounds::AuthorityKind::ReviewAborted,
+        expected_round_id: Some(round_id.clone()),
+        expected_head: Some("to".into()),
+        live_head: Some("to".into()),
+        actor_kind: rounds::ActorKind::Operator,
+        authority_event_id: None,
+        head_changed: None,
+        identity_unavailable: false,
+        members: vec![(instance_id.clone(), rounds::MemberRole::Context)],
+    };
+    let cancel_effects = rounds::RunEffects {
+        status: Some("cancelled".into()),
+        error: Some("agent abort".into()),
+        approved_head: None,
+        steps: vec![],
+    };
+
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TRIGGER poison_authority_effects BEFORE UPDATE ON runs
+            BEGIN
+                SELECT RAISE(ABORT, 'forced mid-txn write failure');
+            END;
+            ",
+        )
+        .unwrap();
+    }
+
+    let poisoned =
+        rounds::persist_authority_with_run_effects(&db, abort_plan.clone(), cancel_effects.clone());
+    assert!(
+        poisoned.is_err(),
+        "injected write failure must abort the transaction"
+    );
+    assert!(
+        rounds::events_for_run(&db, &run_id).unwrap().is_empty(),
+        "rolled-back txn must leave no authority event"
+    );
+    let parked = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(parked.status, "parked");
+    assert!(parked.error.is_none());
+
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch("DROP TRIGGER IF EXISTS poison_authority_effects;")
+            .unwrap();
+    }
+
+    let event_id = rounds::persist_authority_with_run_effects(&db, abort_plan, cancel_effects)
+        .expect("abort with cancelled");
+    let events = rounds::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, event_id);
+    assert_eq!(events[0].kind, rounds::AuthorityKind::ReviewAborted);
+    let cancelled = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    assert_eq!(cancelled.error.as_deref(), Some("agent abort"));
+}
+
+#[test]
+fn approve_with_run_effects_writes_approved_head_and_review_step() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let (run_id, round_id, instance_id) = park_finished_round(&db, home);
+    db.set_run_status(&run_id, "parked", None).unwrap();
+
+    let event_id = rounds::persist_authority_with_run_effects(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: run_id.clone(),
+            kind: rounds::AuthorityKind::ReviewApproved,
+            expected_round_id: Some(round_id.clone()),
+            expected_head: Some("to".into()),
+            live_head: Some("to".into()),
+            actor_kind: rounds::ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: false,
+            members: vec![(instance_id, rounds::MemberRole::Context)],
+        },
+        rounds::RunEffects {
+            status: None,
+            error: None,
+            approved_head: Some("to".into()),
+            steps: vec![rounds::StepEffect {
+                step: "review".into(),
+                status: "completed".into(),
+                error: Some("approved".into()),
+            }],
+        },
+    )
+    .expect("approve with effects");
+
+    let events = rounds::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, event_id);
+    assert_eq!(events[0].kind, rounds::AuthorityKind::ReviewApproved);
+
+    let run = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(run.review_approved_head_sha.as_deref(), Some("to"));
+    assert_eq!(run.status, "parked");
+
+    let steps = db.step_results_for_run(&run_id).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].step, "review");
+    assert_eq!(steps[0].status, "completed");
+    assert_eq!(steps[0].error.as_deref(), Some("approved"));
 }
