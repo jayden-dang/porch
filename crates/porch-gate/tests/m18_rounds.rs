@@ -3144,3 +3144,327 @@ fn daemon_startup_still_recovers_stale_runs_and_refuses_when_recovery_fails() {
         let _ = handle.join();
     }
 }
+
+fn instance_row_bytes(db_file: &Path, instance_id: &str) -> Vec<u8> {
+    let conn = Connection::open(db_file).unwrap();
+    conn.query_row(
+        "SELECT id || round_id || producer_invocation_id || fingerprint ||
+                CAST(fingerprint_version AS TEXT) || candidate_key || criterion_id ||
+                evidence || consequence || action || severity || provenance_json ||
+                IFNULL(confidence_value, '') || IFNULL(confidence_kind, '') ||
+                path || anchor_kind || IFNULL(anchor_value, '')
+         FROM finding_instances WHERE id = ?1",
+        [instance_id],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap()
+    .into_bytes()
+}
+
+fn park_finished_round(db: &Db, home: &Path) -> (String, rounds::RoundId, String) {
+    let run_id = seed_run(db, home);
+    let inventory = b"inv-authority\n";
+    let round_id =
+        rounds::open_round(db, &sample_plan(&run_id), &sample_bindings(inventory)).unwrap();
+    let producer = producer_id(db, &round_id);
+    let (rev, _) = rounds::read_history(db, &run_id).unwrap();
+    assert_eq!(
+        rounds::finalize_round(db, &round_id, &sample_complete_proposal(&producer), rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+    db.set_run_shas(&run_id, Some("to"), None).unwrap();
+    let instance_id = rounds::instances_for_round(db, &round_id).unwrap()[0]
+        .id
+        .clone();
+    (run_id, round_id, instance_id)
+}
+
+#[test]
+fn review_approved_persists_context_members_without_mutating_instances() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let (run_id, round_id, instance_id) = park_finished_round(&db, home);
+    let before = instance_row_bytes(&db_path(home), &instance_id);
+    let audit_before: i64 = {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.query_row(
+            "SELECT audit_rev FROM runs WHERE id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    let event_id = rounds::persist_authority(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: run_id.clone(),
+            kind: rounds::AuthorityKind::ReviewApproved,
+            expected_round_id: Some(round_id.clone()),
+            expected_head: Some("to".into()),
+            live_head: Some("to".into()),
+            actor_kind: rounds::ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: false,
+            members: vec![(instance_id.clone(), rounds::MemberRole::Context)],
+        },
+    )
+    .expect("persist approved");
+
+    assert!(!event_id.is_empty());
+    let after = instance_row_bytes(&db_path(home), &instance_id);
+    assert_eq!(before, after, "finding instance row must stay immutable");
+
+    let events = rounds::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, event_id);
+    assert_eq!(events[0].kind, rounds::AuthorityKind::ReviewApproved);
+    assert_eq!(
+        events[0].review_round_id.as_deref(),
+        Some(round_id.as_str())
+    );
+    assert_eq!(events[0].reviewed_head.as_deref(), Some("to"));
+    assert!(!events[0].identity_unavailable);
+    assert_eq!(events[0].members.len(), 1);
+    assert_eq!(events[0].members[0].finding_instance_id, instance_id);
+    assert_eq!(events[0].members[0].role, rounds::MemberRole::Context);
+
+    let audit_after: i64 = {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.query_row(
+            "SELECT audit_rev FROM runs WHERE id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert!(audit_after > audit_before, "persist must bump audit_rev");
+}
+
+#[test]
+fn drifted_round_or_head_fails_closed_without_writing_an_event() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let (run_id, round_id, instance_id) = park_finished_round(&db, home);
+
+    let other_home_run = {
+        db.upsert_repo(
+            "repo-other-auth",
+            home,
+            &home.join("bare-other-auth.git"),
+            "main",
+        )
+        .unwrap();
+        db.insert_run(
+            "repo-other-auth",
+            "feat",
+            "deadbeef",
+            Some("intent"),
+            Some("flag"),
+        )
+        .unwrap()
+        .id
+    };
+    let other_round = rounds::open_round(
+        &db,
+        &sample_plan(&other_home_run),
+        &sample_bindings(b"inv-other-auth\n"),
+    )
+    .unwrap();
+    let other_producer = producer_id(&db, &other_round);
+    let (other_rev, _) = rounds::read_history(&db, &other_home_run).unwrap();
+    assert_eq!(
+        rounds::finalize_round(
+            &db,
+            &other_round,
+            &sample_complete_proposal(&other_producer),
+            other_rev
+        )
+        .unwrap(),
+        FinalizeOutcome::Finalized
+    );
+
+    let wrong_round = rounds::persist_authority(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: run_id.clone(),
+            kind: rounds::AuthorityKind::ReviewApproved,
+            expected_round_id: Some(other_round),
+            expected_head: Some("to".into()),
+            live_head: Some("to".into()),
+            actor_kind: rounds::ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: false,
+            members: vec![(instance_id.clone(), rounds::MemberRole::Context)],
+        },
+    );
+    assert!(matches!(wrong_round, Err(rounds::AuthorityError::Stale)));
+    assert!(rounds::events_for_run(&db, &run_id).unwrap().is_empty());
+
+    let wrong_live = rounds::persist_authority(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: run_id.clone(),
+            kind: rounds::AuthorityKind::ReviewApproved,
+            expected_round_id: Some(round_id),
+            expected_head: Some("to".into()),
+            live_head: Some("moved".into()),
+            actor_kind: rounds::ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: false,
+            members: vec![(instance_id, rounds::MemberRole::Context)],
+        },
+    );
+    assert!(matches!(wrong_live, Err(rounds::AuthorityError::Stale)));
+    assert!(rounds::events_for_run(&db, &run_id).unwrap().is_empty());
+}
+
+#[test]
+fn empty_modern_context_and_legacy_abort_both_persist() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+
+    let run_empty = seed_run(&db, home);
+    let inventory = b"inv-empty-auth\n";
+    let round_empty =
+        rounds::open_round(&db, &sample_plan(&run_empty), &sample_bindings(inventory)).unwrap();
+    let producer = producer_id(&db, &round_empty);
+    let (rev, _) = rounds::read_history(&db, &run_empty).unwrap();
+    let mut proposal = sample_complete_proposal(&producer);
+    proposal.instances.clear();
+    assert_eq!(
+        rounds::finalize_round(&db, &round_empty, &proposal, rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+    db.set_run_shas(&run_empty, Some("to"), None).unwrap();
+    assert!(
+        rounds::instances_for_round(&db, &round_empty)
+            .unwrap()
+            .is_empty()
+    );
+
+    let empty_event = rounds::persist_authority(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: run_empty.clone(),
+            kind: rounds::AuthorityKind::ReviewApproved,
+            expected_round_id: Some(round_empty),
+            expected_head: Some("to".into()),
+            live_head: Some("to".into()),
+            actor_kind: rounds::ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: false,
+            members: vec![],
+        },
+    )
+    .expect("empty context still inserts");
+    let empty_events = rounds::events_for_run(&db, &run_empty).unwrap();
+    assert_eq!(empty_events.len(), 1);
+    assert_eq!(empty_events[0].id, empty_event);
+    assert!(empty_events[0].members.is_empty());
+    assert!(!empty_events[0].identity_unavailable);
+
+    let run_legacy = {
+        db.upsert_repo(
+            "repo-legacy-auth",
+            home,
+            &home.join("bare-legacy-auth.git"),
+            "main",
+        )
+        .unwrap();
+        db.insert_run(
+            "repo-legacy-auth",
+            "feat",
+            "deadbeef",
+            Some("intent"),
+            Some("flag"),
+        )
+        .unwrap()
+        .id
+    };
+    let legacy_event = rounds::persist_authority(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: run_legacy.clone(),
+            kind: rounds::AuthorityKind::ReviewAborted,
+            expected_round_id: None,
+            expected_head: None,
+            live_head: None,
+            actor_kind: rounds::ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: true,
+            members: vec![],
+        },
+    )
+    .expect("legacy abort");
+    let legacy_events = rounds::events_for_run(&db, &run_legacy).unwrap();
+    assert_eq!(legacy_events.len(), 1);
+    assert_eq!(legacy_events[0].id, legacy_event);
+    assert!(legacy_events[0].identity_unavailable);
+    assert!(legacy_events[0].review_round_id.is_none());
+    assert!(legacy_events[0].members.is_empty());
+}
+
+#[test]
+fn authority_members_store_instance_ids_never_display_handles() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let (run_id, round_id, instance_id) = park_finished_round(&db, home);
+    assert!(
+        !(instance_id.starts_with('f')
+            && instance_id.len() > 1
+            && instance_id[1..].chars().all(|c| c.is_ascii_digit())),
+        "fixture instance id must be a durable id, not fN, got {instance_id}"
+    );
+
+    rounds::persist_authority(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: run_id.clone(),
+            kind: rounds::AuthorityKind::FixRequested,
+            expected_round_id: Some(round_id),
+            expected_head: Some("to".into()),
+            live_head: Some("to".into()),
+            actor_kind: rounds::ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: false,
+            members: vec![(instance_id.clone(), rounds::MemberRole::Target)],
+        },
+    )
+    .expect("fix requested");
+
+    let events = rounds::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].members.len(), 1);
+    let stored = &events[0].members[0].finding_instance_id;
+    assert_eq!(stored, &instance_id);
+    assert!(
+        !(stored.starts_with('f')
+            && stored.len() > 1
+            && stored[1..].chars().all(|c| c.is_ascii_digit())),
+        "display handle fN must not be stored, got {stored}"
+    );
+    let conn = Connection::open(db_path(home)).unwrap();
+    let bad: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM authority_event_members m
+             WHERE m.finding_instance_id GLOB 'f[0-9]*'
+               AND NOT EXISTS (
+                   SELECT 1 FROM finding_instances fi WHERE fi.id = m.finding_instance_id
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bad, 0);
+}

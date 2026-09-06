@@ -145,6 +145,36 @@ CREATE TABLE IF NOT EXISTS round_producer_durations (
     FOREIGN KEY (round_id, producer_invocation_id)
         REFERENCES round_producers(round_id, id)
 );
+
+CREATE TABLE IF NOT EXISTS authority_events (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    kind TEXT NOT NULL CHECK (kind IN (
+        'review_approved', 'review_skipped', 'fix_requested', 'review_aborted'
+    )),
+    review_round_id TEXT REFERENCES review_rounds(id),
+    reviewed_head TEXT,
+    actor_kind TEXT NOT NULL CHECK (actor_kind IN ('operator', 'porch')),
+    authority_event_id TEXT REFERENCES authority_events(id),
+    head_changed INTEGER CHECK (head_changed IN (0, 1)),
+    identity_unavailable INTEGER NOT NULL DEFAULT 0 CHECK (identity_unavailable IN (0, 1)),
+    created_at TEXT NOT NULL,
+    CHECK (
+        (identity_unavailable = 1 AND review_round_id IS NULL)
+        OR (identity_unavailable = 0)
+    )
+);
+CREATE INDEX IF NOT EXISTS authority_events_run
+    ON authority_events(run_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS authority_event_members (
+    event_id TEXT NOT NULL REFERENCES authority_events(id) ON DELETE CASCADE,
+    finding_instance_id TEXT NOT NULL REFERENCES finding_instances(id),
+    role TEXT NOT NULL CHECK (role IN ('context', 'target')),
+    PRIMARY KEY (event_id, finding_instance_id, role)
+);
+CREATE INDEX IF NOT EXISTS authority_event_members_instance
+    ON authority_event_members(finding_instance_id);
 ";
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {

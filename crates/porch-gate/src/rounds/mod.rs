@@ -1,6 +1,7 @@
 //! Durable review-round store.
 
 mod applicability;
+mod authority;
 mod requirements;
 pub mod retention;
 mod schema;
@@ -8,6 +9,10 @@ mod schema;
 pub use applicability::{
     Applicability, EquivalenceInput, ObservedVersionForEquivalence, applicable_round,
     applicable_round_for_run, descriptor_equivalence_digest,
+};
+pub use authority::{
+    ActorKind, AuthorityError, AuthorityEventRecord, AuthorityKind, AuthorityMemberRecord,
+    MemberRole, PersistAuthorityPlan, events_for_run, persist_authority,
 };
 pub use requirements::{
     RequirementRow, RequirementSpec, Resolution, Role, assurance_shape, assurance_shape_for_rows,
@@ -1016,7 +1021,10 @@ pub fn finalize_round(
     )?;
 
     tx.execute(
-        "UPDATE runs SET review_history_revision = review_history_revision + 1 WHERE id = ?1",
+        "UPDATE runs
+         SET review_history_revision = review_history_revision + 1,
+             audit_rev = audit_rev + 1
+         WHERE id = ?1",
         [&run_id],
     )?;
 
@@ -1136,7 +1144,10 @@ fn close_interrupted(db: &Db, round_id: &RoundId, reason: &str) -> Result<bool> 
         ],
     )?;
     tx.execute(
-        "UPDATE runs SET review_history_revision = review_history_revision + 1 WHERE id = ?1",
+        "UPDATE runs
+         SET review_history_revision = review_history_revision + 1,
+             audit_rev = audit_rev + 1
+         WHERE id = ?1",
         [&run_id],
     )?;
     tx.commit()?;
@@ -1425,7 +1436,7 @@ fn map_round(row: &rusqlite::Row<'_>) -> Result<RoundRecord> {
     })
 }
 
-fn now_secs() -> String {
+pub(crate) fn now_secs() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or_else(|_| "0".into(), |d| d.as_secs().to_string())
