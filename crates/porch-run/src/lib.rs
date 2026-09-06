@@ -25,7 +25,7 @@ use porch_gate::rounds::{
     OpenRoundPlan, PersistAuthorityPlan, ProducerDuration, ProducerInvocation, RequirementSpec,
     Resolution, Role, RoundCoverageProposal, RoundId, RunEffects, STALE_REVISION_RETRIES,
     StepEffect, capture_context_element, descriptor_equivalence_digest, digest_for_specs,
-    persist_authority_with_run_effects, run_required_set_digest, sha256_hex,
+    persist_authority, persist_authority_with_run_effects, run_required_set_digest, sha256_hex,
 };
 use porch_gate::{
     Db, RunExecutor, RunRow, StatusFindingDto, db_path, event_hub, load_finding_notes, repo_id_for,
@@ -2190,6 +2190,8 @@ fn respond_fix(
         ));
     }
 
+    persist_fix_requested(db, home, run, wt, &selected)?;
+
     let Some(pre_fix_head) = spawn_and_wait_fixer(db, home, run, bare, wt, &selected)? else {
         // Fixer failed closed; run already marked failed.
         return Ok(());
@@ -2202,6 +2204,73 @@ fn respond_fix(
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
 
     finish_rereview(db, home, run, bare, wt, yes)
+}
+
+/// Persist `fix_requested` with selected instance ULIDs as targets; commit before fixer spawn.
+fn persist_fix_requested(
+    db: &Db,
+    home: &Path,
+    run: &RunRow,
+    wt: &Path,
+    selected: &[Finding],
+) -> std::result::Result<String, UsageOrFail> {
+    let round_id = round_for_decision(db, run)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?
+        .ok_or_else(|| {
+            UsageOrFail::Fail("fix requires an applicable review round for authority".into())
+        })?;
+    let round = rounds::get_round(db, &round_id)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?
+        .ok_or_else(|| {
+            UsageOrFail::Fail(format!("decision round {} missing", round_id.as_str()))
+        })?;
+    let instances =
+        rounds::instances_for_round(db, &round_id).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    // Same ordinal as status_from_instance / findings_for_run: instances_for_round → f0..fN.
+    let display_to_instance: std::collections::HashMap<String, String> = instances
+        .into_iter()
+        .enumerate()
+        .map(|(i, inst)| (format!("f{i}"), inst.id))
+        .collect();
+    let mut members = Vec::with_capacity(selected.len());
+    for finding in selected {
+        let Some(instance_id) = display_to_instance.get(&finding.id) else {
+            return Err(UsageOrFail::Fail(format!(
+                "finding {} has no durable instance in the applicable round",
+                finding.id
+            )));
+        };
+        members.push((instance_id.clone(), MemberRole::Target));
+    }
+    let live_head =
+        porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    let plan = PersistAuthorityPlan {
+        run_id: run.id.clone(),
+        kind: AuthorityKind::FixRequested,
+        expected_round_id: Some(round_id),
+        expected_head: Some(round.to_sha),
+        live_head: Some(live_head),
+        actor_kind: ActorKind::Operator,
+        authority_event_id: None,
+        head_changed: None,
+        identity_unavailable: false,
+        members,
+    };
+    let event_id = match persist_authority(db, plan) {
+        Ok(id) => id,
+        Err(AuthorityError::Stale) => {
+            return Err(UsageOrFail::Fail(
+                "authority persist rejected: applicable round or reviewed HEAD drifted".into(),
+            ));
+        }
+        Err(AuthorityError::Storage(e)) => return Err(UsageOrFail::Fail(e.to_string())),
+    };
+    // Minimal handoff for Task 5 `--yes` citing this fix_requested id.
+    let art = run_artifact_dir(home, &run.id);
+    std::fs::create_dir_all(&art).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    std::fs::write(art.join("last_fix_requested_event_id"), &event_id)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    Ok(event_id)
 }
 
 /// Returns `Ok(None)` when the fixer failed closed (run already marked failed).

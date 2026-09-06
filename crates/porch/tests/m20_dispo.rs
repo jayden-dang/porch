@@ -1,10 +1,11 @@
-//! Disposition history: review approve/skip bulk authority events.
+//! Disposition history: review approve/skip/fix authority events.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
 use porch_gate::rounds::{self, AuthorityKind, MemberRole};
 use porch_gate::{Db, kill_group, repo_id_for, round_for_decision};
@@ -141,8 +142,79 @@ case "$MODE" in
     printf '{"comments":[{"path":"%s","content":"null deref on empty input","category":"bug","severity":"high","start_line":1,"end_line":2}],"files":%s,"coverage":%s}\n' \
       "$TARGET" "$FILES_JSON" "$COV_JSON" > "$OUT"
     ;;
+  two-blocking)
+    TARGET=$(printf '%s\n' $FILES | head -n1)
+    if [ -z "$TARGET" ]; then TARGET="README"; fi
+    printf '{"comments":[{"path":"%s","content":"bug one","category":"bug","severity":"high","start_line":1,"end_line":1},{"path":"%s","content":"bug two","category":"bug","severity":"high","start_line":2,"end_line":2}],"files":%s,"coverage":%s}\n' \
+      "$TARGET" "$TARGET" "$FILES_JSON" "$COV_JSON" > "$OUT"
+    ;;
   *)
     echo "unknown PORCH_FAKE_REVIEW_MODE=$MODE" >&2
+    exit 1
+    ;;
+esac
+"#;
+    std::fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
+
+fn install_fake_fixer(bin_dir: &Path) -> PathBuf {
+    let path = bin_dir.join("fake-fixer");
+    let script = r#"#!/bin/sh
+set -e
+PROMPT=""
+FINDINGS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prompt-file) PROMPT="$2"; shift 2 ;;
+    --findings-file) FINDINGS="$2"; shift 2 ;;
+    --session-id) shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -z "$PROMPT" ] || [ ! -f "$PROMPT" ]; then
+  echo "prompt file missing" >&2
+  exit 1
+fi
+if [ -z "$FINDINGS" ] || [ ! -f "$FINDINGS" ]; then
+  echo "findings file missing" >&2
+  exit 1
+fi
+: "${PORCH_HOME:?}"
+# Record whether fix_requested already exists when the fixer binary starts.
+python3 - <<'PY'
+import os, sqlite3
+home = os.environ["PORCH_HOME"]
+db = sqlite3.connect(os.path.join(home, "state.sqlite"))
+n = db.execute(
+    "SELECT COUNT(*) FROM authority_events WHERE kind = 'fix_requested'"
+).fetchone()[0]
+with open(os.path.join(home, "fixer-saw-fix-requested"), "w", encoding="utf-8") as f:
+    f.write(str(n))
+open(os.path.join(home, "fixer-invoked"), "w", encoding="utf-8").write("1")
+PY
+MODE="${PORCH_FAKE_FIXER_MODE:-noop}"
+case "$MODE" in
+  noop)
+    printf '{"summary":"noop","session_id":"sess-1"}\n'
+    ;;
+  apply)
+    TARGET=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[0]["path"] if d else "README")' "$FINDINGS" 2>/dev/null || echo README)
+    if [ ! -f "$TARGET" ]; then TARGET=README; fi
+    printf 'fixed\n' >> "$TARGET"
+    git -c core.hooksPath=/dev/null -c user.email=porch@example.com -c user.name=Porch add -A >/dev/null
+    git -c core.hooksPath=/dev/null -c user.email=porch@example.com -c user.name=Porch commit --no-verify -m "fix: address review findings" >/dev/null
+    printf '{"summary":"address review findings","session_id":"sess-1"}\n'
+    ;;
+  *)
+    echo "unknown PORCH_FAKE_FIXER_MODE=$MODE" >&2
     exit 1
     ;;
 esac
@@ -168,6 +240,7 @@ fn setup_with_origin_and_fake(mode: &str) -> (TempDir, PathBuf, PathBuf, PathBuf
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&bin_dir).unwrap();
     let fake = install_fake_review(&bin_dir);
+    let fake_fixer = install_fake_fixer(&bin_dir);
     let fake_gh = install_noop_gh(&bin_dir);
 
     init_bare(&origin).unwrap();
@@ -206,8 +279,10 @@ fn setup_with_origin_and_fake(mode: &str) -> (TempDir, PathBuf, PathBuf, PathBuf
         .current_dir(&work)
         .env("PORCH_HOME", &home)
         .env(REVIEW_BIN_ENV, &fake)
+        .env(FIXER_BIN_ENV, &fake_fixer)
         .env(GH_BIN_ENV, &fake_gh)
         .env("PORCH_FAKE_REVIEW_MODE", mode)
+        .env("PORCH_FAKE_FIXER_MODE", "noop")
         .env("PATH", &path)
         .arg("init")
         .assert()
@@ -220,8 +295,10 @@ fn setup_with_origin_and_fake(mode: &str) -> (TempDir, PathBuf, PathBuf, PathBuf
         &home,
         &[
             (REVIEW_BIN_ENV, fake.as_os_str()),
+            (FIXER_BIN_ENV, fake_fixer.as_os_str()),
             (GH_BIN_ENV, fake_gh.as_os_str()),
             ("PORCH_FAKE_REVIEW_MODE", mode.as_ref()),
+            ("PORCH_FAKE_FIXER_MODE", "noop".as_ref()),
             ("PATH", path.as_ref()),
             ("PORCH_REVIEW_TIMEOUT_SECS", "5".as_ref()),
         ],
@@ -230,6 +307,39 @@ fn setup_with_origin_and_fake(mode: &str) -> (TempDir, PathBuf, PathBuf, PathBuf
     porch_gate::wait_for_health(&home, Duration::from_secs(5)).unwrap();
 
     (tmp, work, home, origin, fake)
+}
+
+fn agent_fix(
+    work: &Path,
+    home: &Path,
+    fake: &Path,
+    run_id: &str,
+    extra: &[&str],
+) -> std::process::Output {
+    let fake_fixer = fake.parent().unwrap().join("fake-fixer");
+    let fake_gh = fake.parent().unwrap().join("fake-gh");
+    let path = format!(
+        "{}:{}",
+        fake.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut args = vec!["agent", "respond", "fix", "--run-id", run_id];
+    args.extend_from_slice(extra);
+    Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(work)
+        .env("PORCH_HOME", home)
+        .env(REVIEW_BIN_ENV, fake)
+        .env(FIXER_BIN_ENV, &fake_fixer)
+        .env(GH_BIN_ENV, &fake_gh)
+        .env("PORCH_FAKE_REVIEW_MODE", "blocking")
+        .env("PORCH_FAKE_FIXER_MODE", "noop")
+        .env("PORCH_REVIEW_TIMEOUT_SECS", "20")
+        .env("PORCH_FIXER_TIMEOUT_SECS", "20")
+        .env("PATH", &path)
+        .args(&args)
+        .output()
+        .unwrap()
 }
 
 fn push_with_env(work: &Path, home: &Path, branch: &str, fake: &Path, mode: &str) {
@@ -485,4 +595,177 @@ fn head_moved_after_park_rejects_approve_without_event() {
     );
 
     kill_daemon(&home);
+}
+
+#[test]
+fn fix_freezes_selected_target_instance_ids() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("two-blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(
+        &work,
+        &home,
+        "feat-dispo-fix-targets",
+        &fake,
+        "two-blocking",
+    );
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let round_id = round_for_decision(&db, &run)
+        .unwrap()
+        .expect("decision round");
+    let instances = rounds::instances_for_round(&db, &round_id).unwrap();
+    assert!(
+        instances.len() >= 2,
+        "two-blocking park needs ≥2 instances; got {}",
+        instances.len()
+    );
+    let expected_f0 = instances[0].id.clone();
+
+    let out = agent_fix(&work, &home, &fake, &run.id, &["--findings", "f0"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(events.len(), 1, "exactly one fix_requested event");
+    assert_eq!(events[0].kind, AuthorityKind::FixRequested);
+    assert_eq!(
+        events[0].review_round_id.as_deref(),
+        Some(round_id.as_str())
+    );
+    assert_eq!(events[0].members.len(), 1);
+    assert_eq!(events[0].members[0].role, MemberRole::Target);
+    assert_eq!(events[0].members[0].finding_instance_id, expected_f0);
+    assert!(
+        !(events[0].members[0].finding_instance_id.starts_with('f')
+            && events[0].members[0].finding_instance_id[1..]
+                .chars()
+                .all(|c| c.is_ascii_digit())),
+        "members must be instance ids, not display handles"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn empty_fix_selection_usage_exits_without_event() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-fix-empty", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let out = agent_fix(&work, &home, &fake, &run.id, &["--findings", ""]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "empty selection must usage-exit; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["code"], "usage");
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("no findings selected") || err.contains("findings"),
+        "expected empty-selection usage copy, got {v}"
+    );
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "parked");
+    assert!(
+        rounds::events_for_run(&db, &run.id).unwrap().is_empty(),
+        "empty selection must not write fix_requested"
+    );
+    assert!(
+        !home.join("fixer-invoked").is_file(),
+        "fixer must not spawn on empty selection"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn fix_persists_event_before_fixer_and_drift_skips_spawn() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-fix-order", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let out = agent_fix(&work, &home, &fake, &run.id, &[]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saw = std::fs::read_to_string(home.join("fixer-saw-fix-requested")).unwrap();
+    assert_eq!(
+        saw.trim(),
+        "1",
+        "fixer must observe fix_requested already committed at spawn"
+    );
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, AuthorityKind::FixRequested);
+    assert!(!events[0].members.is_empty());
+    assert!(
+        events[0]
+            .members
+            .iter()
+            .all(|m| m.role == MemberRole::Target)
+    );
+
+    // Fresh park for drift: move worktree HEAD after park, then fix must fail closed.
+    let (_tmp2, work2, home2, _origin2, fake2) = setup_with_origin_and_fake("blocking");
+    commit_change(&work2, "bug.txt", "boom\n");
+    push_with_env(&work2, &home2, "feat-dispo-fix-drift", &fake2, "blocking");
+    let db2 = Db::open(&home2.join("state.sqlite")).unwrap();
+    let repo_id2 = repo_id_for(&work2);
+    let run2 = wait_status(&db2, &repo_id2, &["parked"], Duration::from_secs(20));
+    let wt = run2.worktree_dir.clone().expect("parked worktree");
+    git(&wt, &["config", "user.email", "porch@example.com"]);
+    git(&wt, &["config", "user.name", "Porch"]);
+    std::fs::write(wt.join("drift.txt"), "moved\n").unwrap();
+    git(&wt, &["add", "drift.txt"]);
+    git(&wt, &["commit", "-m", "drift after park"]);
+
+    let out = agent_fix(&work2, &home2, &fake2, &run2.id, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stale fix must fail; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("drift") || err.contains("stale") || err.contains("rejected"),
+        "expected drift/stale error, got {v}"
+    );
+    let run2 = db2.run_by_id(&run2.id).unwrap().unwrap();
+    assert_eq!(run2.status, "parked");
+    assert!(
+        rounds::events_for_run(&db2, &run2.id).unwrap().is_empty(),
+        "drifted fix must not write an authority event"
+    );
+    assert!(
+        !home2.join("fixer-invoked").is_file(),
+        "fixer must not spawn after HEAD drift"
+    );
+
+    kill_daemon(&home);
+    kill_daemon(&home2);
 }
