@@ -19,17 +19,18 @@ use porch_agent::{
     write_fixer_inputs, write_rebase_fix_inputs,
 };
 use porch_gate::rounds::{
-    self, AssuranceCompletion, ContextApplication, ContextApplicationState, ContextSource,
-    EquivalenceInput, ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal,
-    ObservedVersionForEquivalence, OpenRoundPlan, ProducerDuration, ProducerInvocation,
-    RequirementSpec, Resolution, Role, RoundCoverageProposal, RoundId, STALE_REVISION_RETRIES,
-    capture_context_element, descriptor_equivalence_digest, digest_for_specs,
-    run_required_set_digest, sha256_hex,
+    self, ActorKind, AssuranceCompletion, AuthorityError, AuthorityKind, ContextApplication,
+    ContextApplicationState, ContextSource, EquivalenceInput, ExecutionState, FinalizeOutcome,
+    FinalizeProposal, FindingInstanceProposal, MemberRole, ObservedVersionForEquivalence,
+    OpenRoundPlan, PersistAuthorityPlan, ProducerDuration, ProducerInvocation, RequirementSpec,
+    Resolution, Role, RoundCoverageProposal, RoundId, RunEffects, STALE_REVISION_RETRIES,
+    StepEffect, capture_context_element, descriptor_equivalence_digest, digest_for_specs,
+    persist_authority_with_run_effects, run_required_set_digest, sha256_hex,
 };
 use porch_gate::{
     Db, RunExecutor, RunRow, StatusFindingDto, db_path, event_hub, load_finding_notes, repo_id_for,
-    resolve_run_assurance, rpc_start_run, run_artifact_dir, run_deliver_repair_dir, run_fixer_dir,
-    run_worktree_dir,
+    resolve_run_assurance, round_for_decision, rpc_start_run, run_artifact_dir,
+    run_deliver_repair_dir, run_fixer_dir, run_worktree_dir,
 };
 use porch_git::GitDir;
 use porch_review::{
@@ -1816,31 +1817,10 @@ fn agent_respond_inner(
             ));
         }
         AgentResponse::Approve => {
-            let head = porch_git::rev_parse_c(&wt, "HEAD")
-                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            db.set_review_approved_head_sha(&run.id, Some(&head))
-                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            clear_uncertified_if_certified(&db, &wt, &run.repo_id, &run.branch, &head)
-                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            record_step(&db, &run.id, "review", "completed", Some("approved"))
-                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            let parked =
-                finish_certify_and_deliver(home, &db, &bare, &wt, &run.id, &repo.default_branch)?;
-            if !parked {
-                finish_remove_worktree(&bare, &run, &wt);
-            }
+            respond_review_approve(home, &db, &run, &bare, &wt, &repo.default_branch)?;
         }
         AgentResponse::Skip => {
-            // Skip does not write review_approved_head_sha.
-            record_step(&db, &run.id, "review", "skipped", Some("agent skip"))
-                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            for phase in ["certify", "deliver"] {
-                record_step(&db, &run.id, phase, "skipped", Some("skip remaining"))
-                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            }
-            set_status(&db, &run.id, "completed", None)
-                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            finish_remove_worktree(&bare, &run, &wt);
+            respond_review_skip(&db, &run, &bare, &wt)?;
         }
         AgentResponse::Abort => {
             set_status(&db, &run.id, "cancelled", Some("agent abort"))
@@ -1861,6 +1841,146 @@ fn agent_respond_inner(
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?
         .ok_or_else(|| UsageOrFail::Fail("run disappeared".into()))?;
     status_from_run(&db, &run, home).map_err(UsageOrFail::Fail)
+}
+
+fn respond_review_approve(
+    home: &Path,
+    db: &Db,
+    run: &RunRow,
+    bare: &GitDir,
+    wt: &Path,
+    default_branch: &str,
+) -> std::result::Result<(), UsageOrFail> {
+    let head = porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    persist_review_bulk_or_legacy(
+        db,
+        run,
+        AuthorityKind::ReviewApproved,
+        &head,
+        RunEffects {
+            status: None,
+            error: None,
+            approved_head: Some(head.clone()),
+            steps: vec![StepEffect {
+                step: "review".into(),
+                status: "completed".into(),
+                error: Some("approved".into()),
+            }],
+        },
+        |db, run| {
+            db.set_review_approved_head_sha(&run.id, Some(&head))
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            record_step(db, &run.id, "review", "completed", Some("approved"))
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))
+        },
+    )?;
+    clear_uncertified_if_certified(db, wt, &run.repo_id, &run.branch, &head)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    let parked = finish_certify_and_deliver(home, db, bare, wt, &run.id, default_branch)?;
+    if !parked {
+        finish_remove_worktree(bare, run, wt);
+    }
+    Ok(())
+}
+
+fn respond_review_skip(
+    db: &Db,
+    run: &RunRow,
+    bare: &GitDir,
+    wt: &Path,
+) -> std::result::Result<(), UsageOrFail> {
+    let head = porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    // Skip does not write review_approved_head_sha.
+    persist_review_bulk_or_legacy(
+        db,
+        run,
+        AuthorityKind::ReviewSkipped,
+        &head,
+        RunEffects {
+            status: Some("completed".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![
+                StepEffect {
+                    step: "review".into(),
+                    status: "skipped".into(),
+                    error: Some("agent skip".into()),
+                },
+                StepEffect {
+                    step: "certify".into(),
+                    status: "skipped".into(),
+                    error: Some("skip remaining".into()),
+                },
+                StepEffect {
+                    step: "deliver".into(),
+                    status: "skipped".into(),
+                    error: Some("skip remaining".into()),
+                },
+            ],
+        },
+        |db, run| {
+            record_step(db, &run.id, "review", "skipped", Some("agent skip"))
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            for phase in ["certify", "deliver"] {
+                record_step(db, &run.id, phase, "skipped", Some("skip remaining"))
+                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            }
+            set_status(db, &run.id, "completed", None).map_err(|e| UsageOrFail::Fail(e.to_string()))
+        },
+    )?;
+    finish_remove_worktree(bare, run, wt);
+    Ok(())
+}
+
+/// Persist a bulk review authority event with run effects, or fall back for legacy parks.
+fn persist_review_bulk_or_legacy<F>(
+    db: &Db,
+    run: &RunRow,
+    kind: AuthorityKind,
+    live_head: &str,
+    effects: RunEffects,
+    legacy: F,
+) -> std::result::Result<(), UsageOrFail>
+where
+    F: FnOnce(&Db, &RunRow) -> std::result::Result<(), UsageOrFail>,
+{
+    let Some(round_id) =
+        round_for_decision(db, run).map_err(|e| UsageOrFail::Fail(e.to_string()))?
+    else {
+        return legacy(db, run);
+    };
+    let round = rounds::get_round(db, &round_id)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?
+        .ok_or_else(|| {
+            UsageOrFail::Fail(format!("decision round {} missing", round_id.as_str()))
+        })?;
+    let instances =
+        rounds::instances_for_round(db, &round_id).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    // Same ordinal as status_from_instance: instances_for_round order → f0..fN.
+    let members: Vec<(String, MemberRole)> = instances
+        .into_iter()
+        .map(|inst| (inst.id, MemberRole::Context))
+        .collect();
+    let expected_head = round.to_sha;
+    let plan = PersistAuthorityPlan {
+        run_id: run.id.clone(),
+        kind,
+        expected_round_id: Some(round_id),
+        expected_head: Some(expected_head),
+        live_head: Some(live_head.to_string()),
+        actor_kind: ActorKind::Operator,
+        authority_event_id: None,
+        head_changed: None,
+        identity_unavailable: false,
+        members,
+    };
+    match persist_authority_with_run_effects(db, plan, effects) {
+        Ok(_) => Ok(()),
+        Err(AuthorityError::Stale) => Err(UsageOrFail::Fail(
+            "authority persist rejected: applicable round or reviewed HEAD drifted".into(),
+        )),
+        Err(AuthorityError::Storage(e)) => Err(UsageOrFail::Fail(e.to_string())),
+    }
 }
 
 fn respond_compose(
