@@ -2207,18 +2207,19 @@ fn respond_fix(
 }
 
 /// Persist `fix_requested` with selected instance ULIDs as targets; commit before fixer spawn.
+/// Legacy parks (`round_for_decision` none, `findings_json`): skip persist, no event.
 fn persist_fix_requested(
     db: &Db,
     home: &Path,
     run: &RunRow,
     wt: &Path,
     selected: &[Finding],
-) -> std::result::Result<String, UsageOrFail> {
-    let round_id = round_for_decision(db, run)
-        .map_err(|e| UsageOrFail::Fail(e.to_string()))?
-        .ok_or_else(|| {
-            UsageOrFail::Fail("fix requires an applicable review round for authority".into())
-        })?;
+) -> std::result::Result<(), UsageOrFail> {
+    let Some(round_id) =
+        round_for_decision(db, run).map_err(|e| UsageOrFail::Fail(e.to_string()))?
+    else {
+        return Ok(());
+    };
     let round = rounds::get_round(db, &round_id)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?
         .ok_or_else(|| {
@@ -2270,7 +2271,7 @@ fn persist_fix_requested(
     std::fs::create_dir_all(&art).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     std::fs::write(art.join("last_fix_requested_event_id"), &event_id)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    Ok(event_id)
+    Ok(())
 }
 
 /// Returns `Ok(None)` when the fixer failed closed (run already marked failed).

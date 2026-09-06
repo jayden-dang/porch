@@ -12,7 +12,7 @@ use porch_gate::rounds::{
     ExecutionState, OpenRoundPlan, ProducerInvocation, RoundBindings, capture_context_element,
     context_applicability_digest, sha256_hex,
 };
-use porch_gate::{Db, kill_group, repo_id_for, run_worktree_dir};
+use porch_gate::{Db, kill_group, repo_id_for, round_for_decision, run_worktree_dir};
 use porch_git::{GitDir, init_bare, worktree_add_detach};
 use porch_review::REVIEW_BIN_ENV;
 use serde_json::Value;
@@ -1607,6 +1607,10 @@ fn legacy_parked_run_answers_actions_and_unreviewed_is_none() {
         .unwrap();
         strip_rounds_for_run(&db, &run.id);
 
+        assert!(
+            round_for_decision(&db, &run).unwrap().is_none(),
+            "legacy park must have no decision round"
+        );
         let out = Command::cargo_bin("porch")
             .unwrap()
             .current_dir(&s.work)
@@ -1622,8 +1626,12 @@ fn legacy_parked_run_answers_actions_and_unreviewed_is_none() {
             .unwrap();
         assert!(
             out.status.success(),
-            "fix failed: {}",
+            "legacy fix must proceed without a decision round: {}",
             String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(
+            rounds::events_for_run(&db, &run.id).unwrap().is_empty(),
+            "legacy fix must not write authority events"
         );
         kill_daemon(&s.home);
     }
