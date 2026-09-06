@@ -3,9 +3,11 @@ use std::collections::BTreeSet;
 use rusqlite::{Transaction, TransactionBehavior};
 use ulid::Ulid;
 
-use super::{AssuranceCompletion, ExecutionState, RoundId, now_secs};
+use super::{AssuranceCompletion, ExecutionState, RoundId};
 use crate::Result;
-use crate::db::Db;
+use crate::db::{self, Db};
+
+use db::now_secs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityKind {
@@ -279,13 +281,18 @@ pub fn persist_authority_with_run_effects(
     )
     .map_err(crate::Error::from)?;
 
-    for (instance_id, role) in &members {
-        tx.execute(
-            "INSERT INTO authority_event_members (event_id, finding_instance_id, role)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![event_id, instance_id, role.as_str()],
-        )
-        .map_err(crate::Error::from)?;
+    {
+        let mut insert_member = tx
+            .prepare(
+                "INSERT INTO authority_event_members (event_id, finding_instance_id, role)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(crate::Error::from)?;
+        for (instance_id, role) in &members {
+            insert_member
+                .execute(rusqlite::params![event_id, instance_id, role.as_str()])
+                .map_err(crate::Error::from)?;
+        }
     }
 
     apply_run_effects_tx(&tx, &run_id, effects)?;
@@ -412,7 +419,10 @@ fn guard_applicable(
     Ok(())
 }
 
-fn applicable_round_id_tx(tx: &Transaction<'_>, run_id: &str) -> Result<Option<(String, String)>> {
+pub(crate) fn applicable_round_id_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+) -> Result<Option<(String, String)>> {
     let head_sha: Option<String> =
         tx.query_row("SELECT head_sha FROM runs WHERE id = ?1", [run_id], |row| {
             row.get(0)
@@ -466,6 +476,40 @@ fn instances_for_round_tx(tx: &Transaction<'_>, round_id: &RoundId) -> Result<BT
 /// Panics if the database mutex is poisoned.
 pub fn events_for_run(db: &Db, run_id: &str) -> Result<Vec<AuthorityEventRecord>> {
     let conn = db.conn();
+    events_for_run_conn(&conn, run_id)
+}
+
+/// Latest `fix_requested` event id and reviewed head for a run, if any.
+///
+/// # Errors
+///
+/// Returns a storage error if the query fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn latest_fix_requested(db: &Db, run_id: &str) -> Result<Option<(String, Option<String>)>> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT id, reviewed_head FROM authority_events
+         WHERE run_id = ?1 AND kind = ?2
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![
+        run_id,
+        AuthorityKind::FixRequested.as_str()
+    ])?;
+    match rows.next()? {
+        Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn events_for_run_conn(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<Vec<AuthorityEventRecord>> {
     let mut stmt = conn.prepare(
         "SELECT id, run_id, kind, review_round_id, reviewed_head, actor_kind,
                 authority_event_id, head_changed, identity_unavailable, created_at
@@ -489,13 +533,13 @@ pub fn events_for_run(db: &Db, run_id: &str) -> Result<Vec<AuthorityEventRecord>
             head_changed: head_changed.map(|v| v != 0),
             identity_unavailable: row.get::<_, i64>(8)? != 0,
             created_at: row.get(9)?,
-            members: members_for_event(&conn, &id)?,
+            members: members_for_event(conn, &id)?,
         });
     }
     Ok(events)
 }
 
-fn members_for_event(
+pub(crate) fn members_for_event(
     conn: &rusqlite::Connection,
     event_id: &str,
 ) -> Result<Vec<AuthorityMemberRecord>> {

@@ -1039,7 +1039,7 @@ fn canonicalize_path(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
-fn now_secs() -> String {
+pub(crate) fn now_secs() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or_else(|_| "0".into(), |d| d.as_secs().to_string())

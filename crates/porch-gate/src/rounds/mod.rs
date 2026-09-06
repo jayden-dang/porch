@@ -12,8 +12,8 @@ pub use applicability::{
 };
 pub use authority::{
     ActorKind, AuthorityError, AuthorityEventRecord, AuthorityKind, AuthorityMemberRecord,
-    MemberRole, PersistAuthorityPlan, RunEffects, StepEffect, events_for_run, persist_authority,
-    persist_authority_with_run_effects,
+    MemberRole, PersistAuthorityPlan, RunEffects, StepEffect, events_for_run, latest_fix_requested,
+    persist_authority, persist_authority_with_run_effects,
 };
 pub use requirements::{
     RequirementRow, RequirementSpec, Resolution, Role, assurance_shape, assurance_shape_for_rows,
@@ -22,14 +22,16 @@ pub use requirements::{
 
 use std::cell::Cell;
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use crate::db::Db;
+use crate::db::{self, Db};
 use crate::{Error, Result};
+
+pub(crate) use authority::{applicable_round_id_tx, events_for_run_conn};
+use db::now_secs;
 
 pub(crate) use schema::migrate;
 
@@ -1435,10 +1437,4 @@ fn map_round(row: &rusqlite::Row<'_>) -> Result<RoundRecord> {
         finalized_at: row.get(14)?,
         review_duration_ms: row.get(15)?,
     })
-}
-
-pub(crate) fn now_secs() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or_else(|_| "0".into(), |d| d.as_secs().to_string())
 }

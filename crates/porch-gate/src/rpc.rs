@@ -400,7 +400,6 @@ pub struct RunSnapshot {
     pub assurance_record: AssuranceRecord,
     pub steps: Vec<StepSnapshot>,
     pub state_rev: u64,
-    /// Additive hint that `get_audit` can serve a derived document for this run.
     #[serde(default)]
     pub audit_available: bool,
 }

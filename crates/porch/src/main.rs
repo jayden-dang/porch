@@ -13,7 +13,7 @@ use porch_gate::{
 };
 use porch_run::{
     AgentCliResult, AgentResponse, AgentRunOpts, PipelineExecutor, agent_respond, agent_run,
-    agent_status, agent_sync, rerun,
+    agent_status, agent_sync, rerun, resolve_agent_run_id,
 };
 
 mod doctor;
@@ -337,25 +337,10 @@ fn run_agent_audit(home: &Path, run_id: Option<&str>, work_tree: &Path) -> Agent
     let resolved = if let Some(id) = run_id {
         id.to_string()
     } else {
-        let status = agent_status(home, None, work_tree);
-        if status.exit_code != 0 {
-            return status;
+        match resolve_agent_run_id(home, None, work_tree) {
+            Ok(id) => id,
+            Err(err) => return err,
         }
-        let Some(id) = serde_json::from_str::<serde_json::Value>(&status.json)
-            .ok()
-            .and_then(|v| {
-                v.get("run_id")
-                    .and_then(|id| id.as_str())
-                    .map(str::to_string)
-            })
-        else {
-            return AgentCliResult {
-                exit_code: 1,
-                json: serde_json::json!({"error": "status missing run_id"}).to_string(),
-                already_emitted: false,
-            };
-        };
-        id
     };
     match get_audit(home, &resolved) {
         Ok(doc) => AgentCliResult {

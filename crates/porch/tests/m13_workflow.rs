@@ -380,7 +380,6 @@ fn rebase_conflict_parks_with_phase_rebase() {
     let body = String::from_utf8_lossy(&status.stdout);
     assert!(body.contains("\"phase\": \"rebase\""), "{body}");
 
-    // approve/skip refused on rebase park
     let approve = Command::cargo_bin("porch")
         .unwrap()
         .current_dir(&h.work)

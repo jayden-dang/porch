@@ -1697,6 +1697,42 @@ pub struct AgentCliResult {
     pub already_emitted: bool,
 }
 
+/// Resolve a run id the same way status/respond do (explicit id or latest parked).
+///
+/// # Errors
+///
+/// Returns an [`AgentCliResult`] already shaped for CLI emission when the database
+/// cannot be opened, the run id is unknown, or no parked run exists for the repo.
+pub fn resolve_agent_run_id(
+    home: &Path,
+    run_id: Option<&str>,
+    work_tree: &Path,
+) -> std::result::Result<String, AgentCliResult> {
+    let db = match Db::open(&db_path(home)) {
+        Ok(db) => db,
+        Err(e) => {
+            return Err(AgentCliResult {
+                exit_code: 1,
+                json: serde_json::json!({"error": e.to_string()}).to_string(),
+                already_emitted: false,
+            });
+        }
+    };
+    match resolve_run(&db, run_id, work_tree) {
+        Ok(run) => Ok(run.id),
+        Err(UsageOrFail::Usage(msg)) => Err(AgentCliResult {
+            exit_code: 2,
+            json: serde_json::json!({"error": msg, "code": "usage"}).to_string(),
+            already_emitted: false,
+        }),
+        Err(UsageOrFail::Fail(msg)) => Err(AgentCliResult {
+            exit_code: 1,
+            json: serde_json::json!({"error": msg}).to_string(),
+            already_emitted: false,
+        }),
+    }
+}
+
 /// Build status JSON for a parked (or specified) run.
 #[must_use]
 pub fn agent_status(home: &Path, run_id: Option<&str>, work_tree: &Path) -> AgentCliResult {
@@ -1975,7 +2011,6 @@ fn respond_review_skip(
     wt: &Path,
 ) -> std::result::Result<(), UsageOrFail> {
     let head = porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    // Skip does not write review_approved_head_sha.
     persist_review_bulk_or_legacy(
         db,
         run,
@@ -2047,7 +2082,6 @@ where
         })?;
     let instances =
         rounds::instances_for_round(db, &round_id).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    // Same ordinal as status_from_instance: instances_for_round order → f0..fN.
     let members: Vec<(String, MemberRole)> = instances
         .into_iter()
         .map(|inst| (inst.id, MemberRole::Context))
@@ -2452,7 +2486,7 @@ fn finish_rereview(
     wt: &Path,
     yes: bool,
 ) -> std::result::Result<(), UsageOrFail> {
-    // Session-free rereview (never pass fixer session). Exactly one rereview per fix.
+    // Session-free rereview (never pass fixer session).
     match run_review_phase(db, home, &run.id, bare, wt, true) {
         Ok(ReviewPhase::Approved) => {
             // No blocking findings: complete without synthesizing a bulk approve event.
@@ -2517,13 +2551,8 @@ fn persist_standing_consent_approve(
         return Ok(());
     };
 
-    let events =
-        rounds::events_for_run(db, &run.id).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    // Cite the latest durable fix_requested for this run (authority log is SoT).
-    let Some(fix_event) = events
-        .iter()
-        .rev()
-        .find(|e| e.kind == AuthorityKind::FixRequested)
+    let Some((fix_id, fix_reviewed_head)) =
+        rounds::latest_fix_requested(db, &run.id).map_err(|e| UsageOrFail::Fail(e.to_string()))?
     else {
         tracing::warn!(
             run_id = %run.id,
@@ -2535,8 +2564,7 @@ fn persist_standing_consent_approve(
             "standing consent requires a prior fix_requested authority event".into(),
         ));
     };
-    let fix_id = fix_event.id.clone();
-    let fix_reviewed_head = fix_event.reviewed_head.as_deref().unwrap_or("");
+    let fix_reviewed_head = fix_reviewed_head.as_deref().unwrap_or("");
     let head_changed = live_head != fix_reviewed_head;
 
     let round = rounds::get_round(db, &round_id)

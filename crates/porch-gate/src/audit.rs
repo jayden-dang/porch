@@ -1,10 +1,15 @@
 //! Derived audit document over durable rounds, instances, and authority events.
 
+use std::collections::BTreeMap;
+
 use rusqlite::{Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::db::Db;
+use crate::rounds::{
+    AuthorityEventRecord, AuthorityMemberRecord, applicable_round_id_tx, events_for_run_conn,
+};
 
 /// Watermark pair binding one assembled audit document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,7 +25,7 @@ pub struct AuditAnomaly {
     pub detail: String,
 }
 
-/// Compatibility phase projection until ROAD-5.
+/// Phase projection inferred from `step_results`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditPhase {
     pub kind: String,
@@ -142,9 +147,9 @@ pub fn build_audit(db: &Db, run_id: &str) -> Result<AuditDocument> {
     let rounds = load_rounds(&tx, run_id)?;
     let instances = load_instances(&tx, run_id)?;
     let events = load_events(&tx, run_id)?;
-    let related_occurrences = load_related_occurrences(&tx, run_id)?;
+    let related_occurrences = related_occurrences_from(&instances);
     let steps = load_steps(&tx, run_id)?;
-    let has_applicable = applicable_round_exists(&tx, run_id)?;
+    let has_applicable = applicable_round_id_tx(&tx, run_id)?.is_some();
     let has_identity_unavailable = events.iter().any(|e| e.identity_unavailable);
     let has_legacy_findings = findings_json
         .as_deref()
@@ -249,102 +254,55 @@ fn load_instances(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditInstanc
 }
 
 fn load_events(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditEvent>> {
-    let mut stmt = tx.prepare(
-        "SELECT id, kind, review_round_id, reviewed_head, actor_kind,
-                authority_event_id, head_changed, identity_unavailable, created_at
-         FROM authority_events
-         WHERE run_id = ?1
-         ORDER BY created_at, id",
-    )?;
-    let mapped = stmt.query_map([run_id], |row| {
-        let head_changed: Option<i64> = row.get(6)?;
-        Ok(AuditEvent {
-            id: row.get(0)?,
-            kind: row.get(1)?,
-            review_round_id: row.get(2)?,
-            reviewed_head: row.get(3)?,
-            actor_kind: row.get(4)?,
-            authority_event_id: row.get(5)?,
-            head_changed: head_changed.map(|v| v != 0),
-            identity_unavailable: row.get::<_, i64>(7)? != 0,
-            created_at: row.get(8)?,
-            members: Vec::new(),
-        })
-    })?;
-    let mut events = Vec::new();
-    for row in mapped {
-        let mut event = row?;
-        event.members = load_members(tx, &event.id)?;
-        events.push(event);
-    }
-    Ok(events)
+    let records = events_for_run_conn(tx, run_id)?;
+    Ok(records.into_iter().map(audit_event_from_record).collect())
 }
 
-fn load_members(tx: &Transaction<'_>, event_id: &str) -> Result<Vec<AuditEventMember>> {
-    let mut stmt = tx.prepare(
-        "SELECT finding_instance_id, role FROM authority_event_members
-         WHERE event_id = ?1
-         ORDER BY finding_instance_id, role",
-    )?;
-    let mapped = stmt.query_map([event_id], |row| {
-        Ok(AuditEventMember {
-            finding_instance_id: row.get(0)?,
-            role: row.get(1)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in mapped {
-        out.push(row?);
+fn audit_event_from_record(record: AuthorityEventRecord) -> AuditEvent {
+    AuditEvent {
+        id: record.id,
+        kind: record.kind.as_str().to_string(),
+        review_round_id: record.review_round_id,
+        reviewed_head: record.reviewed_head,
+        actor_kind: record.actor_kind.as_str().to_string(),
+        authority_event_id: record.authority_event_id,
+        head_changed: record.head_changed,
+        identity_unavailable: record.identity_unavailable,
+        created_at: record.created_at,
+        members: record
+            .members
+            .into_iter()
+            .map(audit_member_from_record)
+            .collect(),
     }
-    Ok(out)
 }
 
-fn load_related_occurrences(
-    tx: &Transaction<'_>,
-    run_id: &str,
-) -> Result<Vec<RelatedOccurrenceGroup>> {
-    let mut stmt = tx.prepare(
-        "SELECT i.fingerprint, i.fingerprint_version, i.id
-         FROM finding_instances i
-         INNER JOIN review_rounds r ON r.id = i.round_id
-         WHERE r.run_id = ?1
-           AND (i.fingerprint, i.fingerprint_version) IN (
-             SELECT i2.fingerprint, i2.fingerprint_version
-             FROM finding_instances i2
-             INNER JOIN review_rounds r2 ON r2.id = i2.round_id
-             WHERE r2.run_id = ?1
-             GROUP BY i2.fingerprint, i2.fingerprint_version
-             HAVING COUNT(*) >= 2
-           )
-         ORDER BY i.fingerprint, i.fingerprint_version, r.ordinal, i.id",
-    )?;
-    let mapped = stmt.query_map([run_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-
-    let mut groups: Vec<RelatedOccurrenceGroup> = Vec::new();
-    for row in mapped {
-        let (fingerprint, fingerprint_version, instance_id) = row?;
-        match groups.last_mut() {
-            Some(g)
-                if g.fingerprint == fingerprint && g.fingerprint_version == fingerprint_version =>
-            {
-                g.instance_ids.push(instance_id);
-            }
-            _ => {
-                groups.push(RelatedOccurrenceGroup {
-                    fingerprint,
-                    fingerprint_version,
-                    instance_ids: vec![instance_id],
-                });
-            }
-        }
+fn audit_member_from_record(member: AuthorityMemberRecord) -> AuditEventMember {
+    AuditEventMember {
+        finding_instance_id: member.finding_instance_id,
+        role: member.role.as_str().to_string(),
     }
-    Ok(groups)
+}
+
+fn related_occurrences_from(instances: &[AuditInstance]) -> Vec<RelatedOccurrenceGroup> {
+    let mut groups: BTreeMap<(String, i64), Vec<String>> = BTreeMap::new();
+    for instance in instances {
+        groups
+            .entry((instance.fingerprint.clone(), instance.fingerprint_version))
+            .or_default()
+            .push(instance.id.clone());
+    }
+    groups
+        .into_iter()
+        .filter(|(_, ids)| ids.len() >= 2)
+        .map(
+            |((fingerprint, fingerprint_version), instance_ids)| RelatedOccurrenceGroup {
+                fingerprint,
+                fingerprint_version,
+                instance_ids,
+            },
+        )
+        .collect()
 }
 
 fn load_steps(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditStep>> {
@@ -365,31 +323,4 @@ fn load_steps(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditStep>> {
         out.push(row?);
     }
     Ok(out)
-}
-
-fn applicable_round_exists(tx: &Transaction<'_>, run_id: &str) -> Result<bool> {
-    let head_sha: Option<String> =
-        tx.query_row("SELECT head_sha FROM runs WHERE id = ?1", [run_id], |row| {
-            row.get(0)
-        })?;
-
-    let mut stmt = tx.prepare(
-        "SELECT to_sha FROM review_rounds
-         WHERE run_id = ?1
-           AND execution = 'finished'
-           AND assurance_completion = 'complete'
-           AND finalized_at IS NOT NULL
-         ORDER BY ordinal DESC",
-    )?;
-    let mut rows = stmt.query([run_id])?;
-    while let Some(row) = rows.next()? {
-        let to_sha: String = row.get(0)?;
-        if let Some(head) = head_sha.as_deref() {
-            if to_sha != head {
-                continue;
-            }
-        }
-        return Ok(true);
-    }
-    Ok(false)
 }

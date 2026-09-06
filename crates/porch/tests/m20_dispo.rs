@@ -593,7 +593,6 @@ fn head_moved_after_park_rejects_approve_without_event() {
     let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
     let wt = run.worktree_dir.clone().expect("parked worktree");
 
-    // Move live worktree HEAD after park so rev-parse diverges from reviewed HEAD.
     git(&wt, &["config", "user.email", "porch@example.com"]);
     git(&wt, &["config", "user.name", "Porch"]);
     std::fs::write(wt.join("drift.txt"), "moved\n").unwrap();
@@ -770,7 +769,6 @@ fn fix_persists_event_before_fixer_and_drift_skips_spawn() {
             .all(|m| m.role == MemberRole::Target)
     );
 
-    // Fresh park for drift: move worktree HEAD after park, then fix must fail closed.
     let (_tmp2, work2, home2, _origin2, fake2) = setup_with_origin_and_fake("blocking");
     commit_change(&work2, "bug.txt", "boom\n");
     push_with_env(&work2, &home2, "feat-dispo-fix-drift", &fake2, "blocking");
