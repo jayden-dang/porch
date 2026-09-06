@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+use crate::audit::{AuditDocument, build_audit};
 use crate::db::{Db, RunRow, StepResultRow};
 use crate::events::{Event, EventHub};
 use crate::home::socket_path;
@@ -399,6 +400,9 @@ pub struct RunSnapshot {
     pub assurance_record: AssuranceRecord,
     pub steps: Vec<StepSnapshot>,
     pub state_rev: u64,
+    /// Additive hint that `get_audit` can serve a derived document for this run.
+    #[serde(default)]
+    pub audit_available: bool,
 }
 
 /// One `step_results` row in a snapshot.
@@ -468,6 +472,7 @@ pub fn build_run_snapshot(
             })
             .collect(),
         state_rev,
+        audit_available: true,
     })
 }
 
@@ -573,6 +578,32 @@ pub fn get_run(home: &Path, run_id: &str) -> Result<RunSnapshot> {
     serde_json::from_value(resp.result).map_err(|e| crate::Error::Other(e.to_string()))
 }
 
+/// Fetch the derived audit document via daemon RPC.
+///
+/// # Errors
+///
+/// Returns an error if the socket cannot be reached, the run is missing, or
+/// the response is invalid.
+pub fn get_audit(home: &Path, run_id: &str) -> Result<AuditDocument> {
+    let resp = rpc_call(
+        home,
+        "get_audit",
+        Some(serde_json::json!({"run_id": run_id})),
+    )?;
+    if resp
+        .result
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .is_none()
+    {
+        if let Some(err) = resp.result.get("error").and_then(|v| v.as_str()) {
+            return Err(crate::Error::Other(err.into()));
+        }
+        return Err(crate::Error::Other("get_audit: invalid response".into()));
+    }
+    serde_json::from_value(resp.result).map_err(|e| crate::Error::Other(e.to_string()))
+}
+
 /// Open a subscribe stream. Calls `on_event` for each NDJSON event until the
 /// callback returns `false` or the peer hangs up.
 ///
@@ -658,6 +689,15 @@ pub(crate) fn get_run_result(db: &Db, hub: &EventHub, run_id: &str) -> Result<se
     let steps = db.step_results_for_run(run_id)?;
     let snap = build_run_snapshot(db, &run, &steps, hub.state_rev())?;
     serde_json::to_value(snap).map_err(|e| crate::Error::Other(e.to_string()))
+}
+
+/// Server-side: build `get_audit` result from DB.
+pub(crate) fn get_audit_result(db: &Db, run_id: &str) -> Result<serde_json::Value> {
+    if db.run_by_id(run_id)?.is_none() {
+        return Ok(serde_json::json!({"error": format!("unknown run {run_id}")}));
+    }
+    let doc = build_audit(db, run_id)?;
+    serde_json::to_value(doc).map_err(|e| crate::Error::Other(e.to_string()))
 }
 
 /// Fetch a capped file snippet / diff for one finding via daemon RPC.

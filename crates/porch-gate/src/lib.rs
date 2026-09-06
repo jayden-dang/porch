@@ -2,6 +2,7 @@
 //! Pipeline execution lives in `porch-run` (injected via [`RunExecutor`]).
 
 mod admit;
+mod audit;
 mod daemon;
 mod db;
 mod eject;
@@ -19,6 +20,10 @@ mod service;
 mod skill;
 
 pub use admit::admit_push;
+pub use audit::{
+    AuditAnomaly, AuditDocument, AuditEvent, AuditEventMember, AuditInstance, AuditPhase,
+    AuditRound, AuditStep, AuditWatermark, RelatedOccurrenceGroup, build_audit,
+};
 pub use daemon::{ensure_daemon, run_daemon, wait_for_health};
 pub use db::{Db, RepoRow, RunRow, StepResultRow, UncertifiedPipelineRange};
 pub use eject::{EjectOptions, EjectResult, eject};
@@ -40,7 +45,7 @@ pub use rpc::start_run as rpc_start_run;
 pub use rpc::{
     AssuranceRecord, AuditIdentity, FINDING_HUNK_MAX_BYTES, LegacyFindingDto, RunSnapshot,
     StatusFindingDto, StepSnapshot, UnavailableAudit, clear_rounds_for_run, compact_run_row,
-    get_finding_hunk, get_run, health_check, list_runs, operator_failure_report,
+    get_audit, get_finding_hunk, get_run, health_check, list_runs, operator_failure_report,
     resolve_run_assurance, round_for_decision, subscribe_events,
 };
 pub use service::{

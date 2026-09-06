@@ -8,7 +8,10 @@ use assert_cmd::Command;
 use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
 use porch_gate::rounds::{self, ActorKind, AuthorityKind, MemberRole};
-use porch_gate::{Db, clear_rounds_for_run, kill_group, repo_id_for, round_for_decision};
+use porch_gate::{
+    Db, build_audit, clear_rounds_for_run, get_audit, get_run, kill_group, repo_id_for,
+    round_for_decision,
+};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
 use rusqlite::Connection;
@@ -1326,6 +1329,248 @@ fn legacy_abort_records_identity_unavailable_without_display_members() {
             .iter()
             .all(|m| m.finding_instance_id != "f0"),
         "display f0 must never appear as a member id"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn audit_snapshot_includes_events_instances_and_related_occurrences() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-audit-related", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    let first_round = round_for_decision(&db, &run)
+        .unwrap()
+        .expect("first decision round");
+    let first_instances = rounds::instances_for_round(&db, &first_round).unwrap();
+    assert_eq!(first_instances.len(), 1);
+    let first_id = first_instances[0].id.clone();
+    let first_fp = first_instances[0].fingerprint.clone();
+    let first_fp_ver = first_instances[0].fingerprint_version;
+
+    let out = agent_fix(&work, &home, &fake, &run.id, &[]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    let second_round = round_for_decision(&db, &run)
+        .unwrap()
+        .expect("post-fix decision round");
+    let second_instances = rounds::instances_for_round(&db, &second_round).unwrap();
+    assert_eq!(second_instances.len(), 1);
+    let second_id = second_instances[0].id.clone();
+    assert_ne!(first_id, second_id);
+    assert_eq!(
+        second_instances[0].fingerprint, first_fp,
+        "noop rereview must reuse fingerprint for related_occurrences"
+    );
+    assert_eq!(second_instances[0].fingerprint_version, first_fp_ver);
+
+    let doc = build_audit(&db, &run.id).unwrap();
+    assert_eq!(doc.schema_version, 1);
+    assert_eq!(doc.run_id, run.id);
+    assert!(
+        doc.rounds.len() >= 2,
+        "audit must list both rounds; got {}",
+        doc.rounds.len()
+    );
+    assert!(
+        doc.instances.iter().any(|i| i.id == first_id),
+        "first instance missing from audit"
+    );
+    assert!(
+        doc.instances.iter().any(|i| i.id == second_id),
+        "second instance missing from audit"
+    );
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(
+        doc.events
+            .iter()
+            .any(|e| e.id == events[0].id && e.kind == "fix_requested"),
+        "committed fix_requested must appear in audit events: {:?}",
+        doc.events
+    );
+    assert!(
+        !doc.related_occurrences.is_empty(),
+        "matching fingerprints across rounds must form a related group"
+    );
+    let group = doc
+        .related_occurrences
+        .iter()
+        .find(|g| g.fingerprint == first_fp && g.fingerprint_version == first_fp_ver)
+        .expect("related group for shared fingerprint");
+    assert_eq!(
+        group.instance_ids,
+        vec![first_id.clone(), second_id.clone()],
+        "related_occurrences ordered by round ordinal then instance id"
+    );
+    assert!(
+        !serde_json::to_value(&doc)
+            .unwrap()
+            .to_string()
+            .contains("lineage"),
+        "audit must not emit lineage edges"
+    );
+
+    let rpc_doc = get_audit(&home, &run.id).unwrap();
+    assert_eq!(rpc_doc.run_id, doc.run_id);
+    assert_eq!(rpc_doc.watermark.audit_rev, doc.watermark.audit_rev);
+    assert_eq!(rpc_doc.related_occurrences, doc.related_occurrences);
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn parked_audit_is_as_of_with_audit_rev_watermark_and_inferred_phase() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-audit-asof", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let snap = get_run(&home, &run.id).unwrap();
+    let doc = get_audit(&home, &run.id).unwrap();
+    assert_eq!(doc.completeness, "as_of");
+    assert_eq!(doc.run_status, "parked");
+    let raw = serde_json::to_value(&doc).unwrap();
+    assert!(
+        raw["watermark"].get("state_rev").is_none(),
+        "watermark must not carry EventHub state_rev"
+    );
+    assert_ne!(
+        raw["watermark"]["audit_rev"],
+        serde_json::json!(snap.state_rev),
+        "audit watermark key is audit_rev, not state_rev={}",
+        snap.state_rev
+    );
+    let conn = Connection::open(home.join("state.sqlite")).unwrap();
+    let audit_rev: i64 = conn
+        .query_row(
+            "SELECT audit_rev FROM runs WHERE id = ?1",
+            [&run.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let history_rev: i64 = conn
+        .query_row(
+            "SELECT review_history_revision FROM runs WHERE id = ?1",
+            [&run.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(doc.watermark.audit_rev, audit_rev);
+    assert_eq!(doc.watermark.review_history_revision, history_rev);
+    assert_eq!(doc.phase.kind, "step_results_inferred");
+    assert!(
+        !doc.phase.steps.is_empty(),
+        "inferred phase must copy durable step_results"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn inconsistent_parked_audit_sets_anomaly_but_still_succeeds() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-audit-anomaly", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    clear_rounds_for_run(&db, &run.id).unwrap();
+    db.set_findings_json(&run.id, None).unwrap();
+    assert!(
+        round_for_decision(&db, &db.run_by_id(&run.id).unwrap().unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert!(rounds::events_for_run(&db, &run.id).unwrap().is_empty());
+
+    let doc = get_audit(&home, &run.id).unwrap();
+    assert_eq!(doc.completeness, "as_of");
+    assert_eq!(doc.run_status, "parked");
+    let anomaly = doc.anomaly.expect("inconsistent parked must set anomaly");
+    assert!(!anomaly.code.is_empty());
+    assert!(!anomaly.detail.is_empty());
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn get_run_stays_compact_with_display_handles_and_may_advertise_audit() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-audit-get-run", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let snap = get_run(&home, &run.id).unwrap();
+    let findings = snap.findings.as_array().expect("findings array");
+    assert!(!findings.is_empty());
+    assert_eq!(findings[0]["id"], "f0");
+    assert!(findings[0].get("fingerprint").is_none());
+    assert!(findings[0].get("criterion_id").is_none());
+    assert!(
+        snap.audit_available,
+        "compact snapshot may advertise audit_available"
+    );
+    let raw = serde_json::to_value(&snap).unwrap();
+    assert!(raw.get("related_occurrences").is_none());
+    assert!(raw.get("events").is_none());
+    assert!(raw.get("schema_version").is_none());
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn audit_document_exposes_head_changed_false_on_porch_approve() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(
+        &work,
+        &home,
+        "feat-dispo-audit-head-changed",
+        &fake,
+        "blocking",
+    );
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let out = agent_fix(&work, &home, &fake, &run.id, &["--yes"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let doc = get_audit(&home, &run.id).unwrap();
+    let approve = doc
+        .events
+        .iter()
+        .find(|e| e.kind == "review_approved" && e.actor_kind == "porch")
+        .expect("porch review_approved in audit");
+    assert_eq!(
+        approve.head_changed,
+        Some(false),
+        "audit must expose stored head_changed=false"
     );
 
     kill_daemon(&home);

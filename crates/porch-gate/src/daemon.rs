@@ -152,6 +152,18 @@ fn handle_connection(
                 Err(e) => serde_json::json!({"error": e.to_string()}),
             }
         }
+        "get_audit" => {
+            let run_id = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("run_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| crate::Error::Other("get_audit requires params.run_id".into()))?;
+            match rpc::get_audit_result(db, run_id) {
+                Ok(v) => v,
+                Err(e) => serde_json::json!({"error": e.to_string()}),
+            }
+        }
         "get_finding_hunk" => {
             let run_id = req
                 .params

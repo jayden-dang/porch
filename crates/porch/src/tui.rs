@@ -836,6 +836,7 @@ mod tests {
                 },
             ],
             state_rev: 1,
+            audit_available: true,
         }
     }
 
