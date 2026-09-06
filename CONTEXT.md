@@ -66,6 +66,216 @@ The logical reconciliation key for recognizing the same issue across
 and may recur on multiple instances over time.
 _Avoid_: "hash", "finding id"
 
+**Disposition history**:
+The porch-owned, append-only event log of authority actions about a **Finding
+instance**, keyed by `finding_instance_id`. The log is the source of truth; any
+current-state view is a derived projection and must not become a second
+authority. Finalized instance rows are never updated to carry operator
+disposition, and producer `action` is never overwritten. After a later
+**Review round**, prior occurrences remain readable through their own events.
+Distinct from a producer **Finding** `action` and from coverage-file `authority`
+on `round_coverage`. Never keyed by display `fN`.
+_Avoid_: "comment", "note", "action" when the operator or porch decision is meant.
+
+**Phase-event history**:
+The porch-owned append-only `phase_events` log — source of truth for a
+**Run**'s phase lifecycle. Canonical top-level phases are exactly `intent`,
+`rebase`, `review`, `certify`, and `deliver`. Re-entry into a canonical phase
+mints a new top-level **Phase attempt** with an incremented ordinal.
+`started` persists before work; a separate terminal is appended; the start
+row is never updated. Crash recovery appends interrupted/cancelled evidence.
+The log reconstructs the timeline without the live stream; subscribe events
+are notifications (a gap refreshes durable state). `step_results` and
+`steps[]` are compatibility projections, rebuildable from `phase_events`,
+never an independent authority. The timeline is exposed through the **Audit
+read path**.
+_Avoid_: "activity", "log line", "steps[]" as the audit record.
+
+**Phase attempt**:
+One numbered execution of a canonical top-level phase on a **Run**. `parked`
+is a nonterminal suspension; a later operator response either resumes the
+attempt or produces its terminal outcome. Nested operations use
+`parent_attempt_id` (execution containment) only. Causal links between
+top-level attempts use `caused_by_attempt_id` and never replace chronological
+`phase_events` order. A **Nested operation** must not start after its parent
+attempt has a terminal event. Rereview, recertification, and redelivery are
+new top-level attempts, not children of `deliver_repair` or a prior `deliver`
+attempt. Compatibility may still show `phase=compose`; the canonical audit
+path is `deliver/<attempt>/compose/<operation-attempt>`.
+_Avoid_: treating compose, fixer, or `deliver_repair` as a sixth top-level phase.
+
+**Nested operation**:
+Typed work contained by an active (nonterminal) **Phase attempt**: `compose`
+and the mechanical work of `deliver_repair` belong to the owning `deliver`
+attempt; fixer execution belongs to the suspended `review` attempt.
+`AllowlistFailed` and `MergeConflicting` are nonterminal repairable-failure
+evidence on the active `deliver` attempt, not its terminal. Nested
+`deliver_repair` ordinals are allocated only while budget remains; `started`
+persists before work; the budget counts nested operations **started**.
+Succession is taken only from explicit post-success HEAD before/after on the
+nested terminal — never from repair kind or crash inference. HEAD-changing
+success: atomic handoff that revokes old-HEAD approval, binds the new HEAD,
+terminals the old `deliver` attempt, and starts the next `review` attempt
+(`caused_by` that deliver). Unchanged-HEAD success: atomic handoff to the
+next `deliver` attempt only — no rereview, no recertify, never reuse the
+same deliver ordinal. Repair fail/interrupt: terminal nested op, owning
+deliver, and run — no successor. Budget already exhausted: no nested op;
+terminal current deliver and run with an explicit budget-exhausted cause.
+_Avoid_: "phase" for these nodes; "step string" as their identity; counting
+budget by deliver-attempt ordinals.
+
+**Audit read path**:
+The operator-facing reconstruction that joins **Disposition history** and
+**Phase-event history** for one assurance outcome. Completing only one domain
+does not satisfy **GOAL-2**. Cross-round related findings are **not** stored
+as instance-lineage edges. The read path groups already-finalized
+fingerprints with the exact key `(run_id, fingerprint_version, fingerprint)`
+into an equivalence set (`related_occurrences` or equivalent) — never a
+predecessor/successor chain, never a rerun of reconciliation, never a
+candidate-key or similarity join. Occurrences stay independent (round,
+provenance, finding data, disposition events, bulk memberships); nothing is
+folded or transferred. Grouping does not span runs or fingerprint versions,
+does not participate in current-round authorization or forward eligibility,
+and is omitted when conservative reconciliation minted a new fingerprint.
+`caused_by_attempt_id` remains phase-attempt causality only and never implies
+a finding-level causal edge. Deterministic order: review-round ordinal, then
+durable instance id.
+_Avoid_: "status", "get_run" as the audit join; "successor finding"; treating
+a related-occurrence group as one merged finding.
+
+**Audit document**:
+The one dedicated typed read model produced by a shared server-side **Audit
+read path** over durable round, finding-instance, disposition-event, and
+`phase_events` sources. It is derived, not a new source of truth. Each
+document is built from one consistent SQLite read snapshot (or equivalent)
+and carries a revision/watermark. One builder serves every surface: daemon
+RPC + `porch agent` JSON, human CLI pretty-print, additive TUI audit/history
+view. Consumers must not duplicate join or interpretation rules.
+`get_run`, `porch agent status`, `findings[]`, and compatibility `steps[]`
+stay compact live state — they may advertise audit availability, never the
+full audit contract. The TUI loads the document lazily when that view opens,
+not on every live `State` / `StreamGap`. Subscribe events remain
+notifications only. Ordering in the document is deterministic. The same
+schema is available for every existing run (`running`, `parked`, terminal).
+Each response uses a durable database-backed watermark/revision — not
+in-memory `EventHub.state_rev` — and includes every durable fact committed
+at that snapshot (rounds, findings, disposition/authority events, active /
+suspended / terminal attempts, nested ops, causal links). Nonterminal
+documents are labeled partial/as-of that watermark and observed run status;
+they must not expose a final assurance outcome before one exists. Active and
+parked nodes appear when their events are durable. A lifecycle/phase-tree
+inconsistency is an explicit anomaly or unknown, not a silently complete
+document. Partial audit is a successful RPC/agent response. Later reads may
+show later watermarks; consumers must not cache a partial document as final.
+If pagination exists, every page/cursor of one assembled document shares that
+watermark.
+_Avoid_: stuffing the log into `status`; fetching audit on every live event;
+using `state_rev` as the audit watermark.
+
+**Bulk operator response**:
+A review-level `approve` or `skip` recorded as one event, not as synthesized
+per-finding dispositions. It freezes every `finding_instance_id` from the
+applicable finalized **Review round** at response time. Membership means
+included in that decision context, not individually disposed. `approve`
+authorizes continuation, binds that `review_round_id` and the approved HEAD,
+and keeps the certify → deliver path. `skip` records termination without
+approval, does not record an approved HEAD, and does not authorize
+continuation. A later **Finding instance** with the same **Fingerprint** is
+not covered. The write fails closed if the applicable round or reviewed HEAD
+changed before persistence.
+_Avoid_: "accepted findings", "skipped findings" — those names imply
+per-finding disposition.
+
+**Rebase abort**:
+Operator `respond abort` while the canonical `rebase` **Phase attempt** is
+parked. One atomic transaction: terminal that rebase attempt, then
+`parked → cancelled` with an explicit operator rebase-abort cause. Transaction
+failure rolls back completely and leaves the run parked with its worktree.
+After commit: publish live notifications, run the existing recovery-pin
+check, then force-remove the disposable worktree. Do not invoke
+`git rebase --abort` on this path — the initial and retry parks already abort
+Git successfully before parking. Post-commit pin or worktree failure does not
+rewrite the cancelled/terminal outcome; residue is left for recovery. No
+finding-instance or **Disposition history** events (`rebase0` is fixer input,
+not durable identity). No successor **Phase attempt**. The event cause is
+distinct from the internal `git rebase --abort` command.
+_Avoid_: confusing operator abort with Git `rebase --abort`; synthesizing
+findings from `rebase0`.
+
+**Compose abort**:
+Operator `abort` while nested `compose` is parked. One atomic transaction, in
+order: terminal the nested compose operation; terminal the owning `deliver`
+attempt, causally linked to that compose abort; transition the **Run**
+`parked → cancelled` with an explicit compose-abort cause. Any write failure
+rolls back the whole transaction, leaves the run parked, and keeps the
+worktree. After commit: publish live notifications, then clean the worktree.
+Post-commit cleanup or process death does not rewrite the terminal audit
+outcome; startup recovery removes local residue. The GitHub PR stays open —
+no `gh` close/draft/edit/mutate on abort. Persist the known PR reference and
+record intended external disposition `left_open`; if no reference exists,
+record that honestly. No **Disposition history** or finding events. Distinct
+from compose `skip`, which accepts the scaffold and lets `deliver` complete.
+Compatibility projections must show both compose cancellation and owning
+deliver termination; the durable audit tree remains after live `phase=compose`
+ends.
+_Avoid_: treating compose abort as review abort; closing the PR; synthesizing
+a PR reference.
+
+**Review aborted**:
+A review-level `abort` on a modern parked review, recorded as one bulk
+`review_aborted` operator-response event binding the applicable
+`review_round_id`, the reviewed HEAD, and the frozen set of every
+`finding_instance_id` in that round. Membership is decision context only — not
+per-finding `rejected` or `aborted`. Grants no approval and no continuation; the
+**Run** becomes `cancelled`. Distinct from review `skip` and from system
+cancellation such as `superseded_by_new_push`. The event and the
+`parked → cancelled` transition persist atomically; worktree cleanup runs only
+after that commit. Legacy parks without round identity may abort: record at
+run/review level with audit identity explicitly unavailable; never treat `fN`
+as instance ids or synthesize membership.
+_Avoid_: "skip", "superseded" — those are different causes and terminals.
+
+**Fix requested**:
+A review-level `fix` recorded as one append-only `fix_requested` event.
+Target relations are durable `finding_instance_id`s resolved at response time
+from explicit `--findings` or the default all-blocking selection — never
+display `fN`. A target means requested for this fixer attempt, not fixed,
+resolved, accepted, or otherwise terminally disposed. An empty target set is
+rejected. `fix_requested` and the nested fixer `started` event persist before
+the fixer is spawned. The parked **Phase attempt** stays nonterminal for the
+whole nested fixer operation. Fixer terminal and parent review terminal are
+separate events. A fixer outcome that permits rereview uses an atomic **Phase
+handoff** into a new review attempt; at most one successor review attempt is
+created from a given review attempt. Fixer failure or interruption terminals
+the nested op and the parent review, fails or interrupts the run, and creates
+no successor. Fixer `Ok` with `HEAD_after == HEAD_before` is a successful nested
+outcome, not failure or approval; the fixer terminal carries durable
+no-change evidence (bound HEAD and `head_changed=false` or equivalent).
+The same atomic **Phase handoff** still runs; a fresh **Review round**
+executes required producers on that unchanged HEAD — no short-circuit, no
+reuse of prior producer results because the SHA matches. New identities for
+round, invocations, attempt, and finding occurrences; fingerprint
+reconciliation only, no transfer of disposition, target membership, or
+authority. Exactly one rereview for that `fix` response — no automatic
+no-op loop. If the fresh round parks and `--yes` is exercised, the bulk
+`review_approved` binds the new round, unchanged HEAD, and new instance set,
+and the audit path shows that the fixer did not change HEAD. Changed HEAD
+after a crash is not evidence of fixer success.
+Rereview mints a new **Review round** only after the handoff commits; if the
+process dies after handoff but before the round opens, recovery terminals the
+already-started new review attempt as interrupted and does not synthesize a
+round. `--yes` remains bounded standing consent as already defined.
+_Avoid_: "fixed findings" — the target set is a request, not an outcome.
+
+**Phase handoff**:
+The atomic succession of one top-level **Phase attempt** by the next: append
+the old attempt's terminal, allocate the next ordinal, append `started` for
+the new attempt, and set `caused_by_attempt_id` to the old attempt. Old
+terminal and new start occupy consecutive deterministic sequence positions.
+Never two attempts of the same canonical phase nonterminal at once. The new
+attempt's `started` event is durable before that attempt's work begins.
+_Avoid_: overlapping attempts; inferring succession from HEAD movement.
+
 **Assurance protocol**:
 Porch's own end-to-end contract over a review: inventory, required coverage,
 normalization, reconciliation, authority, SHA binding, and the fail-closed
