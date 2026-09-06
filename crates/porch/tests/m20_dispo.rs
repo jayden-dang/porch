@@ -8,9 +8,10 @@ use assert_cmd::Command;
 use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
 use porch_gate::rounds::{self, ActorKind, AuthorityKind, MemberRole};
-use porch_gate::{Db, kill_group, repo_id_for, round_for_decision};
+use porch_gate::{Db, clear_rounds_for_run, kill_group, repo_id_for, round_for_decision};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
+use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -1073,6 +1074,258 @@ fn yes_after_noop_fix_records_porch_approve_citing_fix_event() {
             .iter()
             .all(|m| first_ids.contains(&m.finding_instance_id)),
         "prior fix_requested membership must remain on the old round"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn abort_records_bulk_context_event_and_cancels() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-abort", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let round_id = round_for_decision(&db, &run)
+        .unwrap()
+        .expect("decision round");
+    let round = rounds::get_round(&db, &round_id)
+        .unwrap()
+        .expect("round row");
+    let instances = rounds::instances_for_round(&db, &round_id).unwrap();
+    assert!(
+        !instances.is_empty(),
+        "parked blocking review must have instances"
+    );
+    let instance_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
+    let wt = run.worktree_dir.clone().expect("parked worktree");
+    assert!(wt.exists(), "worktree present before abort");
+
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .args(["agent", "respond", "abort", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "abort is cancelled → exit 1; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "cancelled");
+    assert!(v["review_approved_head_sha"].is_null());
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "cancelled");
+    assert_eq!(run.error.as_deref(), Some("agent abort"));
+    assert!(run.review_approved_head_sha.is_none());
+    assert!(
+        !wt.exists(),
+        "worktree cleaned only after abort commit succeeds"
+    );
+
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(events.len(), 1, "exactly one bulk abort event");
+    assert_eq!(events[0].kind, AuthorityKind::ReviewAborted);
+    assert_ne!(
+        events[0].kind,
+        AuthorityKind::ReviewSkipped,
+        "abort must stay distinct from skip"
+    );
+    assert_ne!(
+        run.error.as_deref(),
+        Some("superseded by new push"),
+        "operator abort must stay distinct from push supersession"
+    );
+    assert!(!events[0].identity_unavailable);
+    assert_eq!(
+        events[0].review_round_id.as_deref(),
+        Some(round_id.as_str())
+    );
+    assert_eq!(
+        events[0].reviewed_head.as_deref(),
+        Some(round.to_sha.as_str())
+    );
+    let mut member_ids: Vec<String> = events[0]
+        .members
+        .iter()
+        .map(|m| {
+            assert_eq!(m.role, MemberRole::Context);
+            m.finding_instance_id.clone()
+        })
+        .collect();
+    member_ids.sort();
+    let mut expected = instance_ids;
+    expected.sort();
+    assert_eq!(member_ids, expected);
+    assert!(
+        member_ids
+            .iter()
+            .all(|id| !(id.starts_with('f') && id[1..].chars().all(|c| c.is_ascii_digit()))),
+        "members must be instance ids, not display handles"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn abort_txn_failure_leaves_parked_worktree_then_cleanup_after_commit() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-abort-txn", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    let wt = run.worktree_dir.clone().expect("parked worktree");
+    assert!(wt.exists());
+
+    {
+        let conn = Connection::open(home.join("state.sqlite")).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TRIGGER poison_abort_effects BEFORE UPDATE ON runs
+            BEGIN
+                SELECT RAISE(ABORT, 'forced mid-txn write failure');
+            END;
+            ",
+        )
+        .unwrap();
+    }
+
+    let poisoned = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .args(["agent", "respond", "abort", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        poisoned.status.code(),
+        Some(1),
+        "poisoned abort must fail; stdout={} stderr={}",
+        String::from_utf8_lossy(&poisoned.stdout),
+        String::from_utf8_lossy(&poisoned.stderr)
+    );
+
+    let parked = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(parked.status, "parked");
+    assert!(
+        rounds::events_for_run(&db, &run.id).unwrap().is_empty(),
+        "rolled-back abort must leave no authority event"
+    );
+    assert!(
+        wt.exists(),
+        "worktree must remain when abort txn fails before commit"
+    );
+
+    {
+        let conn = Connection::open(home.join("state.sqlite")).unwrap();
+        conn.execute_batch("DROP TRIGGER IF EXISTS poison_abort_effects;")
+            .unwrap();
+    }
+
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .args(["agent", "respond", "abort", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "abort is cancelled → exit 1; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cancelled = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, AuthorityKind::ReviewAborted);
+    assert!(
+        !wt.exists(),
+        "worktree cleanup runs only after abort txn commits"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn legacy_abort_records_identity_unavailable_without_display_members() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-legacy-abort", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    let wt = run.worktree_dir.clone().expect("parked worktree");
+
+    db.set_findings_json(
+        &run.id,
+        Some(
+            r#"[{"id":"f0","path":"bug.txt","message":"legacy","severity":"warning","action":"ask-user","start_line":1,"end_line":1}]"#,
+        ),
+    )
+    .unwrap();
+    clear_rounds_for_run(&db, &run.id).unwrap();
+    assert!(
+        round_for_decision(&db, &db.run_by_id(&run.id).unwrap().unwrap())
+            .unwrap()
+            .is_none(),
+        "legacy park must have no decision round"
+    );
+
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .args(["agent", "respond", "abort", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "legacy abort is cancelled → exit 1; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "cancelled");
+    assert_eq!(run.error.as_deref(), Some("agent abort"));
+    assert!(run.review_approved_head_sha.is_none());
+    assert!(
+        !wt.exists(),
+        "legacy abort still cleans worktree after commit"
+    );
+
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(events.len(), 1, "legacy abort still records an event");
+    assert_eq!(events[0].kind, AuthorityKind::ReviewAborted);
+    assert!(events[0].identity_unavailable);
+    assert!(events[0].review_round_id.is_none());
+    assert!(events[0].reviewed_head.is_none());
+    assert!(
+        events[0].members.is_empty(),
+        "legacy abort must not synthesize members from display fN"
+    );
+    assert!(
+        events[0]
+            .members
+            .iter()
+            .all(|m| m.finding_instance_id != "f0"),
+        "display f0 must never appear as a member id"
     );
 
     kill_daemon(&home);

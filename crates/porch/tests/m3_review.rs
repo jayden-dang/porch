@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use porch_deliver::GH_BIN_ENV;
-use porch_gate::rounds::{self, Role};
+use porch_gate::rounds::{self, AuthorityKind, Role};
 use porch_gate::{Db, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
@@ -449,6 +449,9 @@ fn respond_abort_cancels() {
     let run = db.run_by_id(&run.id).unwrap().unwrap();
     assert_eq!(run.status, "cancelled");
     assert!(run.review_approved_head_sha.is_none());
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, AuthorityKind::ReviewAborted);
 
     kill_daemon(&home);
 }

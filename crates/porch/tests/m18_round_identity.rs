@@ -1518,6 +1518,12 @@ fn legacy_parked_run_answers_actions_and_unreviewed_is_none() {
             String::from_utf8_lossy(&abort.stdout)
         );
         assert_eq!(db.run_by_id(&run.id).unwrap().unwrap().status, "cancelled");
+        let events = rounds::events_for_run(&db, &run.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, rounds::AuthorityKind::ReviewAborted);
+        assert!(events[0].identity_unavailable);
+        assert!(events[0].review_round_id.is_none());
+        assert!(events[0].members.is_empty());
         kill_daemon(&s.home);
     }
 

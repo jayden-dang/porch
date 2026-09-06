@@ -1822,10 +1822,13 @@ fn agent_respond_inner(
         AgentResponse::Skip => {
             respond_review_skip(&db, &run, &bare, &wt)?;
         }
-        AgentResponse::Abort => {
+        AgentResponse::Abort if phase == "rebase" => {
             set_status(&db, &run.id, "cancelled", Some("agent abort"))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             finish_remove_worktree(&bare, &run, &wt);
+        }
+        AgentResponse::Abort => {
+            respond_review_abort(&db, &run, &bare, &wt)?;
         }
         AgentResponse::Fix { finding_ids, yes } => {
             if phase == "rebase" {
@@ -1880,6 +1883,76 @@ fn respond_review_approve(
     if !parked {
         finish_remove_worktree(bare, run, wt);
     }
+    Ok(())
+}
+
+fn respond_review_abort(
+    db: &Db,
+    run: &RunRow,
+    bare: &GitDir,
+    wt: &Path,
+) -> std::result::Result<(), UsageOrFail> {
+    let effects = RunEffects {
+        status: Some("cancelled".into()),
+        error: Some("agent abort".into()),
+        approved_head: None,
+        steps: vec![],
+    };
+    let plan = if let Some(round_id) =
+        round_for_decision(db, run).map_err(|e| UsageOrFail::Fail(e.to_string()))?
+    {
+        let round = rounds::get_round(db, &round_id)
+            .map_err(|e| UsageOrFail::Fail(e.to_string()))?
+            .ok_or_else(|| {
+                UsageOrFail::Fail(format!("decision round {} missing", round_id.as_str()))
+            })?;
+        let instances = rounds::instances_for_round(db, &round_id)
+            .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        let members: Vec<(String, MemberRole)> = instances
+            .into_iter()
+            .map(|inst| (inst.id, MemberRole::Context))
+            .collect();
+        let head =
+            porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        PersistAuthorityPlan {
+            run_id: run.id.clone(),
+            kind: AuthorityKind::ReviewAborted,
+            expected_round_id: Some(round_id),
+            expected_head: Some(round.to_sha),
+            live_head: Some(head),
+            actor_kind: ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: false,
+            members,
+        }
+    } else {
+        // Legacy findings_json park: abort still records, with identity unavailable.
+        PersistAuthorityPlan {
+            run_id: run.id.clone(),
+            kind: AuthorityKind::ReviewAborted,
+            expected_round_id: None,
+            expected_head: None,
+            live_head: None,
+            actor_kind: ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: true,
+            members: vec![],
+        }
+    };
+    match persist_authority_with_run_effects(db, plan, effects) {
+        Ok(_) => {}
+        Err(AuthorityError::Stale) => {
+            return Err(UsageOrFail::Fail(
+                "authority persist rejected: applicable round or reviewed HEAD drifted".into(),
+            ));
+        }
+        Err(AuthorityError::Storage(e)) => {
+            return Err(UsageOrFail::Fail(e.to_string()));
+        }
+    }
+    finish_remove_worktree(bare, run, wt);
     Ok(())
 }
 
