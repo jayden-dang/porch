@@ -2348,27 +2348,28 @@ fn finish_rereview(
     wt: &Path,
     yes: bool,
 ) -> std::result::Result<(), UsageOrFail> {
-    // Session-free rereview (never pass fixer session).
+    // Session-free rereview (never pass fixer session). Exactly one rereview per fix.
     match run_review_phase(db, home, &run.id, bare, wt, true) {
         Ok(ReviewPhase::Approved) => {
+            // No blocking findings: complete without synthesizing a bulk approve event.
             complete_after_review(db, home, bare, wt, run, None)?;
         }
         Ok(ReviewPhase::Parked) => {
             if yes {
                 let head = porch_git::rev_parse_c(wt, "HEAD")
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-                db.set_review_approved_head_sha(&run.id, Some(&head))
-                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+                persist_standing_consent_approve(db, home, run, &head)?;
                 clear_uncertified_if_certified(db, wt, &run.repo_id, &run.branch, &head)
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-                complete_after_review(
-                    db,
-                    home,
-                    bare,
-                    wt,
-                    run,
-                    Some("approved remaining after --yes"),
-                )?;
+                let repo = db
+                    .repo_by_id(&run.repo_id)
+                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?
+                    .ok_or_else(|| UsageOrFail::Fail(format!("unknown repo {}", run.repo_id)))?;
+                let parked =
+                    finish_certify_and_deliver(home, db, bare, wt, &run.id, &repo.default_branch)?;
+                if !parked {
+                    finish_remove_worktree(bare, run, wt);
+                }
             } else {
                 record_step(db, &run.id, "review", "parked", Some("fix_review"))
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
@@ -2382,6 +2383,101 @@ fn finish_rereview(
         }
     }
     Ok(())
+}
+
+/// `--yes` standing consent: porch `review_approved` citing `fix_requested`, or legacy column write.
+fn persist_standing_consent_approve(
+    db: &Db,
+    home: &Path,
+    run: &RunRow,
+    live_head: &str,
+) -> std::result::Result<(), UsageOrFail> {
+    let Some(round_id) =
+        round_for_decision(db, run).map_err(|e| UsageOrFail::Fail(e.to_string()))?
+    else {
+        db.set_review_approved_head_sha(&run.id, Some(live_head))
+            .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        record_step(
+            db,
+            &run.id,
+            "review",
+            "completed",
+            Some("approved remaining after --yes"),
+        )
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        return Ok(());
+    };
+
+    let fix_id = std::fs::read_to_string(
+        run_artifact_dir(home, &run.id).join("last_fix_requested_event_id"),
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+    let Some(fix_id) = fix_id else {
+        db.set_review_approved_head_sha(&run.id, Some(live_head))
+            .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        record_step(
+            db,
+            &run.id,
+            "review",
+            "completed",
+            Some("approved remaining after --yes"),
+        )
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        return Ok(());
+    };
+
+    let events =
+        rounds::events_for_run(db, &run.id).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    let fix_event = events.iter().find(|e| e.id == fix_id).ok_or_else(|| {
+        UsageOrFail::Fail(format!(
+            "fix_requested event {fix_id} missing for standing consent"
+        ))
+    })?;
+    let fix_reviewed_head = fix_event.reviewed_head.as_deref().unwrap_or("");
+    let head_changed = live_head != fix_reviewed_head;
+
+    let round = rounds::get_round(db, &round_id)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?
+        .ok_or_else(|| {
+            UsageOrFail::Fail(format!("decision round {} missing", round_id.as_str()))
+        })?;
+    let instances =
+        rounds::instances_for_round(db, &round_id).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    let members: Vec<(String, MemberRole)> = instances
+        .into_iter()
+        .map(|inst| (inst.id, MemberRole::Context))
+        .collect();
+    let plan = PersistAuthorityPlan {
+        run_id: run.id.clone(),
+        kind: AuthorityKind::ReviewApproved,
+        expected_round_id: Some(round_id),
+        expected_head: Some(round.to_sha),
+        live_head: Some(live_head.to_string()),
+        actor_kind: ActorKind::Porch,
+        authority_event_id: Some(fix_id),
+        head_changed: Some(head_changed),
+        identity_unavailable: false,
+        members,
+    };
+    let effects = RunEffects {
+        status: None,
+        error: None,
+        approved_head: Some(live_head.to_string()),
+        steps: vec![StepEffect {
+            step: "review".into(),
+            status: "completed".into(),
+            error: Some("approved remaining after --yes".into()),
+        }],
+    };
+    match persist_authority_with_run_effects(db, plan, effects) {
+        Ok(_) => Ok(()),
+        Err(AuthorityError::Stale) => Err(UsageOrFail::Fail(
+            "authority persist rejected: applicable round or reviewed HEAD drifted".into(),
+        )),
+        Err(AuthorityError::Storage(e)) => Err(UsageOrFail::Fail(e.to_string())),
+    }
 }
 
 fn complete_after_review(

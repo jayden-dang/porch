@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use assert_cmd::Command;
 use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
-use porch_gate::rounds::{self, AuthorityKind, MemberRole};
+use porch_gate::rounds::{self, ActorKind, AuthorityKind, MemberRole};
 use porch_gate::{Db, kill_group, repo_id_for, round_for_decision};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
@@ -132,6 +132,18 @@ for f in $FILES; do
   COV_JSON="$COV_JSON{\"path\":\"$f\",\"status\":\"pass\"}"
 done
 COV_JSON="$COV_JSON]"
+# Clean if any changed file contains the substring "fixed".
+HAS_FIXED=0
+for f in $FILES; do
+  if [ -f "$f" ] && grep -q fixed "$f" 2>/dev/null; then
+    HAS_FIXED=1
+    break
+  fi
+done
+if [ "$HAS_FIXED" -eq 1 ]; then
+  printf '{"comments":[],"files":%s,"coverage":%s}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
+  exit 0
+fi
 case "$MODE" in
   clean)
     printf '{"comments":[],"files":%s,"coverage":%s}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
@@ -316,6 +328,18 @@ fn agent_fix(
     run_id: &str,
     extra: &[&str],
 ) -> std::process::Output {
+    agent_fix_modes(work, home, fake, run_id, extra, "blocking", "noop")
+}
+
+fn agent_fix_modes(
+    work: &Path,
+    home: &Path,
+    fake: &Path,
+    run_id: &str,
+    extra: &[&str],
+    review_mode: &str,
+    fixer_mode: &str,
+) -> std::process::Output {
     let fake_fixer = fake.parent().unwrap().join("fake-fixer");
     let fake_gh = fake.parent().unwrap().join("fake-gh");
     let path = format!(
@@ -332,8 +356,8 @@ fn agent_fix(
         .env(REVIEW_BIN_ENV, fake)
         .env(FIXER_BIN_ENV, &fake_fixer)
         .env(GH_BIN_ENV, &fake_gh)
-        .env("PORCH_FAKE_REVIEW_MODE", "blocking")
-        .env("PORCH_FAKE_FIXER_MODE", "noop")
+        .env("PORCH_FAKE_REVIEW_MODE", review_mode)
+        .env("PORCH_FAKE_FIXER_MODE", fixer_mode)
         .env("PORCH_REVIEW_TIMEOUT_SECS", "20")
         .env("PORCH_FIXER_TIMEOUT_SECS", "20")
         .env("PATH", &path)
@@ -768,4 +792,288 @@ fn fix_persists_event_before_fixer_and_drift_skips_spawn() {
 
     kill_daemon(&home);
     kill_daemon(&home2);
+}
+
+#[test]
+fn noop_fix_still_opens_new_round_and_keeps_prior_events() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-noop-round", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    let first_round = round_for_decision(&db, &run)
+        .unwrap()
+        .expect("first decision round");
+    let first_instances = rounds::instances_for_round(&db, &first_round).unwrap();
+    let first_ids: Vec<String> = first_instances.iter().map(|i| i.id.clone()).collect();
+    let first_head = rounds::get_round(&db, &first_round)
+        .unwrap()
+        .expect("first round")
+        .to_sha;
+
+    let out = agent_fix(&work, &home, &fake, &run.id, &[]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["status"], "parked");
+    assert!(v["review_approved_head_sha"].is_null());
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "parked");
+    let rounds_list = rounds::rounds_for_run(&db, &run.id).unwrap();
+    assert!(
+        rounds_list.len() >= 2,
+        "unchanged HEAD must still open a fresh round; got {}",
+        rounds_list.len()
+    );
+    let second_round = round_for_decision(&db, &run)
+        .unwrap()
+        .expect("post-fix decision round");
+    assert_ne!(second_round.as_str(), first_round.as_str());
+    let second = rounds::get_round(&db, &second_round)
+        .unwrap()
+        .expect("second round row");
+    assert_eq!(
+        second.to_sha, first_head,
+        "noop fixer keeps HEAD; rereview still binds that SHA"
+    );
+    let second_instances = rounds::instances_for_round(&db, &second_round).unwrap();
+    assert!(!second_instances.is_empty());
+    for inst in &second_instances {
+        assert!(
+            !first_ids.contains(&inst.id),
+            "fingerprint must not reuse prior instance ids"
+        );
+    }
+
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, AuthorityKind::FixRequested);
+    assert_eq!(
+        events[0].review_round_id.as_deref(),
+        Some(first_round.as_str())
+    );
+    assert!(
+        events[0]
+            .members
+            .iter()
+            .all(|m| first_ids.contains(&m.finding_instance_id)),
+        "prior fix targets must remain on the old round"
+    );
+    assert!(
+        events[0].members.iter().all(|m| !second_instances
+            .iter()
+            .any(|i| i.id == m.finding_instance_id)),
+        "new instances must not inherit old target membership"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn noop_fix_reruns_producers_without_second_automatic_fix() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-noop-producers", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    let first_round = round_for_decision(&db, &run)
+        .unwrap()
+        .expect("first decision round");
+    let first_producers = rounds::producers_for_round(&db, &first_round).unwrap();
+    assert!(
+        !first_producers.is_empty(),
+        "initial park must record producers"
+    );
+
+    let out = agent_fix(&work, &home, &fake, &run.id, &[]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "parked", "exactly one rereview then park again");
+    assert!(run.review_approved_head_sha.is_none());
+    let second_round = round_for_decision(&db, &run)
+        .unwrap()
+        .expect("post-fix decision round");
+    let second_producers = rounds::producers_for_round(&db, &second_round).unwrap();
+    assert_eq!(
+        second_producers.len(),
+        first_producers.len(),
+        "required producers must run again on the unchanged SHA"
+    );
+    let first_ids: Vec<&str> = first_producers.iter().map(|p| p.id.as_str()).collect();
+    for p in &second_producers {
+        assert!(
+            !first_ids.contains(&p.id.as_str()),
+            "rereview producer ids must be fresh"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(home.join("fixer-invoked"))
+            .unwrap()
+            .trim(),
+        "1",
+        "no automatic second fix loop"
+    );
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == AuthorityKind::FixRequested)
+            .count(),
+        1
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn clean_rereview_completes_without_bulk_approve_event() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-clean-rereview", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+
+    let out = agent_fix_modes(&work, &home, &fake, &run.id, &[], "blocking", "apply");
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["status"] == "parked" || v["status"] == "completed",
+        "clean rereview must continue; got {v}"
+    );
+
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "clean rereview must not synthesize bulk approve; got {events:?}"
+    );
+    assert_eq!(events[0].kind, AuthorityKind::FixRequested);
+    assert!(
+        events
+            .iter()
+            .all(|e| e.kind != AuthorityKind::ReviewApproved),
+        "no review_approved when rereview has no blocking findings"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn yes_after_noop_fix_records_porch_approve_citing_fix_event() {
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-yes", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    let first_round = round_for_decision(&db, &run)
+        .unwrap()
+        .expect("first decision round");
+    let first_instances = rounds::instances_for_round(&db, &first_round).unwrap();
+    let first_ids: Vec<String> = first_instances.iter().map(|i| i.id.clone()).collect();
+
+    let out = agent_fix(&work, &home, &fake, &run.id, &["--yes"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["review_approved_head_sha"].as_str().unwrap().len() >= 7,
+        "standing consent must set approved HEAD; got {v}"
+    );
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    let events = rounds::events_for_run(&db, &run.id).unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "fix_requested then porch review_approved; got {events:?}"
+    );
+    assert_eq!(events[0].kind, AuthorityKind::FixRequested);
+    assert_eq!(events[1].kind, AuthorityKind::ReviewApproved);
+    assert_eq!(events[1].actor_kind, ActorKind::Porch);
+    assert_eq!(
+        events[1].authority_event_id.as_deref(),
+        Some(events[0].id.as_str()),
+        "porch approve must cite the fix_requested event"
+    );
+    assert_eq!(
+        events[1].head_changed,
+        Some(false),
+        "noop fixer must record head_changed=false"
+    );
+
+    let second_round = round_for_decision(&db, &run)
+        .unwrap()
+        .expect("post-fix decision round");
+    assert_ne!(
+        second_round.as_str(),
+        first_round.as_str(),
+        "rereview must mint a new round"
+    );
+    assert_eq!(
+        events[1].review_round_id.as_deref(),
+        Some(second_round.as_str())
+    );
+    let second_instances = rounds::instances_for_round(&db, &second_round).unwrap();
+    let mut second_ids: Vec<String> = second_instances.iter().map(|i| i.id.clone()).collect();
+    second_ids.sort();
+    assert!(
+        !second_ids.is_empty(),
+        "new round must have fresh instances"
+    );
+    for id in &second_ids {
+        assert!(
+            !first_ids.contains(id),
+            "new-round instance {id} must not reuse pre-fix ids"
+        );
+    }
+    let mut member_ids: Vec<String> = events[1]
+        .members
+        .iter()
+        .map(|m| {
+            assert_eq!(m.role, MemberRole::Context);
+            m.finding_instance_id.clone()
+        })
+        .collect();
+    member_ids.sort();
+    assert_eq!(
+        member_ids, second_ids,
+        "standing consent freezes the new-round instance set"
+    );
+    assert!(
+        events[0]
+            .members
+            .iter()
+            .all(|m| first_ids.contains(&m.finding_instance_id)),
+        "prior fix_requested membership must remain on the old round"
+    );
+
+    kill_daemon(&home);
 }
