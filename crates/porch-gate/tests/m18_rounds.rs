@@ -3414,6 +3414,182 @@ fn empty_modern_context_and_legacy_abort_both_persist() {
 }
 
 #[test]
+fn modern_review_aborted_and_skipped_persist_with_context_freeze() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+
+    let (abort_run, abort_round, abort_instance) = park_finished_round(&db, home);
+    let abort_event = rounds::persist_authority(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: abort_run.clone(),
+            kind: rounds::AuthorityKind::ReviewAborted,
+            expected_round_id: Some(abort_round.clone()),
+            expected_head: Some("to".into()),
+            live_head: Some("to".into()),
+            actor_kind: rounds::ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: false,
+            members: vec![(abort_instance.clone(), rounds::MemberRole::Context)],
+        },
+    )
+    .expect("modern abort");
+    let abort_events = rounds::events_for_run(&db, &abort_run).unwrap();
+    assert_eq!(abort_events.len(), 1);
+    assert_eq!(abort_events[0].id, abort_event);
+    assert_eq!(abort_events[0].kind, rounds::AuthorityKind::ReviewAborted);
+    assert!(!abort_events[0].identity_unavailable);
+    assert_eq!(
+        abort_events[0].review_round_id.as_deref(),
+        Some(abort_round.as_str())
+    );
+    assert_eq!(abort_events[0].members.len(), 1);
+    assert_eq!(
+        abort_events[0].members[0].finding_instance_id,
+        abort_instance
+    );
+    assert_eq!(abort_events[0].members[0].role, rounds::MemberRole::Context);
+
+    let skip_run = {
+        db.upsert_repo(
+            "repo-skip-auth",
+            home,
+            &home.join("bare-skip-auth.git"),
+            "main",
+        )
+        .unwrap();
+        db.insert_run(
+            "repo-skip-auth",
+            "feat",
+            "cafebabe",
+            Some("intent"),
+            Some("flag"),
+        )
+        .unwrap()
+        .id
+    };
+    let inventory = b"inv-skip-auth\n";
+    let skip_round =
+        rounds::open_round(&db, &sample_plan(&skip_run), &sample_bindings(inventory)).unwrap();
+    let producer = producer_id(&db, &skip_round);
+    let (rev, _) = rounds::read_history(&db, &skip_run).unwrap();
+    assert_eq!(
+        rounds::finalize_round(&db, &skip_round, &sample_complete_proposal(&producer), rev)
+            .unwrap(),
+        FinalizeOutcome::Finalized
+    );
+    db.set_run_shas(&skip_run, Some("to"), None).unwrap();
+    let skip_instance = rounds::instances_for_round(&db, &skip_round).unwrap()[0]
+        .id
+        .clone();
+
+    let skip_event = rounds::persist_authority(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: skip_run.clone(),
+            kind: rounds::AuthorityKind::ReviewSkipped,
+            expected_round_id: Some(skip_round.clone()),
+            expected_head: Some("to".into()),
+            live_head: None,
+            actor_kind: rounds::ActorKind::Porch,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: false,
+            members: vec![(skip_instance.clone(), rounds::MemberRole::Context)],
+        },
+    )
+    .expect("modern skip");
+    let skip_events = rounds::events_for_run(&db, &skip_run).unwrap();
+    assert_eq!(skip_events.len(), 1);
+    assert_eq!(skip_events[0].id, skip_event);
+    assert_eq!(skip_events[0].kind, rounds::AuthorityKind::ReviewSkipped);
+    assert!(!skip_events[0].identity_unavailable);
+    assert_eq!(
+        skip_events[0].review_round_id.as_deref(),
+        Some(skip_round.as_str())
+    );
+    assert_eq!(skip_events[0].members.len(), 1);
+    assert_eq!(
+        skip_events[0].members[0].finding_instance_id,
+        skip_instance
+    );
+}
+
+#[test]
+fn identity_unavailable_rejected_for_non_abort_kinds_without_writing() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = {
+        db.upsert_repo(
+            "repo-id-unavail",
+            home,
+            &home.join("bare-id-unavail.git"),
+            "main",
+        )
+        .unwrap();
+        db.insert_run(
+            "repo-id-unavail",
+            "feat",
+            "deadbeef",
+            Some("intent"),
+            Some("flag"),
+        )
+        .unwrap()
+        .id
+    };
+
+    for kind in [
+        rounds::AuthorityKind::ReviewApproved,
+        rounds::AuthorityKind::ReviewSkipped,
+        rounds::AuthorityKind::FixRequested,
+    ] {
+        let result = rounds::persist_authority(
+            &db,
+            rounds::PersistAuthorityPlan {
+                run_id: run_id.clone(),
+                kind,
+                expected_round_id: None,
+                expected_head: None,
+                live_head: None,
+                actor_kind: rounds::ActorKind::Operator,
+                authority_event_id: None,
+                head_changed: None,
+                identity_unavailable: true,
+                members: vec![],
+            },
+        );
+        assert!(
+            result.is_err(),
+            "identity_unavailable must be rejected for {kind:?}"
+        );
+    }
+    assert!(
+        rounds::events_for_run(&db, &run_id).unwrap().is_empty(),
+        "rejected identity_unavailable must not write a row"
+    );
+
+    let legacy_ok = rounds::persist_authority(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: run_id.clone(),
+            kind: rounds::AuthorityKind::ReviewAborted,
+            expected_round_id: None,
+            expected_head: None,
+            live_head: None,
+            actor_kind: rounds::ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: true,
+            members: vec![],
+        },
+    );
+    assert!(legacy_ok.is_ok(), "legacy abort with identity_unavailable still succeeds");
+}
+
+#[test]
 fn authority_members_store_instance_ids_never_display_handles() {
     let home = TempDir::new().unwrap();
     let home = home.path();

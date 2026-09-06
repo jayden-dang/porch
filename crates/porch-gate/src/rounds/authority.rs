@@ -156,6 +156,11 @@ pub fn persist_authority(
     plan: PersistAuthorityPlan,
 ) -> std::result::Result<String, AuthorityError> {
     if plan.identity_unavailable {
+        if plan.kind != AuthorityKind::ReviewAborted {
+            return Err(AuthorityError::Storage(crate::Error::Other(
+                "identity_unavailable is only valid for review_aborted".into(),
+            )));
+        }
         if plan.expected_round_id.is_some() || !plan.members.is_empty() {
             return Err(AuthorityError::Storage(crate::Error::Other(
                 "identity_unavailable abort must omit round id and members".into(),
