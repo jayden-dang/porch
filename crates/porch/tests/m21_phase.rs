@@ -949,3 +949,154 @@ fn agent_status_keeps_shape_while_phase_comes_from_snapshot_field() {
     );
     kill_daemon(&s.home);
 }
+
+/// Seed a running deliver attempt with `repairs` nested `deliver_repair` starts.
+/// When `finish_all` is false, the last nested start is left nonterminal (mid-flight).
+fn seed_deliver_with_repairs(home: &Path, repairs: usize, finish_all: bool) -> (Db, String) {
+    std::fs::create_dir_all(home).unwrap();
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    db.upsert_repo("repo1", home, &home.join("bare.git"), "main")
+        .unwrap();
+    let run = db
+        .insert_run("repo1", "feat-repair-budget", "deadbeef", None, None)
+        .unwrap();
+    let deliver = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run.id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .unwrap();
+    for i in 0..repairs {
+        let nested = rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::NestedStart {
+                parent: deliver.clone(),
+                kind: rounds::phase::OperationKind::DeliverRepair,
+            },
+            rounds::RunEffects::none(),
+        )
+        .unwrap();
+        let finish = finish_all || i + 1 < repairs;
+        if finish {
+            rounds::phase::persist_phase_transition(
+                &db,
+                rounds::phase::PhaseTransition::NestedTerminal {
+                    attempt: nested,
+                    outcome: "completed".into(),
+                    cause: Some(format!("attempt {}", i + 1)),
+                },
+                rounds::RunEffects::none(),
+            )
+            .unwrap();
+        }
+    }
+    (db, run.id)
+}
+
+#[test]
+fn budgeted_started_repairs_refuse_another_with_exhausted_cause() {
+    let tmp = TempDir::new().unwrap();
+    let (db, run_id) = seed_deliver_with_repairs(tmp.path(), 3, true);
+
+    // Column left at default 0 — enforcement must not read it.
+    let run = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(run.deliver_repair_attempts, 0);
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run_id).unwrap(),
+        3,
+        "budget is the count of nested deliver_repair started events"
+    );
+
+    let deliver =
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Deliver)
+            .unwrap()
+            .expect("deliver still open when budget blocks another repair");
+    let cause = "deliver repair budget exhausted (3)";
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Terminal {
+            attempt: deliver.id,
+            outcome: "failed".into(),
+            cause: Some(cause.into()),
+        },
+        rounds::RunEffects {
+            status: Some("failed".into()),
+            error: Some(cause.into()),
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run_id).unwrap(),
+        3,
+        "refuse must not start a fourth nested repair"
+    );
+    let run = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(run.status, "failed");
+    assert!(
+        run.error
+            .as_deref()
+            .is_some_and(|e| e.contains("budget exhausted")),
+        "run must carry budget-exhausted cause, got {:?}",
+        run.error
+    );
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert!(
+        events.iter().any(|e| {
+            e.kind == rounds::phase::PhaseEventKind::Terminal
+                && e.outcome.as_deref() == Some("failed")
+                && e.cause
+                    .as_deref()
+                    .is_some_and(|c| c.contains("budget exhausted"))
+        }),
+        "deliver terminal must carry budget-exhausted cause: {events:?}"
+    );
+}
+
+#[test]
+fn kill_between_repair_count_and_finish_never_exceeds_budget_after_restart() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let (db, run_id) = seed_deliver_with_repairs(home, 3, false);
+
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run_id).unwrap(),
+        3,
+        "unfinished started repairs still count toward the budget"
+    );
+    assert_eq!(
+        db.run_by_id(&run_id)
+            .unwrap()
+            .unwrap()
+            .deliver_repair_attempts,
+        0,
+        "column must not be the budget source"
+    );
+
+    drop(db);
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    db.fail_stale_running("daemon restarted while run was in progress")
+        .unwrap();
+
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run_id).unwrap(),
+        3,
+        "restart must not permit more than the budget of started repairs"
+    );
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    let repair_starts = attempts
+        .iter()
+        .filter(|a| a.operation_kind == Some(rounds::phase::OperationKind::DeliverRepair))
+        .count();
+    assert_eq!(repair_starts, 3);
+}

@@ -1610,15 +1610,14 @@ fn deliver_with_repair(
                 if !repairable {
                     return Err(RunError::Deliver(e));
                 }
-                let run = db
-                    .run_by_id(run_id)?
-                    .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
-                if run.deliver_repair_attempts >= DELIVER_REPAIR_BUDGET {
+                let started =
+                    phase::repair_attempts_started(db, run_id).map_err(|e| gate_fail(&e))?;
+                if started >= DELIVER_REPAIR_BUDGET {
                     return Err(RunError::Msg(format!(
                         "deliver repair budget exhausted ({DELIVER_REPAIR_BUDGET})"
                     )));
                 }
-                let attempt = db.increment_deliver_repair_attempts(run_id)?;
+                let attempt = started + 1;
                 let deliver_attempt = open_attempt(db, run_id, PhaseName::Deliver)?;
                 let repair_attempt = persist_effects(
                     db,

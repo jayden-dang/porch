@@ -761,6 +761,31 @@ pub fn events_for_run(db: &Db, run_id: &str) -> Result<Vec<PhaseEventRow>> {
     Ok(out)
 }
 
+/// Count nested `deliver_repair` started events for a run (deliver-repair budget).
+///
+/// # Errors
+///
+/// Returns a storage error if the query fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn repair_attempts_started(db: &Db, run_id: &str) -> Result<u32> {
+    let conn = db.conn();
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM phase_events e
+         INNER JOIN phase_attempts a ON a.id = e.attempt_id
+         WHERE e.run_id = ?1
+           AND e.kind = 'started'
+           AND a.operation_kind = 'deliver_repair'",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    u32::try_from(n)
+        .map_err(|_| crate::Error::Other(format!("repair started count out of range: {n}")))
+}
+
 /// Cancel a run with a justifying phase event co-written with `runs.status`.
 ///
 /// Prefers terminating an open nested compose under deliver (which also closes

@@ -50,7 +50,7 @@ pub struct RunRow {
     pub findings_json: Option<String>,
     pub fixer_session_id: Option<String>,
     pub pr_url: Option<String>,
-    /// Deliver mechanical repair attempts started (budget default 3).
+    /// Frozen unused column; deliver-repair budget counts phase `deliver_repair` started events.
     pub deliver_repair_attempts: u32,
     /// Pinned default-branch tip SHA used for trusted `.porch.yaml` (E10).
     pub trusted_config_sha: Option<String>,
@@ -702,30 +702,6 @@ impl Db {
             rusqlite::params![title, id],
         )?;
         Ok(())
-    }
-
-    /// Increment `deliver_repair_attempts` when a fix attempt starts; returns the new count.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `SQLite` error if the update fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the connection mutex is poisoned.
-    pub fn increment_deliver_repair_attempts(&self, id: &str) -> Result<u32> {
-        let conn = self.conn.lock().expect("db mutex");
-        conn.execute(
-            "UPDATE runs SET deliver_repair_attempts = deliver_repair_attempts + 1 WHERE id = ?1",
-            rusqlite::params![id],
-        )?;
-        let n: i64 = conn.query_row(
-            "SELECT deliver_repair_attempts FROM runs WHERE id = ?1",
-            rusqlite::params![id],
-            |row| row.get(0),
-        )?;
-        u32::try_from(n)
-            .map_err(|_| crate::Error::Other(format!("deliver_repair_attempts out of range: {n}")))
     }
 
     /// Insert or replace the uncertified fixer range for a repo branch.
