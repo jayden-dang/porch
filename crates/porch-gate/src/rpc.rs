@@ -511,7 +511,16 @@ pub fn wire_phase_name(view: &PhaseView) -> String {
 ///
 /// Panics if the database mutex is poisoned.
 pub fn phase_view_for_run(db: &Db, run_id: &str) -> Result<Option<PhaseView>> {
-    let mut chosen: Option<(PhaseAttemptRow, Option<OperationKind>)> = None;
+    let conn = db.conn();
+    let attempts = phase::attempts_for_run_conn(&conn, run_id)?;
+    let events = phase::events_for_run_conn(&conn, run_id)?;
+    let terminal_ids: std::collections::HashSet<&AttemptId> = events
+        .iter()
+        .filter(|e| e.kind == PhaseEventKind::Terminal)
+        .map(|e| &e.attempt_id)
+        .collect();
+
+    let mut chosen: Option<(&PhaseAttemptRow, Option<OperationKind>)> = None;
     for name in [
         PhaseName::Intent,
         PhaseName::Rebase,
@@ -519,34 +528,35 @@ pub fn phase_view_for_run(db: &Db, run_id: &str) -> Result<Option<PhaseView>> {
         PhaseName::Certify,
         PhaseName::Deliver,
     ] {
-        let Some(open) = phase::nonterminal_attempt(db, run_id, name)? else {
+        let Some(open) = attempts
+            .iter()
+            .filter(|a| {
+                a.phase == name && a.parent_attempt_id.is_none() && !terminal_ids.contains(&a.id)
+            })
+            .max_by(|a, b| {
+                a.ordinal
+                    .cmp(&b.ordinal)
+                    .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+            })
+        else {
             continue;
         };
-        let operation = open_nested_operation(db, run_id, &open.id)?;
+        let operation = attempts.iter().rev().find_map(|a| {
+            if a.parent_attempt_id.as_ref() != Some(&open.id) {
+                return None;
+            }
+            if terminal_ids.contains(&a.id) {
+                None
+            } else {
+                a.operation_kind
+            }
+        });
         chosen = Some((open, operation));
     }
     Ok(chosen.map(|(open, operation)| PhaseView {
         phase: open.phase.as_str().to_string(),
         ordinal: open.ordinal,
         operation: operation.map(|op| op.as_str().to_string()),
-    }))
-}
-
-fn open_nested_operation(
-    db: &Db,
-    run_id: &str,
-    parent: &AttemptId,
-) -> Result<Option<OperationKind>> {
-    let attempts = phase::attempts_for_run(db, run_id)?;
-    let events = phase::events_for_run(db, run_id)?;
-    Ok(attempts.into_iter().rev().find_map(|a| {
-        if a.parent_attempt_id.as_ref() != Some(parent) {
-            return None;
-        }
-        let terminal = events
-            .iter()
-            .any(|e| e.attempt_id == a.id && e.kind == PhaseEventKind::Terminal);
-        if terminal { None } else { a.operation_kind }
     }))
 }
 

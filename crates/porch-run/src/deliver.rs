@@ -32,7 +32,7 @@ fn resolve_gh_bin() -> String {
     gh_bin()
 }
 use porch_gate::rounds::phase::{
-    self as phase, AttemptId, OperationKind, PhaseEventKind, PhaseName, PhaseTransition,
+    self as phase, AttemptId, OperationKind, PhaseName, PhaseTransition,
 };
 use porch_gate::rounds::{RunEffects, StepEffect};
 use porch_gate::{Db, event_hub, resolve_run_assurance, run_artifact_dir};
@@ -68,18 +68,7 @@ fn open_nested_compose(
     run_id: &str,
     deliver: &AttemptId,
 ) -> Result<AttemptId, DeliverError> {
-    let attempts = phase::attempts_for_run(db, run_id)?;
-    let events = phase::events_for_run(db, run_id)?;
-    attempts
-        .into_iter()
-        .rev()
-        .find(|a| {
-            a.parent_attempt_id.as_ref() == Some(deliver)
-                && a.operation_kind == Some(OperationKind::Compose)
-                && !events
-                    .iter()
-                    .any(|e| e.attempt_id == a.id && e.kind == PhaseEventKind::Terminal)
-        })
+    phase::open_nested_attempt(db, run_id, deliver, Some(OperationKind::Compose))?
         .map(|a| a.id)
         .ok_or_else(|| DeliverError::Msg(format!("no open compose attempt for run {run_id}")))
 }

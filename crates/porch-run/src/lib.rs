@@ -19,7 +19,7 @@ use porch_agent::{
     write_fixer_inputs, write_rebase_fix_inputs,
 };
 use porch_gate::rounds::phase::{
-    self as phase, AttemptId, OperationKind, PhaseEventKind, PhaseName, PhaseTransition,
+    self as phase, AttemptId, OperationKind, PhaseName, PhaseTransition,
 };
 use porch_gate::rounds::{
     self, ActorKind, AssuranceCompletion, AuthorityError, AuthorityKind, ContextApplication,
@@ -355,9 +355,7 @@ fn fail_run_with_phase(db: &Db, run_id: &str, msg: &str) -> Result<()> {
             return Ok(());
         }
     }
-    let _ = start_phase(db, run_id, PhaseName::Intent, RunEffects::none())?;
-    let _ = terminal_open(db, run_id, PhaseName::Intent, "failed", Some(msg), effects)?;
-    Ok(())
+    invent_terminal_effects(db, run_id, PhaseName::Intent, "failed", Some(msg), effects)
 }
 
 fn complete_run_with_phase(db: &Db, run_id: &str) -> Result<()> {
@@ -400,8 +398,30 @@ fn complete_run_with_phase(db: &Db, run_id: &str) -> Result<()> {
         )?;
         return Ok(());
     }
-    let _ = start_phase(db, run_id, PhaseName::Deliver, RunEffects::none())?;
-    let _ = terminal_open(db, run_id, PhaseName::Deliver, "completed", None, effects)?;
+    invent_terminal_effects(db, run_id, PhaseName::Deliver, "completed", None, effects)
+}
+
+fn invent_terminal_effects(
+    db: &Db,
+    run_id: &str,
+    phase: PhaseName,
+    outcome: &str,
+    cause: Option<&str>,
+    effects: RunEffects,
+) -> Result<()> {
+    let status = effects.status.clone();
+    let steps = effects.steps.clone();
+    phase::invent_and_terminal(db, run_id, phase, outcome, cause, effects)
+        .map_err(|e| phase_fail(&e))?;
+    if let Some(status) = status.as_deref() {
+        publish_run(run_id, &format!("status={status}"));
+    }
+    for step in &steps {
+        publish_run(
+            run_id,
+            &format!("step={} status={}", step.step, step.status),
+        );
+    }
     Ok(())
 }
 
@@ -2965,17 +2985,11 @@ fn fail_fix_run(
     if let Ok(new_head) = porch_git::rev_parse_c(wt, "HEAD") {
         let _ = persist_uncertified_after_fix(db, wt, run, pre_fix_head, &new_head);
     }
-    // Failed nested fixer also terminals parent review (seam NestedTerminal).
+    // NestedTerminal closes parent review on fixer fail.
     if let Ok(review) = open_attempt(db, &run.id, PhaseName::Review) {
-        let attempts = phase::attempts_for_run(db, &run.id).unwrap_or_default();
-        let events = phase::events_for_run(db, &run.id).unwrap_or_default();
-        if let Some(fixer) = attempts.into_iter().rev().find(|a| {
-            a.parent_attempt_id.as_ref() == Some(&review)
-                && a.operation_kind == Some(OperationKind::Fixer)
-                && !events
-                    .iter()
-                    .any(|e| e.attempt_id == a.id && e.kind == PhaseEventKind::Terminal)
-        }) {
+        if let Ok(Some(fixer)) =
+            phase::open_nested_attempt(db, &run.id, &review, Some(OperationKind::Fixer))
+        {
             let _ = persist_effects(
                 db,
                 &run.id,

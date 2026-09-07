@@ -3,13 +3,13 @@ use std::fmt;
 use rusqlite::{Transaction, TransactionBehavior};
 use ulid::Ulid;
 
+use super::authority::apply_run_effects_tx;
 use super::{RunEffects, StepEffect};
 use crate::Result;
 use crate::db::{self, Db};
 
 use db::now_secs;
 
-/// Stable id for one phase attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AttemptId(String);
 
@@ -32,7 +32,6 @@ impl AsRef<str> for AttemptId {
     }
 }
 
-/// Canonical top-level phase name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PhaseName {
     Intent,
@@ -66,7 +65,6 @@ impl PhaseName {
     }
 }
 
-/// Nested operation recorded under a parent phase attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperationKind {
     Compose,
@@ -96,7 +94,6 @@ impl OperationKind {
     }
 }
 
-/// Kind of a phase-event row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PhaseEventKind {
     Started,
@@ -126,7 +123,6 @@ impl PhaseEventKind {
     }
 }
 
-/// Persisted phase-attempt row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhaseAttemptRow {
     pub id: AttemptId,
@@ -139,7 +135,6 @@ pub struct PhaseAttemptRow {
     pub created_at: String,
 }
 
-/// Persisted phase-event row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhaseEventRow {
     pub id: String,
@@ -152,7 +147,6 @@ pub struct PhaseEventRow {
     pub created_at: String,
 }
 
-/// One phase-lifecycle write, co-committed with [`RunEffects`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhaseTransition {
     Start {
@@ -185,7 +179,6 @@ pub enum PhaseTransition {
     },
 }
 
-/// Failure to persist a phase transition.
 #[derive(Debug, thiserror::Error)]
 pub enum PhaseError {
     #[error("phase start refused: nonterminal attempt already exists for this phase")]
@@ -227,7 +220,43 @@ pub fn persist_phase_transition(
         .map_err(crate::Error::from)?;
 
     let (run_id, attempt_id) = apply_phase_transition_tx(&tx, plan)?;
-    apply_run_effects_tx(&tx, &run_id, effects)?;
+    apply_run_effects_tx(&tx, &run_id, effects).map_err(PhaseError::Storage)?;
+    tx.execute(
+        "UPDATE runs SET audit_rev = audit_rev + 1 WHERE id = ?1",
+        [&run_id],
+    )
+    .map_err(crate::Error::from)?;
+    tx.commit().map_err(crate::Error::from)?;
+    Ok(attempt_id)
+}
+
+/// Start then terminal one top-level attempt and co-write `effects` in a single Immediate txn.
+///
+/// Used when a status change needs a justifying phase event but no attempt is open.
+///
+/// # Errors
+///
+/// Returns the same [`PhaseError`] variants as [`persist_phase_transition`] for `Start` /
+/// `Terminal`, or a storage error when the transaction cannot commit.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn invent_and_terminal(
+    db: &Db,
+    run_id: &str,
+    phase: PhaseName,
+    outcome: &str,
+    cause: Option<&str>,
+    effects: RunEffects,
+) -> std::result::Result<AttemptId, PhaseError> {
+    let conn = db.conn();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+        .map_err(crate::Error::from)?;
+
+    let (run_id, attempt_id) = apply_start_tx(&tx, run_id.to_string(), phase)?;
+    apply_terminal_tx(&tx, attempt_id.clone(), outcome, cause)?;
+    apply_run_effects_tx(&tx, &run_id, effects).map_err(PhaseError::Storage)?;
     tx.execute(
         "UPDATE runs SET audit_rev = audit_rev + 1 WHERE id = ?1",
         [&run_id],
@@ -668,48 +697,6 @@ fn insert_event_tx(
     Ok(())
 }
 
-fn apply_run_effects_tx(
-    tx: &Transaction<'_>,
-    run_id: &str,
-    effects: RunEffects,
-) -> std::result::Result<(), PhaseError> {
-    let RunEffects {
-        status,
-        error,
-        approved_head,
-        steps,
-    } = effects;
-    if let Some(status) = status.as_deref() {
-        tx.execute(
-            "UPDATE runs SET status = ?1, error = ?2 WHERE id = ?3",
-            rusqlite::params![status, error, run_id],
-        )
-        .map_err(crate::Error::from)?;
-    }
-    if let Some(head) = approved_head.as_deref() {
-        tx.execute(
-            "UPDATE runs SET review_approved_head_sha = ?1 WHERE id = ?2",
-            rusqlite::params![head, run_id],
-        )
-        .map_err(crate::Error::from)?;
-    }
-    for StepEffect {
-        step,
-        status,
-        error,
-    } in steps
-    {
-        let id = Ulid::new().to_string();
-        tx.execute(
-            "INSERT INTO step_results (id, run_id, step, status, error, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![id, run_id, step, status, error, now_secs()],
-        )
-        .map_err(crate::Error::from)?;
-    }
-    Ok(())
-}
-
 /// Phase attempts for a run, oldest first.
 ///
 /// # Errors
@@ -831,11 +818,13 @@ pub fn cancel_run(db: &Db, run_id: &str, cause: &str) -> std::result::Result<(),
         steps: vec![],
     };
     if let Some(deliver) = nonterminal_attempt(db, run_id, PhaseName::Deliver)? {
-        if let Some(compose) = open_nested_compose(db, run_id, &deliver.id)? {
+        if let Some(compose) =
+            open_nested_attempt(db, run_id, &deliver.id, Some(OperationKind::Compose))?
+        {
             persist_phase_transition(
                 db,
                 PhaseTransition::NestedTerminal {
-                    attempt: compose,
+                    attempt: compose.id,
                     outcome: "cancelled".into(),
                     cause: Some(cause.to_string()),
                 },
@@ -882,46 +871,72 @@ pub fn cancel_run(db: &Db, run_id: &str, cause: &str) -> std::result::Result<(),
             return Ok(());
         }
     }
-    persist_phase_transition(
+    invent_and_terminal(
         db,
-        PhaseTransition::Start {
-            run_id: run_id.to_string(),
-            phase: PhaseName::Intent,
-        },
-        RunEffects::none(),
-    )?;
-    let intent =
-        nonterminal_attempt(db, run_id, PhaseName::Intent)?.ok_or(PhaseError::UnknownAttempt)?;
-    persist_phase_transition(
-        db,
-        PhaseTransition::Terminal {
-            attempt: intent.id,
-            outcome: "cancelled".into(),
-            cause: Some(cause.to_string()),
-        },
+        run_id,
+        PhaseName::Intent,
+        "cancelled",
+        Some(cause),
         effects,
     )?;
     Ok(())
 }
 
-fn open_nested_compose(
+/// Newest nonterminal nested attempt under `parent`, optionally filtered by `kind`.
+///
+/// # Errors
+///
+/// Returns a storage error if the attempt/event readers fail.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn open_nested_attempt(
     db: &Db,
     run_id: &str,
-    deliver: &AttemptId,
-) -> std::result::Result<Option<AttemptId>, PhaseError> {
-    let attempts = attempts_for_run(db, run_id).map_err(PhaseError::Storage)?;
-    let events = events_for_run(db, run_id).map_err(PhaseError::Storage)?;
-    Ok(attempts.into_iter().rev().find_map(|a| {
-        let is_compose = a.parent_attempt_id.as_ref() == Some(deliver)
-            && a.operation_kind == Some(OperationKind::Compose);
-        if !is_compose {
+    parent: &AttemptId,
+    kind: Option<OperationKind>,
+) -> Result<Option<PhaseAttemptRow>> {
+    let conn = db.conn();
+    open_nested_attempt_conn(&conn, run_id, parent, kind)
+}
+
+/// Like [`open_nested_attempt`] on an already-locked connection.
+///
+/// # Errors
+///
+/// Returns a storage error if the attempt/event readers fail.
+pub fn open_nested_attempt_conn(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    parent: &AttemptId,
+    kind: Option<OperationKind>,
+) -> Result<Option<PhaseAttemptRow>> {
+    let attempts = attempts_for_run_conn(conn, run_id)?;
+    let events = events_for_run_conn(conn, run_id)?;
+    Ok(find_open_nested(&attempts, &events, parent, kind))
+}
+
+fn find_open_nested(
+    attempts: &[PhaseAttemptRow],
+    events: &[PhaseEventRow],
+    parent: &AttemptId,
+    kind: Option<OperationKind>,
+) -> Option<PhaseAttemptRow> {
+    attempts.iter().rev().find_map(|a| {
+        if a.parent_attempt_id.as_ref() != Some(parent) {
             return None;
+        }
+        if let Some(want) = kind {
+            if a.operation_kind != Some(want) {
+                return None;
+            }
         }
         let terminal = events
             .iter()
             .any(|e| e.attempt_id == a.id && e.kind == PhaseEventKind::Terminal);
-        (!terminal).then_some(a.id)
-    }))
+        if terminal { None } else { Some(a.clone()) }
+    })
 }
 
 /// Append interrupted terminals for every nonterminal attempt on each `running` run,
@@ -998,8 +1013,7 @@ fn reconcile_one_running(
             approved_head: None,
             steps: vec![],
         },
-    )
-    .map_err(phase_err_to_storage)?;
+    )?;
     tx.execute(
         "UPDATE runs SET audit_rev = audit_rev + 1 WHERE id = ?1",
         [run_id],

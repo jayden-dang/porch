@@ -318,11 +318,12 @@ pub fn persist_authority_with_run_effects(
     Ok(event_id)
 }
 
-fn apply_run_effects_tx(
+/// Co-write run status / approved HEAD / `step_results` on an open Immediate txn.
+pub(crate) fn apply_run_effects_tx(
     tx: &Transaction<'_>,
     run_id: &str,
     effects: RunEffects,
-) -> std::result::Result<(), AuthorityError> {
+) -> Result<()> {
     let RunEffects {
         status,
         error,
@@ -333,15 +334,13 @@ fn apply_run_effects_tx(
         tx.execute(
             "UPDATE runs SET status = ?1, error = ?2 WHERE id = ?3",
             rusqlite::params![status, error, run_id],
-        )
-        .map_err(crate::Error::from)?;
+        )?;
     }
     if let Some(head) = approved_head.as_deref() {
         tx.execute(
             "UPDATE runs SET review_approved_head_sha = ?1 WHERE id = ?2",
             rusqlite::params![head, run_id],
-        )
-        .map_err(crate::Error::from)?;
+        )?;
     }
     for step in steps {
         let id = Ulid::new().to_string();
@@ -349,8 +348,7 @@ fn apply_run_effects_tx(
             "INSERT INTO step_results (id, run_id, step, status, error, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![id, run_id, step.step, step.status, step.error, now_secs()],
-        )
-        .map_err(crate::Error::from)?;
+        )?;
     }
     Ok(())
 }
