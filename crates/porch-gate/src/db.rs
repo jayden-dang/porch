@@ -790,6 +790,8 @@ impl Db {
 
     /// Insert a step result row.
     ///
+    /// In-crate test helper; production writes go through `phase::persist_phase_transition`.
+    ///
     /// # Errors
     ///
     /// Returns a `SQLite` error if the insert fails.
@@ -797,7 +799,6 @@ impl Db {
     /// # Panics
     ///
     /// Panics if the connection mutex is poisoned.
-    // Still called from in-crate tests; production callers move to the phase seam later.
     #[allow(dead_code)]
     pub(crate) fn insert_step_result(
         &self,

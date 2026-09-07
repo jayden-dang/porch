@@ -792,8 +792,10 @@ fn standing_consent_yes_terminals_review_attempt_beside_status() {
 
     let events = rounds::phase::events_for_run(&db, &run.id).unwrap();
     let attempts = rounds::phase::attempts_for_run(&db, &run.id).unwrap();
+    // After fixer success the parked review yields a successor; --yes terminals that one.
     let review = attempts
         .iter()
+        .rev()
         .find(|a| a.phase == rounds::phase::PhaseName::Review && a.parent_attempt_id.is_none())
         .expect("review attempt");
     assert!(
@@ -809,6 +811,71 @@ fn standing_consent_yes_terminals_review_attempt_beside_status() {
             .unwrap()
             .is_none(),
         "review must not stay open after standing consent --yes"
+    );
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn fix_success_terminals_fixer_and_yields_one_successor_review() {
+    let s = setup_with_review_mode("blocking");
+    let run = park_review_run(&s, "feat-phase-fix-successor");
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let before = rounds::phase::attempts_for_run(&db, &run.id).unwrap();
+    let parked_review = before
+        .iter()
+        .find(|a| a.phase == rounds::phase::PhaseName::Review && a.parent_attempt_id.is_none())
+        .expect("parked review attempt")
+        .id
+        .clone();
+
+    agent_cmd(&s)
+        .args(["agent", "respond", "fix", "--run-id", &run.id])
+        .assert()
+        .success();
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(
+        run.status, "parked",
+        "noop fix + blocking rereview parks again"
+    );
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run.id).unwrap();
+    let events = rounds::phase::events_for_run(&db, &run.id).unwrap();
+
+    let fixer = attempts
+        .iter()
+        .find(|a| {
+            a.parent_attempt_id.as_ref() == Some(&parked_review)
+                && a.operation_kind == Some(rounds::phase::OperationKind::Fixer)
+        })
+        .expect("nested fixer under the parked review");
+    assert!(
+        events.iter().any(|e| {
+            e.attempt_id == fixer.id
+                && e.kind == rounds::phase::PhaseEventKind::Terminal
+                && e.outcome.as_deref() == Some("completed")
+        }),
+        "successful fixer must receive NestedTerminal(completed): events={events:?}"
+    );
+
+    let successors: Vec<_> = attempts
+        .iter()
+        .filter(|a| a.caused_by_attempt_id.as_ref() == Some(&parked_review))
+        .collect();
+    assert_eq!(
+        successors.len(),
+        1,
+        "fixer success must mint exactly one successor review, got {successors:?}"
+    );
+    assert_eq!(successors[0].phase, rounds::phase::PhaseName::Review);
+    assert!(successors[0].parent_attempt_id.is_none());
+
+    let open = rounds::phase::nonterminal_attempt(&db, &run.id, rounds::phase::PhaseName::Review)
+        .unwrap()
+        .expect("rereview park leaves the successor review open");
+    assert_eq!(
+        open.id, successors[0].id,
+        "parked phase must be the handoff successor, not the pre-fix review"
     );
     kill_daemon(&s.home);
 }

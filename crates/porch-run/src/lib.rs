@@ -128,55 +128,6 @@ fn apply_phase(db: &Db, transition: PhaseTransition, effects: RunEffects) -> Res
     phase::persist_phase_transition(db, transition, effects).map_err(|e| phase_fail(&e))
 }
 
-#[allow(dead_code)] // thin seam wrapper; call sites prefer combined helpers
-fn set_status(
-    db: &Db,
-    run_id: &str,
-    status: &str,
-    error: Option<&str>,
-    transition: PhaseTransition,
-) -> Result<()> {
-    apply_phase(
-        db,
-        transition,
-        RunEffects {
-            status: Some(status.to_string()),
-            error: error.map(str::to_string),
-            approved_head: None,
-            steps: vec![],
-        },
-    )?;
-    publish_run(run_id, &format!("status={status}"));
-    Ok(())
-}
-
-#[allow(dead_code)] // thin seam wrapper; call sites prefer combined helpers
-fn record_step(
-    db: &Db,
-    run_id: &str,
-    step: &str,
-    status: &str,
-    error: Option<&str>,
-    transition: PhaseTransition,
-) -> Result<()> {
-    apply_phase(
-        db,
-        transition,
-        RunEffects {
-            status: None,
-            error: None,
-            approved_head: None,
-            steps: vec![StepEffect {
-                step: step.to_string(),
-                status: status.to_string(),
-                error: error.map(str::to_string),
-            }],
-        },
-    )?;
-    publish_run(run_id, &format!("step={step} status={status}"));
-    Ok(())
-}
-
 fn persist_effects(
     db: &Db,
     run_id: &str,
@@ -2258,7 +2209,7 @@ fn agent_respond_inner(
         .clone()
         .ok_or_else(|| UsageOrFail::Fail("parked run has no worktree_dir".into()))?;
 
-    let phase = parked_phase(&db, &run);
+    let phase = parked_phase(&db, &run).map_err(UsageOrFail::Fail)?;
     if phase == "unavailable" {
         return Err(UsageOrFail::Fail(format!(
             "parked run {} has no nonterminal phase attempt",
@@ -2649,13 +2600,21 @@ fn respond_compose(
     }
 }
 
-fn parked_phase(db: &Db, run: &RunRow) -> String {
+fn parked_phase(db: &Db, run: &RunRow) -> std::result::Result<String, String> {
     if run.status != "parked" {
-        return String::new();
+        return Ok(String::new());
     }
     match porch_gate::phase_view_for_run(db, &run.id) {
-        Ok(Some(view)) => porch_gate::wire_phase_name(&view),
-        Ok(None) | Err(_) => "unavailable".into(),
+        Ok(Some(view)) => Ok(porch_gate::wire_phase_name(&view)),
+        Ok(None) => Ok("unavailable".into()),
+        Err(e) => {
+            tracing::error!(
+                run_id = %run.id,
+                error = %e,
+                "phase view read failed for parked run"
+            );
+            Err(format!("phase view read failed: {e}"))
+        }
     }
 }
 
@@ -2823,6 +2782,22 @@ fn respond_fix(
     persist_uncertified_after_fix(db, wt, run, &pre_fix_head, &new_head)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
 
+    // Head may have moved: hand parked review → successor before session-free rereview.
+    let review = open_attempt(db, &run.id, PhaseName::Review)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    persist_effects(
+        db,
+        &run.id,
+        PhaseTransition::Handoff {
+            from: review,
+            to_phase: PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("fixer_ok".into()),
+        },
+        RunEffects::none(),
+    )
+    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+
     finish_rereview(db, home, run, bare, wt, yes)
 }
 
@@ -2917,7 +2892,7 @@ fn spawn_and_wait_fixer(
     // Nested fixer under the parked review attempt.
     let review = open_attempt(db, &run.id, PhaseName::Review)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    persist_effects(
+    let fixer = persist_effects(
         db,
         &run.id,
         PhaseTransition::NestedStart {
@@ -2957,6 +2932,18 @@ fn spawn_and_wait_fixer(
                 db.set_fixer_session_id(&run.id, Some(sid))
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             }
+            // Successful nested fixer terminals before review→review handoff (PHASE-2.6).
+            persist_effects(
+                db,
+                &run.id,
+                PhaseTransition::NestedTerminal {
+                    attempt: fixer,
+                    outcome: "completed".into(),
+                    cause: Some("fixer_ok".into()),
+                },
+                RunEffects::none(),
+            )
+            .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             Ok(Some(pre_fix_head))
         }
         Err(e) => {
@@ -3309,7 +3296,7 @@ pub(crate) fn status_from_run(
         .map(finding_from_status_dto)
         .collect();
     let phase = match run.status.as_str() {
-        "parked" => parked_phase(db, run),
+        "parked" => parked_phase(db, run)?,
         "completed" | "failed" | "cancelled" => "done".into(),
         "running" | "pending" => "pipeline".into(),
         other => other.to_string(),

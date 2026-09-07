@@ -4106,6 +4106,196 @@ fn failed_status_write_rolls_back_attempt_and_event() {
     assert_eq!(after.error, before.error);
 }
 
+/// PHASE-8.3: poison between Start's attempt insert and event insert.
+/// Immediate txn still rolls the whole transition back (no partial commit).
+#[test]
+fn start_poison_after_attempt_insert_rolls_back_and_stays_consistent_after_reopen() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let before = db.run_by_id(&run_id).unwrap().unwrap();
+
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TRIGGER poison_phase_event_insert BEFORE INSERT ON phase_events
+            BEGIN
+                SELECT RAISE(ABORT, 'forced kill between attempt insert and event append');
+            END;
+            ",
+        )
+        .unwrap();
+    }
+
+    let poisoned = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    );
+    assert!(
+        poisoned.is_err(),
+        "poison between Start writes must abort the Immediate txn"
+    );
+    assert!(
+        rounds::phase::attempts_for_run(&db, &run_id)
+            .unwrap()
+            .is_empty(),
+        "rolled-back Start must leave no attempt"
+    );
+    assert!(
+        rounds::phase::events_for_run(&db, &run_id)
+            .unwrap()
+            .is_empty(),
+        "rolled-back Start must leave no event"
+    );
+    let after = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.error, before.error);
+
+    // Drop poison and reopen: log + status remain consistent; ≤1 nonterminal.
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch("DROP TRIGGER IF EXISTS poison_phase_event_insert;")
+            .unwrap();
+    }
+    let reopened = Db::open(&db_path(home)).unwrap();
+    let _ = rounds::phase::reconcile_interrupted(&reopened).expect("reconcile after reopen");
+    assert!(
+        rounds::phase::nonterminal_attempt(&reopened, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_none(),
+        "failed Start must leave zero nonterminal review attempts after reopen"
+    );
+    let status = reopened.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(status.status, before.status);
+}
+
+/// PHASE-8.3: poison between Handoff's terminal-event write and successor attempt insert.
+#[test]
+#[allow(clippy::too_many_lines)] // setup + poison + reopen/reconcile assertions
+fn handoff_poison_after_terminal_event_rolls_back_and_stays_consistent_after_reopen() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let review = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("start review");
+    let before_events = rounds::phase::events_for_run(&db, &run_id).unwrap().len();
+    let before_attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap().len();
+    let before = db.run_by_id(&run_id).unwrap().unwrap();
+
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TRIGGER poison_handoff_successor BEFORE INSERT ON phase_attempts
+            WHEN NEW.caused_by_attempt_id IS NOT NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'forced kill between handoff terminal and successor');
+            END;
+            ",
+        )
+        .unwrap();
+    }
+
+    let poisoned = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: review.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("fixer_ok".into()),
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        poisoned.is_err(),
+        "poison between Handoff writes must abort the Immediate txn"
+    );
+    assert_eq!(
+        rounds::phase::events_for_run(&db, &run_id).unwrap().len(),
+        before_events,
+        "rolled-back Handoff must not keep the from-attempt Terminal"
+    );
+    assert_eq!(
+        rounds::phase::attempts_for_run(&db, &run_id).unwrap().len(),
+        before_attempts,
+        "rolled-back Handoff must not mint a successor"
+    );
+    let open = rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+        .unwrap()
+        .expect("from review stays nonterminal");
+    assert_eq!(open.id, review);
+    let after = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(after.status, before.status);
+
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch("DROP TRIGGER IF EXISTS poison_handoff_successor;")
+            .unwrap();
+    }
+    // Pre-reconcile invariant after rollback: ≤1 nonterminal, status matches log.
+    assert_eq!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .map(|a| a.id),
+        Some(review.clone())
+    );
+    assert_eq!(db.run_by_id(&run_id).unwrap().unwrap().status, "running");
+
+    let reopened = Db::open(&db_path(home)).unwrap();
+    let closed = rounds::phase::reconcile_interrupted(&reopened).expect("reconcile after reopen");
+    assert!(
+        closed >= 1,
+        "running+open review must be interrupted on restart"
+    );
+    assert!(
+        rounds::phase::nonterminal_attempt(&reopened, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_none(),
+        "post-restart must leave ≤1 (here 0) nonterminal review"
+    );
+    let status = reopened.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(
+        status.status, "failed",
+        "status must match interrupted terminals in the log"
+    );
+    assert!(
+        rounds::phase::events_for_run(&reopened, &run_id)
+            .unwrap()
+            .iter()
+            .any(|e| {
+                e.attempt_id == review
+                    && e.kind == rounds::phase::PhaseEventKind::Terminal
+                    && e.outcome.as_deref() == Some("interrupted")
+            }),
+        "reconcile must terminal the rolled-back-open review"
+    );
+}
+
 #[test]
 fn terminal_transition_appends_a_row_and_leaves_started_unchanged() {
     let home = TempDir::new().unwrap();
