@@ -1,7 +1,13 @@
 use std::fmt;
 
+use rusqlite::{Transaction, TransactionBehavior};
+use ulid::Ulid;
+
+use super::{RunEffects, StepEffect};
 use crate::Result;
-use crate::db::Db;
+use crate::db::{self, Db};
+
+use db::now_secs;
 
 /// Stable id for one phase attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -144,6 +150,281 @@ pub struct PhaseEventRow {
     pub outcome: Option<String>,
     pub cause: Option<String>,
     pub created_at: String,
+}
+
+/// One phase-lifecycle write, co-committed with [`RunEffects`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhaseTransition {
+    Start {
+        run_id: String,
+        phase: PhaseName,
+    },
+    Terminal {
+        attempt: AttemptId,
+        outcome: String,
+        cause: Option<String>,
+    },
+    Evidence {
+        attempt: AttemptId,
+        cause: String,
+    },
+}
+
+/// Failure to persist a phase transition.
+#[derive(Debug, thiserror::Error)]
+pub enum PhaseError {
+    #[error("phase start refused: nonterminal attempt already exists for this phase")]
+    NonterminalExists,
+    #[error("phase transition refused: unknown attempt")]
+    UnknownAttempt,
+    #[error(transparent)]
+    Storage(#[from] crate::Error),
+}
+
+/// Persist a phase transition and optional run status / HEAD / step rows in one Immediate txn.
+///
+/// # Errors
+///
+/// Returns [`PhaseError::NonterminalExists`] when `Start` would open a second nonterminal
+/// attempt for the same top-level phase, [`PhaseError::UnknownAttempt`] when the referenced
+/// attempt is missing, or a storage error when the transaction cannot commit.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn persist_phase_transition(
+    db: &Db,
+    plan: PhaseTransition,
+    effects: RunEffects,
+) -> std::result::Result<AttemptId, PhaseError> {
+    let conn = db.conn();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+        .map_err(crate::Error::from)?;
+
+    let (run_id, attempt_id) = match plan {
+        PhaseTransition::Start { run_id, phase } => {
+            if nonterminal_attempt_tx(&tx, &run_id, phase)?.is_some() {
+                return Err(PhaseError::NonterminalExists);
+            }
+            let ordinal = next_top_level_ordinal_tx(&tx, &run_id, phase)?;
+            let attempt_id = AttemptId(Ulid::new().to_string());
+            let created_at = now_secs();
+            tx.execute(
+                "INSERT INTO phase_attempts (
+                    id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+                    operation_kind, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5)",
+                rusqlite::params![
+                    attempt_id.as_str(),
+                    &run_id,
+                    phase.as_str(),
+                    ordinal,
+                    created_at,
+                ],
+            )
+            .map_err(crate::Error::from)?;
+            let seq = next_event_seq_tx(&tx, &run_id)?;
+            insert_event_tx(
+                &tx,
+                &run_id,
+                &attempt_id,
+                seq,
+                PhaseEventKind::Started,
+                None,
+                None,
+                &created_at,
+            )?;
+            (run_id, attempt_id)
+        }
+        PhaseTransition::Terminal {
+            attempt,
+            outcome,
+            cause,
+        } => {
+            let run_id = attempt_run_id_tx(&tx, &attempt)?;
+            let seq = next_event_seq_tx(&tx, &run_id)?;
+            insert_event_tx(
+                &tx,
+                &run_id,
+                &attempt,
+                seq,
+                PhaseEventKind::Terminal,
+                Some(outcome.as_str()),
+                cause.as_deref(),
+                &now_secs(),
+            )?;
+            (run_id, attempt)
+        }
+        PhaseTransition::Evidence { attempt, cause } => {
+            let run_id = attempt_run_id_tx(&tx, &attempt)?;
+            let seq = next_event_seq_tx(&tx, &run_id)?;
+            insert_event_tx(
+                &tx,
+                &run_id,
+                &attempt,
+                seq,
+                PhaseEventKind::Evidence,
+                None,
+                Some(cause.as_str()),
+                &now_secs(),
+            )?;
+            (run_id, attempt)
+        }
+    };
+
+    apply_run_effects_tx(&tx, &run_id, effects)?;
+    tx.execute(
+        "UPDATE runs SET audit_rev = audit_rev + 1 WHERE id = ?1",
+        [&run_id],
+    )
+    .map_err(crate::Error::from)?;
+    tx.commit().map_err(crate::Error::from)?;
+    Ok(attempt_id)
+}
+
+fn nonterminal_attempt_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    phase: PhaseName,
+) -> std::result::Result<Option<PhaseAttemptRow>, PhaseError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT a.id, a.run_id, a.phase, a.ordinal, a.parent_attempt_id, a.caused_by_attempt_id,
+                    a.operation_kind, a.created_at
+             FROM phase_attempts a
+             WHERE a.run_id = ?1
+               AND a.phase = ?2
+               AND a.parent_attempt_id IS NULL
+               AND NOT EXISTS (
+                    SELECT 1 FROM phase_events e
+                    WHERE e.attempt_id = a.id AND e.kind = 'terminal'
+               )
+             ORDER BY a.ordinal DESC, a.id DESC
+             LIMIT 1",
+        )
+        .map_err(crate::Error::from)?;
+    let mut rows = stmt
+        .query(rusqlite::params![run_id, phase.as_str()])
+        .map_err(crate::Error::from)?;
+    match rows.next().map_err(crate::Error::from)? {
+        Some(row) => Ok(Some(map_attempt(row)?)),
+        None => Ok(None),
+    }
+}
+
+fn next_top_level_ordinal_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    phase: PhaseName,
+) -> std::result::Result<i64, PhaseError> {
+    let max: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(ordinal) FROM phase_attempts
+             WHERE run_id = ?1 AND phase = ?2 AND parent_attempt_id IS NULL",
+            rusqlite::params![run_id, phase.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(crate::Error::from)?;
+    Ok(max.unwrap_or(0) + 1)
+}
+
+fn next_event_seq_tx(tx: &Transaction<'_>, run_id: &str) -> std::result::Result<i64, PhaseError> {
+    let max: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(seq) FROM phase_events WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .map_err(crate::Error::from)?;
+    Ok(max.unwrap_or(0) + 1)
+}
+
+fn attempt_run_id_tx(
+    tx: &Transaction<'_>,
+    attempt: &AttemptId,
+) -> std::result::Result<String, PhaseError> {
+    match tx.query_row(
+        "SELECT run_id FROM phase_attempts WHERE id = ?1",
+        [attempt.as_str()],
+        |row| row.get(0),
+    ) {
+        Ok(run_id) => Ok(run_id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Err(PhaseError::UnknownAttempt),
+        Err(err) => Err(PhaseError::Storage(err.into())),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_event_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    attempt: &AttemptId,
+    seq: i64,
+    kind: PhaseEventKind,
+    outcome: Option<&str>,
+    cause: Option<&str>,
+    created_at: &str,
+) -> std::result::Result<(), PhaseError> {
+    let event_id = Ulid::new().to_string();
+    tx.execute(
+        "INSERT INTO phase_events (
+            id, run_id, attempt_id, seq, kind, outcome, cause, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            event_id,
+            run_id,
+            attempt.as_str(),
+            seq,
+            kind.as_str(),
+            outcome,
+            cause,
+            created_at,
+        ],
+    )
+    .map_err(crate::Error::from)?;
+    Ok(())
+}
+
+fn apply_run_effects_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    effects: RunEffects,
+) -> std::result::Result<(), PhaseError> {
+    let RunEffects {
+        status,
+        error,
+        approved_head,
+        steps,
+    } = effects;
+    if let Some(status) = status.as_deref() {
+        tx.execute(
+            "UPDATE runs SET status = ?1, error = ?2 WHERE id = ?3",
+            rusqlite::params![status, error, run_id],
+        )
+        .map_err(crate::Error::from)?;
+    }
+    if let Some(head) = approved_head.as_deref() {
+        tx.execute(
+            "UPDATE runs SET review_approved_head_sha = ?1 WHERE id = ?2",
+            rusqlite::params![head, run_id],
+        )
+        .map_err(crate::Error::from)?;
+    }
+    for StepEffect {
+        step,
+        status,
+        error,
+    } in steps
+    {
+        let id = Ulid::new().to_string();
+        tx.execute(
+            "INSERT INTO step_results (id, run_id, step, status, error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, run_id, step, status, error, now_secs()],
+        )
+        .map_err(crate::Error::from)?;
+    }
+    Ok(())
 }
 
 /// Phase attempts for a run, oldest first.

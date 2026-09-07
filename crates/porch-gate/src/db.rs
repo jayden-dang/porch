@@ -556,7 +556,7 @@ impl Db {
     /// # Panics
     ///
     /// Panics if the connection mutex is poisoned.
-    pub fn set_run_status(&self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
+    pub(crate) fn set_run_status(&self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex");
         conn.execute(
             "UPDATE runs SET status = ?1, error = ?2 WHERE id = ?3",
@@ -832,7 +832,9 @@ impl Db {
     /// # Panics
     ///
     /// Panics if the connection mutex is poisoned.
-    pub fn insert_step_result(
+    // Still called from in-crate tests; production callers move to the phase seam later.
+    #[allow(dead_code)]
+    pub(crate) fn insert_step_result(
         &self,
         run_id: &str,
         step: &str,
