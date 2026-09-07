@@ -2260,6 +2260,12 @@ fn agent_respond_inner(
         .ok_or_else(|| UsageOrFail::Fail("parked run has no worktree_dir".into()))?;
 
     let phase = parked_phase(&db, &run);
+    if phase == "unavailable" {
+        return Err(UsageOrFail::Fail(format!(
+            "parked run {} has no nonterminal phase attempt",
+            run.id
+        )));
+    }
 
     // Compose park MUST be branched before review Skip (skip continues deliver).
     if phase == "compose" {
@@ -2648,12 +2654,10 @@ fn parked_phase(db: &Db, run: &RunRow) -> String {
     if run.status != "parked" {
         return String::new();
     }
-    if let Ok(steps) = db.step_results_for_run(&run.id) {
-        if let Some(step) = steps.iter().rev().find(|s| s.status == "parked") {
-            return step.step.clone();
-        }
+    match porch_gate::phase_view_for_run(db, &run.id) {
+        Ok(Some(view)) => porch_gate::wire_phase_name(&view),
+        Ok(None) | Err(_) => "unavailable".into(),
     }
-    "review".into()
 }
 
 /// Fixer for rebase-parked runs: edit tip, then retry rebase and continue pipeline.

@@ -140,17 +140,15 @@ impl App {
         self.snapshot.status == "parked" && !self.working && self.note_editing.is_none()
     }
 
-    /// True when the parked step driving the run is `compose`.
+    /// True when the parked run's phase view is nested compose.
     #[must_use]
     pub fn compose_parked(&self) -> bool {
         self.snapshot.status == "parked"
             && self
                 .snapshot
-                .steps
-                .iter()
-                .rev()
-                .find(|s| s.status == "parked")
-                .is_some_and(|s| s.step == "compose")
+                .phase
+                .as_ref()
+                .is_some_and(|p| p.operation.as_deref() == Some("compose"))
     }
 
     /// Apply a fresh snapshot (e.g. after `stream_gap` + `get_run`).
@@ -917,6 +915,11 @@ mod tests {
             ],
             state_rev: 1,
             audit_available: true,
+            phase: Some(porch_gate::PhaseView {
+                phase: "review".into(),
+                ordinal: 1,
+                operation: None,
+            }),
         }
     }
 
@@ -924,6 +927,11 @@ mod tests {
         let mut snap = parked_snapshot();
         snap.pr_url = Some("https://example.com/pull/1".into());
         snap.findings = serde_json::json!([]);
+        snap.phase = Some(porch_gate::PhaseView {
+            phase: "deliver".into(),
+            ordinal: 1,
+            operation: Some("compose".into()),
+        });
         snap.steps = vec![
             porch_gate::StepSnapshot {
                 step: "intent".into(),

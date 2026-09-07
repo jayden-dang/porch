@@ -8,9 +8,10 @@ use assert_cmd::Command;
 use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
 use porch_gate::rounds;
-use porch_gate::{Db, kill_group, repo_id_for};
+use porch_gate::{Db, get_run, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
+use rusqlite::Connection;
 use tempfile::TempDir;
 
 fn git(work: &Path, args: &[&str]) {
@@ -819,4 +820,132 @@ fn interrupted_terminal_rolls_back_with_status_when_txn_fails() {
             .is_some(),
         "review must stay nonterminal when reconcile rolls back"
     );
+}
+
+#[test]
+fn parked_run_reports_phase_from_the_log() {
+    let s = setup_with_review_mode("blocking");
+    let run = park_review_run(&s, "feat-phase-snap-review");
+    let open = {
+        let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+        rounds::phase::nonterminal_attempt(&db, &run.id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .expect("review park leaves a nonterminal review attempt")
+    };
+
+    let snap = get_run(&s.home, &run.id).unwrap();
+    let phase = snap
+        .phase
+        .as_ref()
+        .expect("parked run with a nonterminal attempt must expose compact phase");
+    assert_eq!(phase.phase, "review");
+    assert_eq!(phase.ordinal, open.ordinal);
+    assert!(
+        phase.operation.is_none(),
+        "review park has no nested operation"
+    );
+
+    let out = agent_cmd(&s)
+        .args(["agent", "status", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["phase"], "review", "{status}");
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn parked_without_nonterminal_reports_phase_unavailable() {
+    let s = setup();
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let run = db
+        .insert_run(&repo_id, "feat-phase-unavailable", "deadbeef", None, None)
+        .unwrap();
+    Connection::open(s.home.join("state.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE runs SET status = 'parked', error = 'forced park without phase log' WHERE id = ?1",
+            [&run.id],
+        )
+        .unwrap();
+
+    let snap = get_run(&s.home, &run.id).unwrap();
+    assert_eq!(snap.status, "parked");
+    assert!(
+        snap.phase.is_none(),
+        "parked run with no nonterminal attempt must leave phase unavailable, got {:?}",
+        snap.phase
+    );
+
+    let out = agent_cmd(&s)
+        .args(["agent", "status", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_ne!(
+        status["phase"], "review",
+        "must not invent review when the log has no nonterminal: {status}"
+    );
+    assert_eq!(status["phase"], "unavailable", "{status}");
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn agent_status_keeps_shape_while_phase_comes_from_snapshot_field() {
+    let s = setup();
+    let run = park_compose_run(&s, "feat-phase-status-shape");
+
+    let snap = get_run(&s.home, &run.id).unwrap();
+    let phase = snap
+        .phase
+        .as_ref()
+        .expect("compose park must expose compact phase from the log");
+    assert_eq!(phase.phase, "deliver");
+    assert_eq!(phase.operation.as_deref(), Some("compose"));
+
+    let out = agent_cmd(&s)
+        .args(["agent", "status", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    for key in [
+        "run_id",
+        "repo_id",
+        "branch",
+        "status",
+        "phase",
+        "head_sha",
+        "base_sha",
+        "review_approved_head_sha",
+        "findings",
+        "assurance_record",
+    ] {
+        assert!(
+            status.get(key).is_some(),
+            "missing frozen key {key}: {status}"
+        );
+    }
+    assert_eq!(status["phase"], "compose", "{status}");
+    assert_eq!(status["status"], "parked");
+    assert!(
+        status.get("steps").is_none(),
+        "agent status must stay compact: {status}"
+    );
+    kill_daemon(&s.home);
 }

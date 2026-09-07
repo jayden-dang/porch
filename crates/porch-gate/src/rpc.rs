@@ -12,6 +12,9 @@ use crate::audit::{AuditDocument, build_audit};
 use crate::db::{Db, RunRow, StepResultRow};
 use crate::events::{Event, EventHub};
 use crate::home::socket_path;
+use crate::rounds::phase::{
+    self as phase, AttemptId, OperationKind, PhaseAttemptRow, PhaseEventKind, PhaseName,
+};
 use crate::rounds::{
     self, Applicability, AssuranceCompletion, FindingInstanceRecord, RequirementRow, RoundId,
 };
@@ -381,6 +384,15 @@ pub struct Response {
     pub id: u64,
 }
 
+/// Compact phase position derived server-side from `phase_events`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhaseView {
+    pub phase: String,
+    pub ordinal: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+}
+
 /// Full run snapshot returned by `get_run`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSnapshot {
@@ -402,6 +414,9 @@ pub struct RunSnapshot {
     pub state_rev: u64,
     #[serde(default)]
     pub audit_available: bool,
+    /// Nonterminal phase attempt, when the log has one; `None` when unavailable.
+    #[serde(default)]
+    pub phase: Option<PhaseView>,
 }
 
 /// One `step_results` row in a snapshot.
@@ -472,7 +487,67 @@ pub fn build_run_snapshot(
             .collect(),
         state_rev,
         audit_available: true,
+        phase: phase_view_for_run(db, &run.id)?,
     })
+}
+
+/// Compatibility wire name for a compact [`PhaseView`] (nested compose → `"compose"`).
+#[must_use]
+pub fn wire_phase_name(view: &PhaseView) -> String {
+    if view.operation.as_deref() == Some(OperationKind::Compose.as_str()) {
+        OperationKind::Compose.as_str().to_string()
+    } else {
+        view.phase.clone()
+    }
+}
+
+/// Current nonterminal phase position for `run_id`, if the log has one.
+///
+/// # Errors
+///
+/// Returns a storage error if the phase readers fail.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn phase_view_for_run(db: &Db, run_id: &str) -> Result<Option<PhaseView>> {
+    let mut chosen: Option<(PhaseAttemptRow, Option<OperationKind>)> = None;
+    for name in [
+        PhaseName::Intent,
+        PhaseName::Rebase,
+        PhaseName::Review,
+        PhaseName::Certify,
+        PhaseName::Deliver,
+    ] {
+        let Some(open) = phase::nonterminal_attempt(db, run_id, name)? else {
+            continue;
+        };
+        let operation = open_nested_operation(db, run_id, &open.id)?;
+        chosen = Some((open, operation));
+    }
+    Ok(chosen.map(|(open, operation)| PhaseView {
+        phase: open.phase.as_str().to_string(),
+        ordinal: open.ordinal,
+        operation: operation.map(|op| op.as_str().to_string()),
+    }))
+}
+
+fn open_nested_operation(
+    db: &Db,
+    run_id: &str,
+    parent: &AttemptId,
+) -> Result<Option<OperationKind>> {
+    let attempts = phase::attempts_for_run(db, run_id)?;
+    let events = phase::events_for_run(db, run_id)?;
+    Ok(attempts.into_iter().rev().find_map(|a| {
+        if a.parent_attempt_id.as_ref() != Some(parent) {
+            return None;
+        }
+        let terminal = events
+            .iter()
+            .any(|e| e.attempt_id == a.id && e.kind == PhaseEventKind::Terminal);
+        if terminal { None } else { a.operation_kind }
+    }))
 }
 
 fn rpc_call(home: &Path, method: &str, params: Option<serde_json::Value>) -> Result<Response> {
