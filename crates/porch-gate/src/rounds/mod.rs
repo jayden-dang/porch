@@ -38,7 +38,7 @@ use db::now_secs;
 pub(crate) use schema::migrate;
 
 /// Protocol schema version this binary records and understands.
-pub const PROTOCOL_SCHEMA_VERSION: i64 = 2;
+pub const PROTOCOL_SCHEMA_VERSION: i64 = 3;
 
 /// Max stale phase-2 attempts before `abandon_for_history_contention`.
 pub const STALE_REVISION_RETRIES: u32 = 3;

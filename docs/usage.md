@@ -331,3 +331,25 @@ authorization.
 
 **Downgrade** after new-format round rows exist is **unsupported**.
 
+## S. Upgrading porch (phase-event history)
+
+**Back up `$PORCH_HOME` before upgrading.** Finish parked and running work first, or lose it:
+the first open of a phase-events binary against an older `$PORCH_HOME` raises the
+**database-resident compatibility fence** to **protocol 3**. That transaction
+**terminalizes** every still-active (`pending` / `running` / `parked`) run with an explicit
+phase-events upgrade cause in `runs.error` and **clears undelivered**
+`review_approved_head_sha`. Those runs become `failed`. They are **not** still approvable —
+recover with `porch rerun --run-id <ULID>` (new run, new worktree, nothing carries forward).
+
+Pre-existing runs keep whatever history they already had. The upgrade **does not** invent
+phase attempts, ordinals, timestamps, or nesting for them; `porch audit` reports their phase
+slice as unavailable until a fresh run writes real phase events.
+
+The protocol-2 insert and approval triggers stay in force. Protocol 3 adds a status-update
+trigger beside them so an under-protocol writer cannot change `runs.status` either.
+
+**Rollback** to a pre-phase-events binary against a protocol-3 state root is **unsupported**.
+The fence refuses new runs, approvals, and status writes from a writer that does not
+understand protocol 3. Restore a backup of `$PORCH_HOME` taken before the upgrade if you must
+run an older binary.
+

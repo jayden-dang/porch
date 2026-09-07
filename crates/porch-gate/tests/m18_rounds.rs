@@ -19,7 +19,20 @@ use porch_gate::rounds::{
 use porch_gate::{Db, Error, RunExecutor, db_path, run_daemon, wait_for_health};
 use porch_git::GitDir;
 use rusqlite::Connection;
+use rusqlite::functions::FunctionFlags;
 use tempfile::TempDir;
+
+fn register_current_writer_protocol(conn: &Connection) {
+    conn.create_scalar_function(
+        "porch_writer_protocol",
+        0,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |_| Ok(rounds::PROTOCOL_SCHEMA_VERSION),
+    )
+    .unwrap();
+}
 
 fn seed_legacy_db(path: &Path) {
     let conn = Connection::open(path).unwrap();
@@ -65,6 +78,7 @@ fn seed_run(db: &Db, home: &Path) -> String {
 
 fn set_run_status_raw(home: &Path, run_id: &str, status: &str, error: Option<&str>) {
     let conn = Connection::open(db_path(home)).unwrap();
+    register_current_writer_protocol(&conn);
     conn.execute(
         "UPDATE runs SET status = ?1, error = ?2 WHERE id = ?3",
         rusqlite::params![status, error, run_id],
@@ -102,7 +116,7 @@ fn sample_bindings(inventory: &[u8]) -> RoundBindings {
         inventory_digest: digest,
         inventory_bytes: inventory.to_vec(),
         trusted_config_sha: "config".into(),
-        protocol_schema_version: 2,
+        protocol_schema_version: rounds::PROTOCOL_SCHEMA_VERSION,
         fingerprint_version: 1,
         intent_source: Some("flag".into()),
         context_elements: vec![intent.clone()],
@@ -226,7 +240,10 @@ fn open_round_commits_before_returning_id_and_allocates_ordinals() {
     assert_eq!(loaded.to_sha, "to");
     assert_eq!(loaded.inventory_digest, digest);
     assert_eq!(loaded.trusted_config_sha, "config");
-    assert_eq!(loaded.protocol_schema_version, 2);
+    assert_eq!(
+        loaded.protocol_schema_version,
+        rounds::PROTOCOL_SCHEMA_VERSION
+    );
     assert_eq!(loaded.fingerprint_version, 1);
 
     let producers = rounds::producers_for_round(&db, &first).unwrap();
@@ -1104,7 +1121,7 @@ fn bindings_for_producers(inventory: &[u8], producer_count: usize) -> RoundBindi
         inventory_digest: digest,
         inventory_bytes: inventory.to_vec(),
         trusted_config_sha: "config".into(),
-        protocol_schema_version: 2,
+        protocol_schema_version: rounds::PROTOCOL_SCHEMA_VERSION,
         fingerprint_version: 1,
         intent_source: Some("flag".into()),
         context_elements: vec![intent],
@@ -2340,11 +2357,11 @@ fn requirement_count(conn: &Connection, round_id: &str) -> i64 {
 }
 
 #[test]
-fn this_feature_records_protocol_two_and_leaves_legacy_rounds_untouched() {
+fn this_feature_records_current_protocol_and_leaves_legacy_rounds_untouched() {
     let home = TempDir::new().unwrap();
     let home = home.path();
     let db = fixture_db(home);
-    let inventory = b"inv-protocol-two\n";
+    let inventory = b"inv-protocol-current\n";
     let digest = floor_equiv_digest();
 
     let current_run = seed_run(&db, home);
@@ -2356,8 +2373,9 @@ fn this_feature_records_protocol_two_and_leaves_legacy_rounds_untouched() {
     .unwrap();
     let current = rounds::get_round(&db, &current_id).unwrap().unwrap();
     assert_eq!(
-        current.protocol_schema_version, 2,
-        "rounds opened by this feature must record protocol version 2"
+        current.protocol_schema_version,
+        rounds::PROTOCOL_SCHEMA_VERSION,
+        "rounds opened by this binary must record the current protocol version"
     );
 
     let legacy_run = {
@@ -2446,10 +2464,11 @@ fn a_round_above_the_understood_protocol_fails_closed() {
         inventory,
     );
 
+    let future = rounds::PROTOCOL_SCHEMA_VERSION + 1;
     let conn = Connection::open(db_path(home)).unwrap();
     conn.execute(
-        "UPDATE review_rounds SET protocol_schema_version = 3 WHERE id = ?1",
-        [round_id.as_str()],
+        "UPDATE review_rounds SET protocol_schema_version = ?1 WHERE id = ?2",
+        rusqlite::params![future, round_id.as_str()],
     )
     .unwrap();
 
@@ -2464,7 +2483,8 @@ fn a_round_above_the_understood_protocol_fails_closed() {
     };
     match err {
         Error::Other(msg) => assert!(
-            msg.contains("protocol") && (msg.contains('3') || msg.contains("understood")),
+            msg.contains("protocol")
+                && (msg.contains(&future.to_string()) || msg.contains("understood")),
             "unexpected fail-closed message: {msg}"
         ),
         other => panic!("expected a fail-closed error, got {other:?}"),
@@ -2808,6 +2828,42 @@ fn a_connection_without_the_writer_function_cannot_create_or_approve_a_run() {
     assert_eq!(sha.as_deref(), Some("approved-sha"));
 }
 
+#[test]
+fn a_connection_without_the_writer_function_cannot_update_run_status() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    drop(db);
+
+    let conn = Connection::open(db_path(home)).unwrap();
+    let status_before: String = conn
+        .query_row("SELECT status FROM runs WHERE id = ?1", [&run_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status_before, "pending");
+
+    let status_err = conn
+        .execute(
+            "UPDATE runs SET status = 'failed', error = 'sneak' WHERE id = ?1",
+            [&run_id],
+        )
+        .expect_err("an unregistered connection must not update run status");
+    let status_msg = status_err.to_string();
+    assert!(
+        status_msg.contains("porch_writer_protocol"),
+        "absence must fail closed on status, got {status_msg}"
+    );
+
+    let status_after: String = conn
+        .query_row("SELECT status FROM runs WHERE id = ?1", [&run_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status_after, "pending");
+}
+
 fn seed_active_legacy_runs(path: &Path) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
@@ -2925,8 +2981,8 @@ fn assert_legacy_runs_terminalized(db: &Db) {
         parked
             .error
             .as_deref()
-            .is_some_and(|e| e.contains("upgraded")),
-        "legacy active runs must name the upgrade, got {:?}",
+            .is_some_and(|e| { e.contains("upgraded") && e.contains("phase-events") }),
+        "legacy active runs must name the phase-events upgrade, got {:?}",
         parked.error
     );
     assert!(parked.review_approved_head_sha.is_none());
@@ -2964,7 +3020,11 @@ fn upgrading_the_state_root_is_atomic_and_idempotent() {
         writer_fence_installed(&conn),
         "upgrade must install the marker and both run triggers"
     );
-    assert_eq!(min_writer_protocol(&conn), 2);
+    assert!(
+        trigger_exists(&conn, "porch_runs_writer_status"),
+        "upgrade must also install the status writer trigger"
+    );
+    assert_eq!(min_writer_protocol(&conn), rounds::PROTOCOL_SCHEMA_VERSION);
     assert_legacy_runs_terminalized(&db);
 
     let live = db

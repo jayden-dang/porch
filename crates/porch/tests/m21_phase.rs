@@ -8,11 +8,140 @@ use assert_cmd::Command;
 use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
 use porch_gate::rounds;
-use porch_gate::{Db, build_audit, get_run, kill_group, repo_id_for};
+use porch_gate::{Db, build_audit, db_path, get_run, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
 use rusqlite::Connection;
+use rusqlite::functions::FunctionFlags;
 use tempfile::TempDir;
+
+fn register_current_writer_protocol(conn: &Connection) {
+    conn.create_scalar_function(
+        "porch_writer_protocol",
+        0,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |_| Ok(rounds::PROTOCOL_SCHEMA_VERSION),
+    )
+    .unwrap();
+}
+
+fn trigger_exists(conn: &Connection, name: &str) -> bool {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    count == 1
+}
+
+fn phase_row_counts(conn: &Connection, run_id: &str) -> (i64, i64) {
+    let attempts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM phase_attempts WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM phase_events WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (attempts, events)
+}
+
+fn seed_pre_fence_active_runs(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "
+        CREATE TABLE repos (
+            id TEXT PRIMARY KEY,
+            worktree_path TEXT NOT NULL,
+            bare_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            default_branch TEXT NOT NULL DEFAULT 'main'
+        );
+        CREATE TABLE runs (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            sha TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            review_approved_head_sha TEXT,
+            FOREIGN KEY(repo_id) REFERENCES repos(id)
+        );
+        INSERT INTO repos (id, worktree_path, bare_path, created_at, default_branch)
+        VALUES ('repo-legacy', '/tmp/wt', '/tmp/bare.git', '1', 'main');
+        INSERT INTO runs (id, repo_id, branch, sha, status, created_at, review_approved_head_sha)
+        VALUES
+          ('run-parked', 'repo-legacy', 'feat-parked', 'aaa', 'parked', '2', 'approved-before'),
+          ('run-pending', 'repo-legacy', 'feat-pending', 'bbb', 'pending', '3', NULL),
+          ('run-running', 'repo-legacy', 'feat-running', 'ccc', 'running', '4', NULL),
+          ('run-done', 'repo-legacy', 'feat-done', 'ddd', 'completed', '5', 'keep-me');
+        ",
+    )
+    .unwrap();
+}
+
+fn seed_protocol2_fenced_root(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    // Insert rows before installing triggers so seed writes need no writer function.
+    conn.execute_batch(
+        "
+        CREATE TABLE repos (
+            id TEXT PRIMARY KEY,
+            worktree_path TEXT NOT NULL,
+            bare_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            default_branch TEXT NOT NULL DEFAULT 'main'
+        );
+        CREATE TABLE runs (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            sha TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            review_approved_head_sha TEXT,
+            error TEXT,
+            FOREIGN KEY(repo_id) REFERENCES repos(id)
+        );
+        CREATE TABLE porch_state_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            min_writer_protocol INTEGER NOT NULL
+        );
+        INSERT INTO porch_state_meta (id, min_writer_protocol) VALUES (1, 2);
+        INSERT INTO repos (id, worktree_path, bare_path, created_at, default_branch)
+        VALUES ('repo-p2', '/tmp/wt', '/tmp/bare.git', '1', 'main');
+        INSERT INTO runs (id, repo_id, branch, sha, status, created_at, review_approved_head_sha)
+        VALUES
+          ('p2-parked', 'repo-p2', 'feat-parked', 'aaa', 'parked', '2', 'approved-before'),
+          ('p2-pending', 'repo-p2', 'feat-pending', 'bbb', 'pending', '3', NULL),
+          ('p2-running', 'repo-p2', 'feat-running', 'ccc', 'running', '4', NULL),
+          ('p2-done', 'repo-p2', 'feat-done', 'ddd', 'completed', '5', 'keep-me');
+        CREATE TRIGGER porch_runs_writer_insert
+        BEFORE INSERT ON runs
+        BEGIN
+            SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
+            WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
+        END;
+        CREATE TRIGGER porch_runs_writer_approve
+        BEFORE UPDATE OF review_approved_head_sha ON runs
+        BEGIN
+            SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
+            WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
+        END;
+        ",
+    )
+    .unwrap();
+}
 
 fn git(work: &Path, args: &[&str]) {
     let st = StdCommand::new("git")
@@ -867,13 +996,13 @@ fn parked_without_nonterminal_reports_phase_unavailable() {
     let run = db
         .insert_run(&repo_id, "feat-phase-unavailable", "deadbeef", None, None)
         .unwrap();
-    Connection::open(s.home.join("state.sqlite"))
-        .unwrap()
-        .execute(
-            "UPDATE runs SET status = 'parked', error = 'forced park without phase log' WHERE id = ?1",
-            [&run.id],
-        )
-        .unwrap();
+    let raw = Connection::open(s.home.join("state.sqlite")).unwrap();
+    register_current_writer_protocol(&raw);
+    raw.execute(
+        "UPDATE runs SET status = 'parked', error = 'forced park without phase log' WHERE id = ?1",
+        [&run.id],
+    )
+    .unwrap();
 
     let snap = get_run(&s.home, &run.id).unwrap();
     assert_eq!(snap.status, "parked");
@@ -1465,6 +1594,7 @@ fn porch_audit_tree_is_unambiguous_without_colour() {
     let unavail_id = run.id.clone();
     // Terminal status so the daemon executor does not mint phase events on pickup.
     let raw = Connection::open(home2.join("state.sqlite")).unwrap();
+    register_current_writer_protocol(&raw);
     raw.execute(
         "UPDATE runs SET status = 'failed', error = 'pre-phase fixture' WHERE id = ?1",
         [&unavail_id],
@@ -1536,4 +1666,136 @@ fn porch_audit_json_matches_agent_audit_bytes() {
         "porch audit --json must emit identical bytes to porch agent audit"
     );
     kill_daemon(&home);
+}
+
+#[test]
+fn upgrading_terminals_active_runs_with_phase_events_cause_and_no_phase_rows() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    std::fs::create_dir_all(home).unwrap();
+    let path = db_path(home);
+    seed_pre_fence_active_runs(&path);
+
+    let db = Db::open(&path).unwrap();
+    let conn = Connection::open(&path).unwrap();
+
+    assert_eq!(
+        rounds::PROTOCOL_SCHEMA_VERSION,
+        3,
+        "phase-events binary must record protocol 3"
+    );
+    let min: i64 = conn
+        .query_row(
+            "SELECT min_writer_protocol FROM porch_state_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(min, 3, "upgrade must raise the state-root minimum to 3");
+    assert!(
+        trigger_exists(&conn, "porch_runs_writer_status"),
+        "upgrade must install the status writer trigger"
+    );
+
+    for id in ["run-parked", "run-pending", "run-running"] {
+        let run = db.run_by_id(id).unwrap().unwrap();
+        assert_eq!(run.status, "failed", "{id} must be terminalized");
+        assert!(
+            run.error
+                .as_deref()
+                .is_some_and(|e| e.contains("phase-events") && e.contains("upgraded")),
+            "{id} must name the phase-events upgrade, got {:?}",
+            run.error
+        );
+        assert!(
+            run.review_approved_head_sha.is_none(),
+            "{id} must clear undelivered approval"
+        );
+        assert_eq!(
+            phase_row_counts(&conn, id),
+            (0, 0),
+            "{id} must not receive synthesized phase rows"
+        );
+    }
+
+    let done = db.run_by_id("run-done").unwrap().unwrap();
+    assert_eq!(done.status, "completed");
+    assert_eq!(done.review_approved_head_sha.as_deref(), Some("keep-me"));
+    assert_eq!(phase_row_counts(&conn, "run-done"), (0, 0));
+}
+
+#[test]
+fn upgrade_fail_forward_completes_on_fresh_and_already_fenced_roots() {
+    {
+        let home = TempDir::new().unwrap();
+        let home = home.path();
+        std::fs::create_dir_all(home).unwrap();
+        let path = db_path(home);
+        seed_pre_fence_active_runs(&path);
+
+        let db = Db::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            trigger_exists(&conn, "porch_runs_writer_status"),
+            "fresh upgrade must install the status trigger after its own writes"
+        );
+        assert_eq!(
+            db.run_by_id("run-pending").unwrap().unwrap().status,
+            "failed"
+        );
+        assert_eq!(
+            db.run_by_id("run-running").unwrap().unwrap().status,
+            "failed"
+        );
+        assert_eq!(
+            db.run_by_id("run-parked").unwrap().unwrap().status,
+            "failed"
+        );
+    }
+
+    {
+        let home = TempDir::new().unwrap();
+        let home = home.path();
+        std::fs::create_dir_all(home).unwrap();
+        let path = db_path(home);
+        seed_protocol2_fenced_root(&path);
+
+        let db = Db::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let min: i64 = conn
+            .query_row(
+                "SELECT min_writer_protocol FROM porch_state_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(min, 3);
+        assert!(
+            trigger_exists(&conn, "porch_runs_writer_insert"),
+            "protocol-2 insert trigger must remain"
+        );
+        assert!(
+            trigger_exists(&conn, "porch_runs_writer_approve"),
+            "protocol-2 approve trigger must remain"
+        );
+        assert!(
+            trigger_exists(&conn, "porch_runs_writer_status"),
+            "already-fenced upgrade must add the status trigger without aborting fail-forward"
+        );
+        for id in ["p2-parked", "p2-pending", "p2-running"] {
+            let run = db.run_by_id(id).unwrap().unwrap();
+            assert_eq!(run.status, "failed", "{id}");
+            assert!(
+                run.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("phase-events")),
+                "{id} error={:?}",
+                run.error
+            );
+            assert_eq!(phase_row_counts(&conn, id), (0, 0));
+        }
+        let done = db.run_by_id("p2-done").unwrap().unwrap();
+        assert_eq!(done.status, "completed");
+        assert_eq!(done.review_approved_head_sha.as_deref(), Some("keep-me"));
+    }
 }

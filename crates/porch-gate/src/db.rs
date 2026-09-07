@@ -1034,52 +1034,83 @@ fn writer_fence_present(conn: &Connection) -> Result<bool> {
     Ok(n > 0)
 }
 
-fn install_writer_fence(conn: &Connection) -> Result<()> {
-    if writer_fence_present(conn)? {
-        return Ok(());
-    }
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    if writer_fence_present(&tx)? {
-        tx.commit()?;
-        return Ok(());
-    }
-    tx.execute_batch(
+fn install_status_writer_trigger(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS porch_state_meta (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            min_writer_protocol INTEGER NOT NULL
-        );
-        CREATE TRIGGER IF NOT EXISTS porch_runs_writer_insert
-        BEFORE INSERT ON runs
-        BEGIN
-            SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
-            WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
-        END;
-        CREATE TRIGGER IF NOT EXISTS porch_runs_writer_approve
-        BEFORE UPDATE OF review_approved_head_sha ON runs
+        CREATE TRIGGER IF NOT EXISTS porch_runs_writer_status
+        BEFORE UPDATE OF status ON runs
         BEGIN
             SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
             WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
         END;
         ",
     )?;
-    tx.execute(
-        "INSERT OR IGNORE INTO porch_state_meta (id, min_writer_protocol) VALUES (1, ?1)",
-        [crate::rounds::PROTOCOL_SCHEMA_VERSION],
-    )?;
-    tx.execute(
+    Ok(())
+}
+
+fn fail_forward_active_runs_for_phase_upgrade(conn: &Connection) -> Result<()> {
+    conn.execute(
         "UPDATE runs
          SET status = 'failed',
-             error = 'state root upgraded to the mandatory-floor regime; start a fresh run',
+             error = 'state root upgraded to the phase-events regime; start a fresh run',
              review_approved_head_sha = NULL
-         WHERE status IN ('pending', 'running', 'parked')
-           AND NOT EXISTS (
-               SELECT 1 FROM review_rounds
-               WHERE review_rounds.run_id = runs.id
-                 AND review_rounds.protocol_schema_version >= ?1
-           )",
-        [crate::rounds::PROTOCOL_SCHEMA_VERSION],
+         WHERE status IN ('pending', 'running', 'parked')",
+        [],
     )?;
+    Ok(())
+}
+
+fn install_writer_fence(conn: &Connection) -> Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if !writer_fence_present(&tx)? {
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS porch_state_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                min_writer_protocol INTEGER NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS porch_runs_writer_insert
+            BEFORE INSERT ON runs
+            BEGIN
+                SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
+                WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
+            END;
+            CREATE TRIGGER IF NOT EXISTS porch_runs_writer_approve
+            BEFORE UPDATE OF review_approved_head_sha ON runs
+            BEGIN
+                SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
+                WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
+            END;
+            ",
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO porch_state_meta (id, min_writer_protocol) VALUES (1, ?1)",
+            [crate::rounds::PROTOCOL_SCHEMA_VERSION],
+        )?;
+        // Status trigger must be created after fail-forward writes in this transaction.
+        fail_forward_active_runs_for_phase_upgrade(&tx)?;
+        install_status_writer_trigger(&tx)?;
+        tx.commit()?;
+        return Ok(());
+    }
+
+    let min: i64 = tx.query_row(
+        "SELECT min_writer_protocol FROM porch_state_meta WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if min < crate::rounds::PROTOCOL_SCHEMA_VERSION {
+        tx.execute(
+            "UPDATE porch_state_meta SET min_writer_protocol = ?1 WHERE id = 1",
+            [crate::rounds::PROTOCOL_SCHEMA_VERSION],
+        )?;
+        fail_forward_active_runs_for_phase_upgrade(&tx)?;
+        install_status_writer_trigger(&tx)?;
+        tx.commit()?;
+        return Ok(());
+    }
+
+    install_status_writer_trigger(&tx)?;
     tx.commit()?;
     Ok(())
 }
