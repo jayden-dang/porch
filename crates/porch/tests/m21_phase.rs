@@ -8,7 +8,7 @@ use assert_cmd::Command;
 use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
 use porch_gate::rounds;
-use porch_gate::{Db, get_run, kill_group, repo_id_for};
+use porch_gate::{Db, build_audit, get_run, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
 use rusqlite::Connection;
@@ -1099,4 +1099,289 @@ fn kill_between_repair_count_and_finish_never_exceeds_budget_after_restart() {
         .filter(|a| a.operation_kind == Some(rounds::phase::OperationKind::DeliverRepair))
         .count();
     assert_eq!(repair_starts, 3);
+}
+
+fn seed_deliver_with_open_compose(home: &Path) -> (Db, String) {
+    std::fs::create_dir_all(home).unwrap();
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    db.upsert_repo("repo1", home, &home.join("bare.git"), "main")
+        .unwrap();
+    let run = db
+        .insert_run("repo1", "feat-audit-tree", "deadbeef", None, None)
+        .unwrap();
+    let deliver = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run.id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects {
+            status: Some("parked".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .unwrap();
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: deliver,
+            kind: rounds::phase::OperationKind::Compose,
+        },
+        rounds::RunEffects::none(),
+    )
+    .unwrap();
+    (db, run.id)
+}
+
+#[test]
+fn audit_phase_tree_names_event_source_and_nests_operations() {
+    let tmp = TempDir::new().unwrap();
+    let (db, run_id) = seed_deliver_with_open_compose(tmp.path());
+
+    let doc = build_audit(&db, &run_id).unwrap();
+    assert_eq!(doc.schema_version, 2);
+    assert_eq!(doc.phase.kind, "phase_events");
+    assert_eq!(
+        doc.phase.attempts.len(),
+        1,
+        "top-level roots only: {:?}",
+        doc.phase.attempts
+    );
+    let deliver = &doc.phase.attempts[0];
+    assert_eq!(deliver.phase, "deliver");
+    assert_eq!(deliver.ordinal, 1);
+    assert!(deliver.operation.is_none());
+    assert!(deliver.parent_id.is_none());
+    assert!(
+        deliver.terminal.is_none(),
+        "deliver stays nonterminal while compose is open"
+    );
+    assert_eq!(deliver.children.len(), 1, "compose nested under deliver");
+    let compose = &deliver.children[0];
+    assert_eq!(compose.phase, "deliver");
+    assert_eq!(compose.operation.as_deref(), Some("compose"));
+    assert_eq!(compose.parent_id.as_deref(), Some(deliver.id.as_str()));
+    assert!(compose.children.is_empty());
+}
+
+#[test]
+fn audit_phase_without_events_is_explicitly_unavailable() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home).unwrap();
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    db.upsert_repo("repo1", home, &home.join("bare.git"), "main")
+        .unwrap();
+    let run = db
+        .insert_run("repo1", "feat-audit-unavailable", "deadbeef", None, None)
+        .unwrap();
+    // Compatibility step_results alone must not synthesize a phase tree.
+    let raw = Connection::open(home.join("state.sqlite")).unwrap();
+    raw.execute(
+        "INSERT INTO step_results (id, run_id, step, status, error, created_at)
+         VALUES ('s1', ?1, 'review', 'completed', NULL, '1')",
+        [&run.id],
+    )
+    .unwrap();
+    drop(raw);
+
+    let doc = build_audit(&db, &run.id).unwrap();
+    assert_eq!(doc.schema_version, 2);
+    assert_eq!(doc.phase.kind, "unavailable");
+    assert!(
+        doc.phase.attempts.is_empty(),
+        "unavailable must not invent attempts: {:?}",
+        doc.phase.attempts
+    );
+    assert!(
+        doc.phase.steps.is_empty(),
+        "unavailable must not invent steps: {:?}",
+        doc.phase.steps
+    );
+}
+
+#[test]
+fn audit_phase_steps_rebuild_from_terminal_and_evidence_events() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home).unwrap();
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    db.upsert_repo("repo1", home, &home.join("bare.git"), "main")
+        .unwrap();
+    let run = db
+        .insert_run("repo1", "feat-audit-steps", "deadbeef", None, None)
+        .unwrap();
+
+    let review = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run.id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .unwrap();
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Evidence {
+            attempt: review.clone(),
+            cause: "AllowlistFailed".into(),
+        },
+        rounds::RunEffects {
+            status: None,
+            error: None,
+            approved_head: None,
+            steps: vec![rounds::StepEffect {
+                step: "review".into(),
+                status: "failed".into(),
+                error: Some("AllowlistFailed".into()),
+            }],
+        },
+    )
+    .unwrap();
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Terminal {
+            attempt: review,
+            outcome: "completed".into(),
+            cause: Some("operator_approve".into()),
+        },
+        rounds::RunEffects {
+            status: Some("completed".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![rounds::StepEffect {
+                step: "review".into(),
+                status: "completed".into(),
+                error: Some("operator_approve".into()),
+            }],
+        },
+    )
+    .unwrap();
+
+    let doc = build_audit(&db, &run.id).unwrap();
+    assert_eq!(doc.phase.kind, "phase_events");
+    assert_eq!(
+        doc.phase.steps,
+        vec![
+            porch_gate::AuditStep {
+                step: "review".into(),
+                status: "evidence".into(),
+                error: Some("AllowlistFailed".into()),
+            },
+            porch_gate::AuditStep {
+                step: "review".into(),
+                status: "completed".into(),
+                error: Some("operator_approve".into()),
+            },
+        ],
+        "steps project terminal/evidence events in seq order"
+    );
+}
+
+#[test]
+fn active_run_audit_is_partial_as_of_watermark() {
+    let tmp = TempDir::new().unwrap();
+    let (db, run_id) = seed_deliver_with_open_compose(tmp.path());
+
+    let doc = build_audit(&db, &run_id).unwrap();
+    assert_eq!(doc.run_status, "parked");
+    assert_eq!(
+        doc.completeness, "as_of",
+        "active run must be labelled partial as-of its watermark"
+    );
+    assert!(
+        doc.watermark.audit_rev >= 0,
+        "as-of document carries durable audit_rev"
+    );
+    assert_eq!(doc.phase.kind, "phase_events");
+}
+
+#[test]
+fn audit_build_for_200_phase_events_is_fast_and_index_backed() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home).unwrap();
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    db.upsert_repo("repo1", home, &home.join("bare.git"), "main")
+        .unwrap();
+    let run = db
+        .insert_run("repo1", "feat-audit-perf", "deadbeef", None, None)
+        .unwrap();
+
+    // Deliver start + 100 nested start/terminal pairs ≥ 200 phase events.
+    let deliver = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run.id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .unwrap();
+    for i in 0..100 {
+        let nested = rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::NestedStart {
+                parent: deliver.clone(),
+                kind: rounds::phase::OperationKind::DeliverRepair,
+            },
+            rounds::RunEffects::none(),
+        )
+        .unwrap();
+        rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::NestedTerminal {
+                attempt: nested,
+                outcome: "completed".into(),
+                cause: Some(format!("seed {i}")),
+            },
+            rounds::RunEffects::none(),
+        )
+        .unwrap();
+    }
+    let event_count = rounds::phase::events_for_run(&db, &run.id).unwrap().len();
+    assert!(
+        event_count >= 200,
+        "need ≥200 phase events for the latency target, got {event_count}"
+    );
+
+    // Warm the page cache, then measure.
+    let _ = build_audit(&db, &run.id).unwrap();
+    let start = Instant::now();
+    let doc = build_audit(&db, &run.id).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(doc.phase.kind, "phase_events");
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "build_audit for {event_count} events took {elapsed:?}, want <100ms"
+    );
+
+    let raw = Connection::open(home.join("state.sqlite")).unwrap();
+    let mut stmt = raw
+        .prepare("EXPLAIN QUERY PLAN SELECT id, run_id, attempt_id, seq, kind, outcome, cause, created_at FROM phase_events WHERE run_id = ?1 ORDER BY seq, id")
+        .unwrap();
+    let plan: Vec<String> = stmt
+        .query_map([&run.id], |row| row.get::<_, String>(3))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let plan_text = plan.join(" | ");
+    assert!(
+        plan_text.contains("phase_events_run")
+            || plan_text.to_ascii_lowercase().contains("using index"),
+        "phase_events query must be index-backed, plan={plan_text:?}"
+    );
 }

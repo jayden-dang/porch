@@ -1438,7 +1438,7 @@ fn audit_snapshot_includes_events_instances_and_related_occurrences() {
     assert_eq!(second_instances[0].fingerprint_version, first_fp_ver);
 
     let doc = build_audit(&db, &run.id).unwrap();
-    assert_eq!(doc.schema_version, 1);
+    assert_eq!(doc.schema_version, 2);
     assert_eq!(doc.run_id, run.id);
     assert!(
         doc.rounds.len() >= 2,
@@ -1534,10 +1534,14 @@ fn parked_audit_is_as_of_with_audit_rev_watermark_and_inferred_phase() {
         .unwrap();
     assert_eq!(doc.watermark.audit_rev, audit_rev);
     assert_eq!(doc.watermark.review_history_revision, history_rev);
-    assert_eq!(doc.phase.kind, "step_results_inferred");
+    assert_eq!(doc.phase.kind, "phase_events");
+    assert!(
+        !doc.phase.attempts.is_empty(),
+        "parked run with phase log must expose an attempt tree"
+    );
     assert!(
         !doc.phase.steps.is_empty(),
-        "inferred phase must copy durable step_results"
+        "phase slice steps rebuild from durable phase events"
     );
 
     kill_daemon(&home);

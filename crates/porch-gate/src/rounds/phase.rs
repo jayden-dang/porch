@@ -721,6 +721,18 @@ fn apply_run_effects_tx(
 /// Panics if the database mutex is poisoned.
 pub fn attempts_for_run(db: &Db, run_id: &str) -> Result<Vec<PhaseAttemptRow>> {
     let conn = db.conn();
+    attempts_for_run_conn(&conn, run_id)
+}
+
+/// Phase attempts for a run on an open connection, oldest first.
+///
+/// # Errors
+///
+/// Returns a storage error if the query fails.
+pub fn attempts_for_run_conn(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<Vec<PhaseAttemptRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
                 operation_kind, created_at
@@ -747,6 +759,18 @@ pub fn attempts_for_run(db: &Db, run_id: &str) -> Result<Vec<PhaseAttemptRow>> {
 /// Panics if the database mutex is poisoned.
 pub fn events_for_run(db: &Db, run_id: &str) -> Result<Vec<PhaseEventRow>> {
     let conn = db.conn();
+    events_for_run_conn(&conn, run_id)
+}
+
+/// Phase events for a run on an open connection, in sequence order.
+///
+/// # Errors
+///
+/// Returns a storage error if the query fails.
+pub fn events_for_run_conn(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<Vec<PhaseEventRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, run_id, attempt_id, seq, kind, outcome, cause, created_at
          FROM phase_events
