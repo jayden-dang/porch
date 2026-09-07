@@ -1,7 +1,7 @@
 # Design: Phase-event history
 
 Feature code: PHASE
-Status: Approved
+Status: In-progress
 Date: 2026-09-07
 Requirements: ./requirements.md
 

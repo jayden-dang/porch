@@ -1,7 +1,7 @@
 # Requirements: Phase-event history
 
 Feature code: PHASE
-Status: Approved
+Status: In-progress
 Date: 2026-09-07
 
 Roadmap item: ROAD-5 (MILE-2 — Auditable assurance record). Serves GOAL-2, whose

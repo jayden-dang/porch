@@ -1,9 +1,9 @@
 # Tasks: Phase-event history
 
 Feature code: PHASE
-Status: Approved
+Status: In-progress
 Date: 2026-09-07
-Execution-mode: unset
+Execution-mode: continuous
 Requirements: ./requirements.md
 Design: ./design.md
 
