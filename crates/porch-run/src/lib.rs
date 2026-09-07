@@ -3132,7 +3132,13 @@ fn persist_standing_consent_approve(
             error: Some("approved remaining after --yes".into()),
         }],
     };
-    match persist_authority_with_run_effects(db, plan, effects, None) {
+    let phase = Some(review_phase_terminal(
+        db,
+        &run.id,
+        "completed",
+        Some("approved remaining after --yes"),
+    )?);
+    match persist_authority_with_run_effects(db, plan, effects, phase) {
         Ok(_) => Ok(()),
         Err(AuthorityError::Stale) => {
             tracing::warn!(

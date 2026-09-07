@@ -5,6 +5,7 @@ use std::process::Command as StdCommand;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
 use porch_gate::rounds;
 use porch_gate::{Db, kill_group, repo_id_for};
@@ -114,6 +115,47 @@ esac
     path
 }
 
+fn install_fake_fixer(bin_dir: &Path) -> PathBuf {
+    let path = bin_dir.join("fake-fixer");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+set -e
+PROMPT=""
+FINDINGS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prompt-file) PROMPT="$2"; shift 2 ;;
+    --findings-file) FINDINGS="$2"; shift 2 ;;
+    --session-id) shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -z "$PROMPT" ] || [ ! -f "$PROMPT" ]; then
+  echo "prompt file missing" >&2
+  exit 1
+fi
+if [ -z "$FINDINGS" ] || [ ! -f "$FINDINGS" ]; then
+  echo "findings file missing" >&2
+  exit 1
+fi
+MODE="${PORCH_FAKE_FIXER_MODE:-noop}"
+case "$MODE" in
+  noop)
+    printf '{"summary":"noop","session_id":"sess-1"}\n'
+    ;;
+  *)
+    echo "unknown PORCH_FAKE_FIXER_MODE=$MODE" >&2
+    exit 1
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    chmod_755(&path);
+    path
+}
+
 #[allow(clippy::too_many_lines)]
 fn install_fake_gh(bin_dir: &Path) -> PathBuf {
     let path = bin_dir.join("fake-gh");
@@ -211,6 +253,7 @@ struct Setup {
     work: PathBuf,
     home: PathBuf,
     fake_review: PathBuf,
+    fake_fixer: PathBuf,
     fake_gh: PathBuf,
     path: String,
     review_mode: String,
@@ -230,6 +273,7 @@ fn setup_with_review_mode(review_mode: &str) -> Setup {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&bin_dir).unwrap();
     let fake_review = install_fake_review(&bin_dir);
+    let fake_fixer = install_fake_fixer(&bin_dir);
     let fake_gh = install_fake_gh(&bin_dir);
     init_bare(&origin).unwrap();
     let seed = root.join("seed");
@@ -264,8 +308,10 @@ fn setup_with_review_mode(review_mode: &str) -> Setup {
         .current_dir(&work)
         .env("PORCH_HOME", &home)
         .env(REVIEW_BIN_ENV, &fake_review)
+        .env(FIXER_BIN_ENV, &fake_fixer)
         .env(GH_BIN_ENV, &fake_gh)
         .env("PORCH_FAKE_REVIEW_MODE", review_mode)
+        .env("PORCH_FAKE_FIXER_MODE", "noop")
         .env("PORCH_FAKE_GH_MODE", "ok")
         .env("PATH", &path)
         .arg("init")
@@ -278,11 +324,14 @@ fn setup_with_review_mode(review_mode: &str) -> Setup {
         &home,
         &[
             (REVIEW_BIN_ENV, fake_review.as_os_str()),
+            (FIXER_BIN_ENV, fake_fixer.as_os_str()),
             (GH_BIN_ENV, fake_gh.as_os_str()),
             ("PORCH_FAKE_REVIEW_MODE", review_mode.as_ref()),
+            ("PORCH_FAKE_FIXER_MODE", "noop".as_ref()),
             ("PORCH_FAKE_GH_MODE", "ok".as_ref()),
             ("PATH", path.as_ref()),
             ("PORCH_REVIEW_TIMEOUT_SECS", "10".as_ref()),
+            ("PORCH_FIXER_TIMEOUT_SECS", "10".as_ref()),
             ("PORCH_GH_TIMEOUT_SECS", "10".as_ref()),
             ("PORCH_DELIVER_CHECK_TIMEOUT_SECS", "3".as_ref()),
             ("PORCH_DELIVER_CHECK_POLL_SECS", "1".as_ref()),
@@ -295,6 +344,7 @@ fn setup_with_review_mode(review_mode: &str) -> Setup {
         work,
         home,
         fake_review,
+        fake_fixer,
         fake_gh,
         path,
         review_mode: review_mode.to_string(),
@@ -306,8 +356,10 @@ fn push_feat(s: &Setup, branch: &str, intent: Option<&str>) {
     cmd.current_dir(&s.work)
         .env("PORCH_HOME", &s.home)
         .env(REVIEW_BIN_ENV, &s.fake_review)
+        .env(FIXER_BIN_ENV, &s.fake_fixer)
         .env(GH_BIN_ENV, &s.fake_gh)
         .env("PORCH_FAKE_REVIEW_MODE", &s.review_mode)
+        .env("PORCH_FAKE_FIXER_MODE", "noop")
         .env("PORCH_FAKE_GH_MODE", "ok")
         .env("PATH", &s.path);
     if let Some(intent) = intent {
@@ -335,9 +387,13 @@ fn agent_cmd(s: &Setup) -> Command {
     cmd.current_dir(&s.work)
         .env("PORCH_HOME", &s.home)
         .env(REVIEW_BIN_ENV, &s.fake_review)
+        .env(FIXER_BIN_ENV, &s.fake_fixer)
         .env(GH_BIN_ENV, &s.fake_gh)
         .env("PORCH_FAKE_REVIEW_MODE", &s.review_mode)
+        .env("PORCH_FAKE_FIXER_MODE", "noop")
         .env("PORCH_FAKE_GH_MODE", "ok")
+        .env("PORCH_REVIEW_TIMEOUT_SECS", "20")
+        .env("PORCH_FIXER_TIMEOUT_SECS", "20")
         .env("PATH", &s.path);
     cmd
 }
@@ -583,6 +639,46 @@ fn review_park_abort_terminals_review_attempt_beside_cancelled_status() {
             .unwrap()
             .is_none(),
         "review must not stay open after abort"
+    );
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn standing_consent_yes_terminals_review_attempt_beside_status() {
+    let s = setup_with_review_mode("blocking");
+    let run = park_review_run(&s, "feat-phase-standing-yes");
+    agent_cmd(&s)
+        .args(["agent", "respond", "fix", "--yes", "--run-id", &run.id])
+        .assert()
+        .success();
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert!(
+        run.status == "parked" || run.status == "completed",
+        "standing consent should leave parked compose or completed: {run:?}"
+    );
+    assert!(run.review_approved_head_sha.is_some());
+
+    let events = rounds::phase::events_for_run(&db, &run.id).unwrap();
+    let attempts = rounds::phase::attempts_for_run(&db, &run.id).unwrap();
+    let review = attempts
+        .iter()
+        .find(|a| a.phase == rounds::phase::PhaseName::Review && a.parent_attempt_id.is_none())
+        .expect("review attempt");
+    assert!(
+        events.iter().any(|e| {
+            e.attempt_id == review.id
+                && e.kind == rounds::phase::PhaseEventKind::Terminal
+                && e.outcome.as_deref() == Some("completed")
+        }),
+        "standing consent --yes must terminal the review attempt beside status: events={events:?}"
+    );
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run.id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_none(),
+        "review must not stay open after standing consent --yes"
     );
     kill_daemon(&s.home);
 }
