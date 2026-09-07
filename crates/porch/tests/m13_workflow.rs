@@ -418,6 +418,7 @@ fn rebase_conflict_parks_with_phase_rebase() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // end-to-end rebase park → fix → continue + disposition guards
 fn rebase_park_fix_rewrites_tip_and_continues() {
     let h = setup_harness();
 

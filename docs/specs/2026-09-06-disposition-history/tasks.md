@@ -5,7 +5,7 @@
 > `Execution-mode:`.
 
 Feature code: DISPO
-Status: Approved
+Status: Implemented
 Date: 2026-09-06
 Execution-mode: continuous
 Max-concurrency: auto
@@ -65,13 +65,13 @@ Retrieval: `cluster(DISPO)` has empty OWNS until this file exists (coverage `wit
 
 **Depends-on:** none
 
-- [ ] Test: insert `review_approved` with context members; `finding_instances` row bytes unchanged.
-- [ ] Test: `expected_round_id` or `live_head` ≠ stored `to_sha`/`head_sha` → `AuthorityStale`, no row.
-- [ ] Test: modern empty instance list still inserts the event with zero members; legacy abort uses `identity_unavailable=1` and `review_round_id` NULL.
-- [ ] Test: `fN` is never stored on members (ULIDs only).
-- [ ] Run `cargo test -p porch-gate --test m18_rounds` — expect missing table/API.
-- [ ] Implement DDL, `persist_authority`, bump `audit_rev` on persist and on `finalize_round` / `close_interrupted`.
-- [ ] Run tests; expect pass. Commit: `feat(porch-gate): persist append-only authority events`
+- [x] Test: insert `review_approved` with context members; `finding_instances` row bytes unchanged.
+- [x] Test: `expected_round_id` or `live_head` ≠ stored `to_sha`/`head_sha` → `AuthorityStale`, no row.
+- [x] Test: modern empty instance list still inserts the event with zero members; legacy abort uses `identity_unavailable=1` and `review_round_id` NULL.
+- [x] Test: `fN` is never stored on members (ULIDs only).
+- [x] Run `cargo test -p porch-gate --test m18_rounds` — expect missing table/API.
+- [x] Implement DDL, `persist_authority`, bump `audit_rev` on persist and on `finalize_round` / `close_interrupted`.
+- [x] Run tests; expect pass. Commit: `feat(porch-gate): persist append-only authority events`
 
 _Requirements: DISPO-1.1, DISPO-1.2, DISPO-1.3, DISPO-1.5, DISPO-1.7, DISPO-1.8, DISPO-2.1, DISPO-2.2, DISPO-2.5, DISPO-2.6, DISPO-3.1, DISPO-3.3, DISPO-3.4, DISPO-3.7, DISPO-5.1, DISPO-5.2, DISPO-5.4, DISPO-5.7, DISPO-7.1, DISPO-8.1_
 
@@ -89,11 +89,11 @@ _Requirements: DISPO-1.1, DISPO-1.2, DISPO-1.3, DISPO-1.5, DISPO-1.7, DISPO-1.8,
 
 **Depends-on:** Task 1
 
-- [ ] Test: abort plan + `cancelled` status commit together; injected write failure leaves parked + no event.
-- [ ] Test: approve plan writes `review_approved_head_sha` and review `completed` step in the same txn as the event.
-- [ ] Run `cargo test -p porch-gate --test m18_rounds` — expect missing helper.
-- [ ] Implement `persist_authority_with_run_effects` SQL on the same `tx`.
-- [ ] Run tests; expect pass. Commit: `feat(porch-gate): commit authority events with run effects`
+- [x] Test: abort plan + `cancelled` status commit together; injected write failure leaves parked + no event.
+- [x] Test: approve plan writes `review_approved_head_sha` and review `completed` step in the same txn as the event.
+- [x] Run `cargo test -p porch-gate --test m18_rounds` — expect missing helper.
+- [x] Implement `persist_authority_with_run_effects` SQL on the same `tx`.
+- [x] Run tests; expect pass. Commit: `feat(porch-gate): commit authority events with run effects`
 
 _Requirements: DISPO-5.5, DISPO-7.3_
 
@@ -111,11 +111,11 @@ _Requirements: DISPO-5.5, DISPO-7.3_
 
 **Depends-on:** Task 2
 
-- [ ] Test: approve writes one `review_approved` with every instance as `context`, sets approved HEAD, still certifies.
-- [ ] Test: skip writes `review_skipped`, no approved HEAD, certify/deliver skipped.
-- [ ] Test: HEAD moved after park → stale, still parked, no event.
-- [ ] Run `cargo test -p porch --test m3_review --test m20_dispo` — expect missing events.
-- [ ] Wire approve/skip through the helper. Commit: `feat(porch-run): record bulk approve and skip events`
+- [x] Test: approve writes one `review_approved` with every instance as `context`, sets approved HEAD, still certifies.
+- [x] Test: skip writes `review_skipped`, no approved HEAD, certify/deliver skipped.
+- [x] Test: HEAD moved after park → stale, still parked, no event.
+- [x] Run `cargo test -p porch --test m3_review --test m20_dispo` — expect missing events.
+- [x] Wire approve/skip through the helper. Commit: `feat(porch-run): record bulk approve and skip events`
 
 _Requirements: DISPO-2.3, DISPO-2.4, DISPO-8.3, DISPO-8.9_
 
@@ -133,11 +133,11 @@ _Requirements: DISPO-2.3, DISPO-2.4, DISPO-8.3, DISPO-8.9_
 
 **Depends-on:** Task 1
 
-- [ ] Test: `--findings` / default blocking freeze `target` ULIDs; no `fN` on members.
-- [ ] Test: empty selection still usage-exits and inserts no event.
-- [ ] Test: event row exists before fixer binary is invoked; round/HEAD drift does not spawn fixer.
-- [ ] Run `cargo test -p porch --test m4_fix --test m20_dispo` — expect missing `fix_requested`.
-- [ ] Persist then spawn. Commit: `feat(porch-run): persist fix_requested before fixer spawn`
+- [x] Test: `--findings` / default blocking freeze `target` ULIDs; no `fN` on members.
+- [x] Test: empty selection still usage-exits and inserts no event.
+- [x] Test: event row exists before fixer binary is invoked; round/HEAD drift does not spawn fixer.
+- [x] Run `cargo test -p porch --test m4_fix --test m20_dispo` — expect missing `fix_requested`.
+- [x] Persist then spawn. Commit: `feat(porch-run): persist fix_requested before fixer spawn`
 
 _Requirements: DISPO-3.2, DISPO-3.5, DISPO-3.6, DISPO-7.2_
 
@@ -155,12 +155,12 @@ _Requirements: DISPO-3.2, DISPO-3.5, DISPO-3.6, DISPO-7.2_
 
 **Depends-on:** Task 4, Task 2
 
-- [ ] Test: fixer `Ok` with unchanged HEAD still opens a new round and new instance ids; prior instance events remain; fingerprint does not copy membership.
-- [ ] Test: required producers run again on that SHA; no automatic second no-op fix loop.
-- [ ] Test: `--yes` after park writes porch `review_approved` citing `fix_requested`, frozen new-round instances, `head_changed=false` when HEAD equal.
-- [ ] Test: rereview with no blocking findings completes without a bulk approve event.
-- [ ] Run `cargo test -p porch --test m4_fix --test m20_dispo` — expect missing consent event.
-- [ ] Implement. Commit: `feat(porch-run): record standing-consent approve on the new round`
+- [x] Test: fixer `Ok` with unchanged HEAD still opens a new round and new instance ids; prior instance events remain; fingerprint does not copy membership.
+- [x] Test: required producers run again on that SHA; no automatic second no-op fix loop.
+- [x] Test: `--yes` after park writes porch `review_approved` citing `fix_requested`, frozen new-round instances, `head_changed=false` when HEAD equal.
+- [x] Test: rereview with no blocking findings completes without a bulk approve event.
+- [x] Run `cargo test -p porch --test m4_fix --test m20_dispo` — expect missing consent event.
+- [x] Implement. Commit: `feat(porch-run): record standing-consent approve on the new round`
 
 _Requirements: DISPO-4.1, DISPO-4.2, DISPO-4.3, DISPO-4.4, DISPO-4.5, DISPO-4.6, DISPO-4.7, DISPO-4.8_
 
@@ -178,11 +178,11 @@ _Requirements: DISPO-4.1, DISPO-4.2, DISPO-4.3, DISPO-4.4, DISPO-4.5, DISPO-4.6,
 
 **Depends-on:** Task 2
 
-- [ ] Test: modern abort binds round, HEAD, all instance ids as `context`; run `cancelled`; distinct from skip and from `superseded by new push`.
-- [ ] Test: txn failure leaves parked + worktree; cleanup runs only after commit.
-- [ ] Test: legacy park abort records `identity_unavailable`, no `fN` members.
-- [ ] Run `cargo test -p porch --test m3_review --test m18_round_identity --test m20_dispo`.
-- [ ] Implement. Commit: `feat(porch-run): record review_aborted with cancelled status`
+- [x] Test: modern abort binds round, HEAD, all instance ids as `context`; run `cancelled`; distinct from skip and from `superseded by new push`.
+- [x] Test: txn failure leaves parked + worktree; cleanup runs only after commit.
+- [x] Test: legacy park abort records `identity_unavailable`, no `fN` members.
+- [x] Run `cargo test -p porch --test m3_review --test m18_round_identity --test m20_dispo`.
+- [x] Implement. Commit: `feat(porch-run): record review_aborted with cancelled status`
 
 _Requirements: DISPO-5.3, DISPO-5.6, DISPO-8.8_
 
@@ -200,13 +200,13 @@ _Requirements: DISPO-5.3, DISPO-5.6, DISPO-8.8_
 
 **Depends-on:** Task 1
 
-- [ ] Test: one snapshot includes committed events/instances; `related_occurrences` groups `(run_id, fingerprint_version, fingerprint)` with len≥2, ordered by round ordinal then instance id; no lineage edges; grouping unused for authorize.
-- [ ] Test: parked run returns success with `completeness=as_of`; watermark is `audit_rev` not `state_rev`; inferred `phase.kind=step_results_inferred`.
-- [ ] Test: inconsistent parked review (no round, no legacy snapshot) sets structured `anomaly`, still 200-equivalent success.
-- [ ] Test: compact `get_run` still has `fN` findings; may set `audit_available`.
-- [ ] Test: after `--yes` on a no-change fixer, the document exposes `head_changed=false` on the porch `review_approved` event.
-- [ ] Run `cargo test -p porch --test m20_dispo` and `cargo test -p porch --test m18_round_identity`.
-- [ ] Implement builder + `get_audit`. Commit: `feat(porch-gate): serve derived audit documents`
+- [x] Test: one snapshot includes committed events/instances; `related_occurrences` groups `(run_id, fingerprint_version, fingerprint)` with len≥2, ordered by round ordinal then instance id; no lineage edges; grouping unused for authorize.
+- [x] Test: parked run returns success with `completeness=as_of`; watermark is `audit_rev` not `state_rev`; inferred `phase.kind=step_results_inferred`.
+- [x] Test: inconsistent parked review (no round, no legacy snapshot) sets structured `anomaly`, still 200-equivalent success.
+- [x] Test: compact `get_run` still has `fN` findings; may set `audit_available`.
+- [x] Test: after `--yes` on a no-change fixer, the document exposes `head_changed=false` on the porch `review_approved` event.
+- [x] Run `cargo test -p porch --test m20_dispo` and `cargo test -p porch --test m18_round_identity`.
+- [x] Implement builder + `get_audit`. Commit: `feat(porch-gate): serve derived audit documents`
 
 _Requirements: DISPO-1.4, DISPO-1.6, DISPO-2.7, DISPO-4.9, DISPO-6.1, DISPO-6.2, DISPO-6.4, DISPO-6.5, DISPO-6.6, DISPO-6.7, DISPO-6.8, DISPO-6.9, DISPO-6.10, DISPO-6.11, DISPO-6.12, DISPO-6.15, DISPO-6.16, DISPO-6.17, DISPO-6.18, DISPO-7.4, DISPO-8.6, DISPO-8.11_
 
@@ -224,10 +224,10 @@ _Requirements: DISPO-1.4, DISPO-1.6, DISPO-2.7, DISPO-4.9, DISPO-6.1, DISPO-6.2,
 
 **Depends-on:** Task 7
 
-- [ ] Test: `porch agent audit` prints the same builder JSON; status JSON stays compact.
-- [ ] Test: subscribe/`apply_snapshot` path does not call `get_audit`; opening the history view calls it once; `MAILBOX_CAP` unchanged (`events.rs`).
-- [ ] Run `cargo test -p porch --test m20_dispo`.
-- [ ] Implement. Commit: `feat(porch): expose agent audit and lazy TUI history`
+- [x] Test: `porch agent audit` prints the same builder JSON; status JSON stays compact.
+- [x] Test: subscribe/`apply_snapshot` path does not call `get_audit`; opening the history view calls it once; `MAILBOX_CAP` unchanged (`events.rs`).
+- [x] Run `cargo test -p porch --test m20_dispo`.
+- [x] Implement. Commit: `feat(porch): expose agent audit and lazy TUI history`
 
 _Requirements: DISPO-6.3, DISPO-6.13, DISPO-6.14, DISPO-8.7_
 
@@ -243,10 +243,10 @@ _Requirements: DISPO-6.3, DISPO-6.13, DISPO-6.14, DISPO-8.7_
 
 **Depends-on:** Task 3, Task 4, Task 6
 
-- [ ] Test: compose abort still writes no authority members and does not call `gh` (`m17_pr_compose`).
-- [ ] Test: rebase park still rejects approve/skip (`m13_workflow`); `rebase0` is not an authority member.
-- [ ] Test: FLOOR authorize still uses the recorded required set (`m19_floor`); notes stay in `finding_notes.json` keyed by `fN` (`m18_round_identity`).
-- [ ] Run `cargo test -p porch --test m17_pr_compose --test m13_workflow --test m18_round_identity --test m19_floor`.
-- [ ] Fix regressions if any. Commit: `test(porch): guard compose rebase floor and notes after DISPO`
+- [x] Test: compose abort still writes no authority members and does not call `gh` (`m17_pr_compose`).
+- [x] Test: rebase park still rejects approve/skip (`m13_workflow`); `rebase0` is not an authority member.
+- [x] Test: FLOOR authorize still uses the recorded required set (`m19_floor`); notes stay in `finding_notes.json` keyed by `fN` (`m18_round_identity`).
+- [x] Run `cargo test -p porch --test m17_pr_compose --test m13_workflow --test m18_round_identity --test m19_floor`.
+- [x] Fix regressions if any. Commit: `test(porch): guard compose rebase floor and notes after DISPO`
 
 _Requirements: DISPO-8.2, DISPO-8.4, DISPO-8.5, DISPO-8.10, DISPO-8.12_
