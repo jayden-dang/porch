@@ -3339,7 +3339,10 @@ fn drifted_round_or_head_fails_closed_without_writing_an_event() {
             members: vec![(instance_id, rounds::MemberRole::Context)],
         },
     );
-    assert!(matches!(skip_wrong_live, Err(rounds::AuthorityError::Stale)));
+    assert!(matches!(
+        skip_wrong_live,
+        Err(rounds::AuthorityError::Stale)
+    ));
     assert!(rounds::events_for_run(&db, &run_id).unwrap().is_empty());
 }
 
@@ -3784,4 +3787,134 @@ fn approve_with_run_effects_writes_approved_head_and_review_step() {
     assert_eq!(steps[0].step, "review");
     assert_eq!(steps[0].status, "completed");
     assert_eq!(steps[0].error.as_deref(), Some("approved"));
+}
+
+#[test]
+fn opening_legacy_database_adds_phase_tables_and_keeps_existing_rows() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let path = db_path(home);
+    std::fs::create_dir_all(home).unwrap();
+    seed_legacy_db(&path);
+
+    let db = Db::open(&path).unwrap();
+    let run = db.run_by_id("run-legacy").unwrap().expect("legacy run");
+    assert_eq!(run.branch, "feat");
+
+    let conn = Connection::open(&path).unwrap();
+    for table in ["phase_attempts", "phase_events"] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "missing table {table}");
+    }
+    let index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='phase_events_run'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index, 1, "missing phase_events_run index");
+
+    conn.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES ('att-1', 'run-legacy', 'review', 1, NULL, NULL, NULL, '10')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO phase_events (
+            id, run_id, attempt_id, seq, kind, outcome, cause, created_at
+         ) VALUES ('evt-1', 'run-legacy', 'att-1', 1, 'started', NULL, NULL, '10')",
+        [],
+    )
+    .unwrap();
+
+    let attempts = rounds::phase::attempts_for_run(&db, "run-legacy").unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].id.as_str(), "att-1");
+    assert_eq!(attempts[0].phase, rounds::phase::PhaseName::Review);
+    assert_eq!(attempts[0].ordinal, 1);
+    assert!(attempts[0].parent_attempt_id.is_none());
+    assert!(attempts[0].caused_by_attempt_id.is_none());
+    assert!(attempts[0].operation_kind.is_none());
+
+    let events = rounds::phase::events_for_run(&db, "run-legacy").unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "evt-1");
+    assert_eq!(events[0].attempt_id.as_str(), "att-1");
+    assert_eq!(events[0].seq, 1);
+    assert_eq!(events[0].kind, rounds::phase::PhaseEventKind::Started);
+
+    let open =
+        rounds::phase::nonterminal_attempt(&db, "run-legacy", rounds::phase::PhaseName::Review)
+            .unwrap()
+            .expect("started attempt without terminal is nonterminal");
+    assert_eq!(open.id.as_str(), "att-1");
+}
+
+#[test]
+fn duplicate_top_level_phase_attempt_ordinal_is_rejected() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let path = db_path(home);
+    let conn = Connection::open(&path).unwrap();
+
+    conn.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, 'intent', 1, NULL, NULL, NULL, '1')",
+        rusqlite::params!["att-a", &run_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO phase_events (
+            id, run_id, attempt_id, seq, kind, outcome, cause, created_at
+         ) VALUES (?1, ?2, 'att-a', 1, 'started', NULL, NULL, '1')",
+        rusqlite::params!["evt-a", &run_id],
+    )
+    .unwrap();
+
+    let dup = conn.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, 'intent', 1, NULL, NULL, NULL, '2')",
+        rusqlite::params!["att-b", &run_id],
+    );
+    assert!(
+        dup.is_err(),
+        "store must reject a second top-level attempt with the same run/phase/ordinal"
+    );
+
+    conn.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, 'intent', 2, NULL, NULL, NULL, '3')",
+        rusqlite::params!["att-c", &run_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO phase_events (
+            id, run_id, attempt_id, seq, kind, outcome, cause, created_at
+         ) VALUES (?1, ?2, 'att-c', 2, 'started', NULL, NULL, '3')",
+        rusqlite::params!["evt-c", &run_id],
+    )
+    .unwrap();
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].ordinal, 1);
+    assert_eq!(attempts[1].ordinal, 2);
 }

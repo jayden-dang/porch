@@ -175,6 +175,40 @@ CREATE TABLE IF NOT EXISTS authority_event_members (
 );
 CREATE INDEX IF NOT EXISTS authority_event_members_instance
     ON authority_event_members(finding_instance_id);
+
+CREATE TABLE IF NOT EXISTS phase_attempts (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    phase TEXT NOT NULL CHECK (phase IN ('intent','rebase','review','certify','deliver')),
+    ordinal INTEGER NOT NULL,
+    parent_attempt_id TEXT REFERENCES phase_attempts(id),
+    caused_by_attempt_id TEXT REFERENCES phase_attempts(id),
+    operation_kind TEXT CHECK (
+        operation_kind IS NULL
+        OR operation_kind IN ('compose','fixer','deliver_repair')
+    ),
+    created_at TEXT NOT NULL,
+    CHECK (
+        (parent_attempt_id IS NULL AND operation_kind IS NULL)
+        OR (parent_attempt_id IS NOT NULL AND operation_kind IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS phase_attempts_run_phase_ordinal
+    ON phase_attempts(run_id, phase, ordinal)
+    WHERE parent_attempt_id IS NULL;
+
+CREATE TABLE IF NOT EXISTS phase_events (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    attempt_id TEXT NOT NULL REFERENCES phase_attempts(id),
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('started','terminal','evidence')),
+    outcome TEXT,
+    cause TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS phase_events_run
+    ON phase_events(run_id, seq);
 ";
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {

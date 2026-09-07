@@ -45,10 +45,7 @@ impl AuthorityKind {
         // fail-closes when live HEAD drifts from the parked tip (DISPO-2.6).
         matches!(
             self,
-            Self::ReviewApproved
-                | Self::ReviewSkipped
-                | Self::ReviewAborted
-                | Self::FixRequested
+            Self::ReviewApproved | Self::ReviewSkipped | Self::ReviewAborted | Self::FixRequested
         )
     }
 }
