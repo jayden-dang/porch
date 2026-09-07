@@ -164,10 +164,11 @@ not `round_for_decision(&Db)`):
    as `applicable_round_for_run`, inlined on `tx`). It must equal
    `expected_round_id`.
 2. That round's `to_sha` and `runs.head_sha` must equal `expected_head`.
-3. For kinds that bind HEAD (`review_approved`, `review_aborted`,
-   `fix_requested`): `live_head` (caller `rev-parse` **before** the txn) must
-   equal `expected_head`. `review_skipped` does not bind HEAD (`expected_head`
-   / `live_head` may be NULL).
+3. For kinds that bind HEAD (`review_approved`, `review_skipped`,
+   `review_aborted`, `fix_requested`): `live_head` (caller `rev-parse`
+   **before** the txn) must equal `expected_head`. `review_skipped` still does
+   **not** write `review_approved_head_sha`, but it fail-closes on live HEAD
+   drift like other review responses (DISPO-2.6).
 4. `context` members must equal the instance ids of that round at txn time
    (empty list is a valid freeze). `target` members must equal the caller-
    supplied set (non-empty; empty targets never reach persist).

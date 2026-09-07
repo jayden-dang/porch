@@ -3310,6 +3310,25 @@ fn drifted_round_or_head_fails_closed_without_writing_an_event() {
         rounds::PersistAuthorityPlan {
             run_id: run_id.clone(),
             kind: rounds::AuthorityKind::ReviewApproved,
+            expected_round_id: Some(round_id.clone()),
+            expected_head: Some("to".into()),
+            live_head: Some("moved".into()),
+            actor_kind: rounds::ActorKind::Operator,
+            authority_event_id: None,
+            head_changed: None,
+            identity_unavailable: false,
+            members: vec![(instance_id.clone(), rounds::MemberRole::Context)],
+        },
+    );
+    assert!(matches!(wrong_live, Err(rounds::AuthorityError::Stale)));
+    assert!(rounds::events_for_run(&db, &run_id).unwrap().is_empty());
+
+    // DISPO-2.6: skip fail-closes on live_head drift the same as approve.
+    let skip_wrong_live = rounds::persist_authority(
+        &db,
+        rounds::PersistAuthorityPlan {
+            run_id: run_id.clone(),
+            kind: rounds::AuthorityKind::ReviewSkipped,
             expected_round_id: Some(round_id),
             expected_head: Some("to".into()),
             live_head: Some("moved".into()),
@@ -3320,7 +3339,7 @@ fn drifted_round_or_head_fails_closed_without_writing_an_event() {
             members: vec![(instance_id, rounds::MemberRole::Context)],
         },
     );
-    assert!(matches!(wrong_live, Err(rounds::AuthorityError::Stale)));
+    assert!(matches!(skip_wrong_live, Err(rounds::AuthorityError::Stale)));
     assert!(rounds::events_for_run(&db, &run_id).unwrap().is_empty());
 }
 

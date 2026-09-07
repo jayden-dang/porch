@@ -41,9 +41,14 @@ impl AuthorityKind {
     }
 
     fn binds_head(self) -> bool {
+        // ReviewSkipped does not write review_approved_head_sha, but still
+        // fail-closes when live HEAD drifts from the parked tip (DISPO-2.6).
         matches!(
             self,
-            Self::ReviewApproved | Self::ReviewAborted | Self::FixRequested
+            Self::ReviewApproved
+                | Self::ReviewSkipped
+                | Self::ReviewAborted
+                | Self::FixRequested
         )
     }
 }

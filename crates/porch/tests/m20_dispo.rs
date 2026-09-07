@@ -640,6 +640,56 @@ fn head_moved_after_park_rejects_approve_without_event() {
 }
 
 #[test]
+fn head_moved_after_park_rejects_skip_without_event() {
+    // DISPO-2.6 / CASE-39: skip must fail closed on worktree HEAD drift like approve.
+    let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("blocking");
+    commit_change(&work, "bug.txt", "boom\n");
+    push_with_env(&work, &home, "feat-dispo-skip-stale", &fake, "blocking");
+
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&work);
+    let run = wait_status(&db, &repo_id, &["parked"], Duration::from_secs(20));
+    let wt = run.worktree_dir.clone().expect("parked worktree");
+
+    git(&wt, &["config", "user.email", "porch@example.com"]);
+    git(&wt, &["config", "user.name", "Porch"]);
+    std::fs::write(wt.join("drift.txt"), "moved\n").unwrap();
+    git(&wt, &["add", "drift.txt"]);
+    git(&wt, &["commit", "-m", "drift after park"]);
+
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&work)
+        .env("PORCH_HOME", &home)
+        .args(["agent", "respond", "skip", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stale skip must fail; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("drift") || err.contains("stale") || err.contains("rejected"),
+        "expected drift/stale error, got {v}"
+    );
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "parked");
+    assert!(run.review_approved_head_sha.is_none());
+    assert!(
+        rounds::events_for_run(&db, &run.id).unwrap().is_empty(),
+        "stale skip must not write an authority event"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
 fn fix_freezes_selected_target_instance_ids() {
     let (_tmp, work, home, _origin, fake) = setup_with_origin_and_fake("two-blocking");
     commit_change(&work, "bug.txt", "boom\n");
