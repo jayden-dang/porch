@@ -70,7 +70,8 @@ Modify:
 
 ## Task 1: Round tables exist and a round opens durably
 
-**Files:** Create `crates/porch-gate/src/rounds/schema.rs`, `crates/porch-gate/src/rounds/mod.rs`,
+**Files:**
+Create `crates/porch-gate/src/rounds/schema.rs`, `crates/porch-gate/src/rounds/mod.rs`,
 `crates/porch-gate/tests/m18_rounds.rs`. Modify `crates/porch-gate/src/db.rs`.
 **Reuse:** rung 2 — extends `porch-gate::db` (`ensure_column`, `unchecked_transaction`, ULID minting)
 **Interfaces:** Produces `rounds::open_round(plan, bindings) -> RoundId`, `RoundId`, `ExecutionState`,
@@ -88,7 +89,8 @@ _Requirements: ROUND-1.1, ROUND-1.2, ROUND-1.4, ROUND-1.5, ROUND-1.25, ROUND-1.2
 
 ## Task 2: Context elements bind what each layer received
 
-**Files:** Modify `crates/porch-gate/src/rounds/mod.rs`, `crates/porch-gate/src/rounds/schema.rs`.
+**Files:**
+Modify `crates/porch-gate/src/rounds/mod.rs`, `crates/porch-gate/src/rounds/schema.rs`.
 Test `crates/porch-gate/tests/m18_rounds.rs`.
 **Reuse:** rung 2 — extends the round store from Task 1
 **Interfaces:** Consumes `RoundId`. Produces `ContextElement`, `ContextApplication`, `SourceState`,
@@ -105,7 +107,8 @@ _Requirements: ROUND-1.8, ROUND-1.9, ROUND-1.10, ROUND-1.11, ROUND-1.13, ROUND-1
 
 ## Task 3: One immutable invocation plan describes what will run
 
-**Files:** Create `crates/porch-review/src/plan.rs`. Modify `crates/porch-review/src/lib.rs`,
+**Files:**
+Create `crates/porch-review/src/plan.rs`. Modify `crates/porch-review/src/lib.rs`,
 `crates/porch-review/src/agent_review.rs`.
 **Reuse:** rung 2 — extends `review_bin()` and `EngineKind`
 **Interfaces:** Produces `plan::prepare(opts) -> PreparedInvocation`, `InvocationPlan`,
@@ -123,7 +126,8 @@ _Requirements: ROUND-1.17, ROUND-1.18, ROUND-1.19, ROUND-1.20, ROUND-1.21, ROUND
 
 ## Task 4: Findings carry a porch-owned contract and candidate key
 
-**Files:** Create `crates/porch-review/src/identity.rs`. Modify `crates/porch-review/src/lib.rs`,
+**Files:**
+Create `crates/porch-review/src/identity.rs`. Modify `crates/porch-review/src/lib.rs`,
 `crates/porch-quality/src/lib.rs`, `crates/porch-quality/src/rules.rs`.
 **Reuse:** rung 2 — extends the map/normalize pass and `CommentOut`
 **Interfaces:** Produces `identity::derive(finding, mapping) -> CandidateKey`, enriched `Finding`.
@@ -141,7 +145,8 @@ _Requirements: ROUND-3.3, ROUND-3.4, ROUND-3.12, ROUND-3.13, ROUND-3.14, ROUND-3
 
 ## Task 5: Coverage states are derived, never inferred
 
-**Files:** Create `crates/porch-review/src/coverage_state.rs`. Modify `crates/porch-review/src/lib.rs`.
+**Files:**
+Create `crates/porch-review/src/coverage_state.rs`. Modify `crates/porch-review/src/lib.rs`.
 **Reuse:** rung 2 — extends `assert_coverage` and the existing derivation
 **Interfaces:** Produces `coverage_state::derive_states(changed, output) -> Vec<CoverageEntry>`.
 **Depends-on:** none
@@ -156,7 +161,8 @@ _Requirements: ROUND-2.4, ROUND-2.5, ROUND-2.6, ROUND-2.7, ROUND-2.8, ROUND-2.9,
 
 ## Task 6: Reconciliation matches conservatively against a normative corpus
 
-**Files:** Create `crates/porch-review/src/reconcile.rs`, `tests/fixtures/reconcile/1/`.
+**Files:**
+Create `crates/porch-review/src/reconcile.rs`, `tests/fixtures/reconcile/1/`.
 Modify `crates/porch-review/src/lib.rs`.
 **Reuse:** rung 7 — none; no existing code matches finding sets across rounds
 **Interfaces:** Produces `reconcile(current, history) -> Proposal`, `History`, `Proposal`.
@@ -175,7 +181,8 @@ _Requirements: ROUND-3.5, ROUND-3.6, ROUND-3.9, ROUND-3.10, ROUND-3.11, ROUND-3.
 
 ## Task 7: Finalization is atomic and revision-guarded
 
-**Files:** Modify `crates/porch-gate/src/rounds/mod.rs`. Test `crates/porch-gate/tests/m18_rounds.rs`.
+**Files:**
+Modify `crates/porch-gate/src/rounds/mod.rs`. Test `crates/porch-gate/tests/m18_rounds.rs`.
 **Reuse:** rung 2 — extends the round store from Task 1
 **Interfaces:** Produces `read_history(run_id) -> (HistoryRevision, Vec<StoredPriorInstance>)`,
 `finalize_round(round_id, proposal, seen_revision) -> Finalized | Stale`.
@@ -192,7 +199,8 @@ _Requirements: ROUND-1.30, ROUND-2.1, ROUND-2.2, ROUND-2.3, ROUND-3.7, ROUND-3.8
 
 ## Task 8: A round says whether it may authorize the current change
 
-**Files:** Create `crates/porch-gate/src/rounds/applicability.rs`. Test `crates/porch-gate/tests/m18_rounds.rs`.
+**Files:**
+Create `crates/porch-gate/src/rounds/applicability.rs`. Test `crates/porch-gate/tests/m18_rounds.rs`.
 **Reuse:** rung 2 — extends the round store's stored digests
 **Interfaces:** Produces `applicable_round(run_id, bindings, required) -> Applicable | RequiresNew`.
 **Depends-on:** Task 7
@@ -208,7 +216,8 @@ _Requirements: ROUND-1.23, ROUND-1.24, ROUND-1.31, ROUND-4.11, ROUND-4.12, ROUND
 
 ## Task 9: The review phase drives the round lifecycle end to end
 
-**Files:** Modify `crates/porch-run/src/lib.rs`, `crates/porch-review/src/agent_review.rs`.
+**Files:**
+Modify `crates/porch-run/src/lib.rs`, `crates/porch-review/src/agent_review.rs`.
 Test `crates/porch/tests/m18_round_identity.rs`.
 **Reuse:** rung 2 — extends `run_review_phase` and `resolve_review_from`
 **Interfaces:** Consumes `plan::prepare`, `open_round`, `reconcile`, `finalize_round`.
@@ -227,7 +236,8 @@ _Requirements: ROUND-1.3, ROUND-1.32, ROUND-4.1, ROUND-4.2, ROUND-4.3, ROUND-4.4
 
 ## Task 10: A killed review is reconciled at startup
 
-**Files:** Modify `crates/porch-gate/src/daemon.rs`, `crates/porch-gate/src/executor.rs`,
+**Files:**
+Modify `crates/porch-gate/src/daemon.rs`, `crates/porch-gate/src/executor.rs`,
 `crates/porch-gate/src/rounds/mod.rs`. Test `crates/porch/tests/m18_round_identity.rs`.
 **Reuse:** rung 2 — extends `recover_stale`
 **Interfaces:** Consumes `RunExecutor::recover_stale`. Produces `rounds::reconcile_stale`.
@@ -244,7 +254,8 @@ _Requirements: ROUND-4.7, ROUND-4.8, ROUND-6.3, ROUND-6.6, ROUND-7.3, ROUND-7.6_
 
 ## Task 11: Trusted-config commits stay reachable while a round needs them
 
-**Files:** Create `crates/porch-gate/src/rounds/retention.rs`. Modify `crates/porch-gate/src/eject.rs`.
+**Files:**
+Create `crates/porch-gate/src/rounds/retention.rs`. Modify `crates/porch-gate/src/eject.rs`.
 Test `crates/porch-gate/tests/m18_rounds.rs`.
 **Reuse:** rung 2 — `porch_git` CLI plumbing; `refs/porch/recover/<run_id>` namespace pattern
 **Interfaces:** Produces `retention::pin_trusted_config(bare, sha)`, `retention::sweep_unreferenced(bare)`.
@@ -259,7 +270,8 @@ _Requirements: ROUND-1.12, ROUND-1.16, ROUND-1.29_
 
 ## Task 12: Operators read rounds, and legacy runs still answer
 
-**Files:** Modify `crates/porch-gate/src/rpc.rs`, `crates/porch/src/tui.rs`,
+**Files:**
+Modify `crates/porch-gate/src/rpc.rs`, `crates/porch/src/tui.rs`,
 `crates/porch-gate/src/id.rs`, `docs/usage.md`, `docs/install.md`.
 Test `crates/porch/tests/m18_round_identity.rs`.
 **Reuse:** rung 2 — extends the snapshot builder and `get_finding_hunk_result`
