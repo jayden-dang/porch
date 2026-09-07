@@ -382,6 +382,18 @@ fn gh_argv_log(home: &Path) -> String {
     std::fs::read_to_string(home.join("gh-argv.log")).unwrap_or_default()
 }
 
+fn parse_attestation_json(body: &str) -> serde_json::Value {
+    let start = body
+        .find("<!-- porch-attestation")
+        .and_then(|i| body[i..].find('{').map(|j| i + j))
+        .expect("attestation json");
+    let end = body[start..]
+        .find("-->")
+        .map(|i| start + i)
+        .expect("attestation close");
+    serde_json::from_str(body[start..end].trim()).expect("attestation parse")
+}
+
 #[test]
 fn deliver_scaffolds_pr_and_parks_compose() {
     let s = setup(None);
@@ -962,6 +974,90 @@ fn compose_approve_and_fix_are_usage_errors() {
     let db = Db::open(&s.home.join("state.sqlite")).unwrap();
     let run = db.run_by_id(&run.id).unwrap().unwrap();
     assert_eq!(run.status, "parked");
+
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn post_compose_attestation_matches_step_projection_and_excludes_parked_compose() {
+    use porch_deliver::{Attestation, StepSnapshot};
+
+    let s = setup(None);
+    let run = park_compose_run(&s, "feat-attest-guard", Some("freeze attestation bytes"));
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let step_rows = db.step_results_for_run(&run.id).unwrap();
+    assert!(
+        step_rows
+            .iter()
+            .any(|st| st.step == "compose" && st.status == "parked"),
+        "compose park must leave a parked compose step_results row: {step_rows:?}"
+    );
+
+    let body_parked = std::fs::read_to_string(s.home.join("gh-pr-body.txt")).unwrap();
+    let scaffold = parse_attestation_json(&body_parked);
+    let head_sha = scaffold["head_sha"]
+        .as_str()
+        .expect("scaffold head_sha")
+        .to_string();
+    let assurance_shape = scaffold
+        .get("assurance_shape")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let mut projected: Vec<StepSnapshot> = step_rows
+        .iter()
+        .filter(|st| !(st.step == "compose" && st.status == "parked"))
+        .map(|st| StepSnapshot {
+            step: st.step.clone(),
+            status: st.status.clone(),
+        })
+        .collect();
+    projected.push(StepSnapshot {
+        step: "compose".into(),
+        status: "skipped".into(),
+    });
+    projected.push(StepSnapshot {
+        step: "deliver".into(),
+        status: "completed".into(),
+    });
+    let expected = Attestation {
+        head_sha,
+        steps: projected,
+        assurance_shape,
+    };
+    let expected_bytes = serde_json::to_string(&expected).unwrap();
+
+    agent_cmd(&s)
+        .args(["agent", "respond", "skip", "--run-id", &run.id])
+        .assert()
+        .success();
+
+    let body = std::fs::read_to_string(s.home.join("gh-pr-body.txt")).unwrap();
+    let post_val = parse_attestation_json(&body);
+    let post: Attestation = serde_json::from_value(post_val.clone()).unwrap();
+    assert!(
+        post.steps
+            .iter()
+            .all(|st| !(st.step == "compose" && st.status == "parked")),
+        "parked compose must stay excluded post-compose: {post_val}"
+    );
+    assert!(
+        post.steps
+            .iter()
+            .any(|st| st.step == "compose" && st.status == "skipped"),
+        "post-compose attestation must record compose skipped: {post_val}"
+    );
+    let post_bytes = serde_json::to_string(&post).unwrap();
+    assert_eq!(
+        post_bytes, expected_bytes,
+        "identical step_results projection must stay byte-identical\npost={post_bytes}\nexpected={expected_bytes}"
+    );
+    assert_eq!(
+        serde_json::to_string(&expected).unwrap(),
+        expected_bytes,
+        "same projection must re-serialize identically"
+    );
 
     kill_daemon(&s.home);
 }

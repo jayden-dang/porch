@@ -1593,6 +1593,15 @@ fn get_run_stays_compact_with_display_handles_and_may_advertise_audit() {
     assert!(findings[0].get("fingerprint").is_none());
     assert!(findings[0].get("criterion_id").is_none());
     assert!(
+        !snap.steps.is_empty(),
+        "compact snapshot must carry steps[] as live state"
+    );
+    assert!(
+        snap.steps.iter().any(|s| s.step == "review"),
+        "steps[] should include the review row: {:?}",
+        snap.steps
+    );
+    assert!(
         snap.audit_available,
         "compact snapshot may advertise audit_available"
     );
@@ -1600,6 +1609,8 @@ fn get_run_stays_compact_with_display_handles_and_may_advertise_audit() {
     assert!(raw.get("related_occurrences").is_none());
     assert!(raw.get("events").is_none());
     assert!(raw.get("schema_version").is_none());
+    assert!(raw.get("watermark").is_none());
+    assert!(raw.get("completeness").is_none());
 
     kill_daemon(&home);
 }

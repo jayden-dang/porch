@@ -924,3 +924,91 @@ review:
         "persisted instructions: {raw}"
     );
 }
+
+fn parse_attestation_json(body: &str) -> serde_json::Value {
+    let start = body
+        .find("<!-- porch-attestation")
+        .and_then(|i| body[i..].find('{').map(|j| i + j))
+        .expect("attestation json");
+    let end = body[start..]
+        .find("-->")
+        .map(|i| start + i)
+        .expect("attestation close");
+    serde_json::from_str(body[start..end].trim()).expect("attestation parse")
+}
+
+#[test]
+fn compose_skip_attestation_excludes_parked_compose_and_matches_step_projection() {
+    use porch_deliver::{Attestation, StepSnapshot};
+
+    let s = setup(None, "clean", "ok");
+    git(&s.work, &["checkout", "-b", "feat-attest-m6"]);
+    commit_change(&s.work, "attest-m6.txt", "x\n");
+    push_with_env(&s, "feat-attest-m6", "clean", "ok");
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let parked = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed"],
+        Duration::from_secs(45),
+    );
+    assert_eq!(parked.status, "parked", "err={:?}", parked.error);
+
+    let step_rows = db.step_results_for_run(&parked.id).unwrap();
+    assert!(
+        step_rows
+            .iter()
+            .any(|st| st.step == "compose" && st.status == "parked"),
+        "steps={step_rows:?}"
+    );
+    let body_parked = std::fs::read_to_string(s.home.join("gh-pr-body.txt")).unwrap();
+    let scaffold = parse_attestation_json(&body_parked);
+    let expected = Attestation {
+        head_sha: scaffold["head_sha"].as_str().unwrap().to_string(),
+        steps: {
+            let mut projected: Vec<StepSnapshot> = step_rows
+                .iter()
+                .filter(|st| !(st.step == "compose" && st.status == "parked"))
+                .map(|st| StepSnapshot {
+                    step: st.step.clone(),
+                    status: st.status.clone(),
+                })
+                .collect();
+            projected.push(StepSnapshot {
+                step: "compose".into(),
+                status: "skipped".into(),
+            });
+            projected.push(StepSnapshot {
+                step: "deliver".into(),
+                status: "completed".into(),
+            });
+            projected
+        },
+        assurance_shape: scaffold
+            .get("assurance_shape")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    };
+    let expected_bytes = serde_json::to_string(&expected).unwrap();
+
+    let out = compose_skip(&s, &parked.id, "ok");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let body = std::fs::read_to_string(s.home.join("gh-pr-body.txt")).unwrap();
+    let post: Attestation = serde_json::from_value(parse_attestation_json(&body)).unwrap();
+    assert!(
+        post.steps
+            .iter()
+            .all(|st| !(st.step == "compose" && st.status == "parked")),
+        "parked compose must stay excluded: {post:?}"
+    );
+    assert_eq!(serde_json::to_string(&post).unwrap(), expected_bytes);
+
+    kill_daemon(&s.home);
+}
