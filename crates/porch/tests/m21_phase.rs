@@ -76,6 +76,7 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
+MODE="${PORCH_FAKE_REVIEW_MODE:-clean}"
 FILES=$(git diff --name-only "$FROM" "$TO" 2>/dev/null || true)
 FILES_JSON="["
 FIRST=1
@@ -91,7 +92,21 @@ for f in $FILES; do
   COV_JSON="$COV_JSON{\"path\":\"$f\",\"status\":\"pass\"}"
 done
 COV_JSON="$COV_JSON]"
-printf '{"comments":[],"files":%s,"coverage":%s}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
+case "$MODE" in
+  clean)
+    printf '{"comments":[],"files":%s,"coverage":%s}\n' "$FILES_JSON" "$COV_JSON" > "$OUT"
+    ;;
+  blocking)
+    TARGET=$(printf '%s\n' $FILES | head -n1)
+    if [ -z "$TARGET" ]; then TARGET="README"; fi
+    printf '{"comments":[{"path":"%s","content":"null deref on empty input","category":"bug","severity":"high","start_line":1,"end_line":2}],"files":%s,"coverage":%s}\n' \
+      "$TARGET" "$FILES_JSON" "$COV_JSON" > "$OUT"
+    ;;
+  *)
+    echo "unknown PORCH_FAKE_REVIEW_MODE=$MODE" >&2
+    exit 1
+    ;;
+esac
 "#,
     )
     .unwrap();
@@ -198,9 +213,14 @@ struct Setup {
     fake_review: PathBuf,
     fake_gh: PathBuf,
     path: String,
+    review_mode: String,
 }
 
 fn setup() -> Setup {
+    setup_with_review_mode("clean")
+}
+
+fn setup_with_review_mode(review_mode: &str) -> Setup {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let origin = root.join("origin.git");
@@ -245,7 +265,7 @@ fn setup() -> Setup {
         .env("PORCH_HOME", &home)
         .env(REVIEW_BIN_ENV, &fake_review)
         .env(GH_BIN_ENV, &fake_gh)
-        .env("PORCH_FAKE_REVIEW_MODE", "clean")
+        .env("PORCH_FAKE_REVIEW_MODE", review_mode)
         .env("PORCH_FAKE_GH_MODE", "ok")
         .env("PATH", &path)
         .arg("init")
@@ -259,7 +279,7 @@ fn setup() -> Setup {
         &[
             (REVIEW_BIN_ENV, fake_review.as_os_str()),
             (GH_BIN_ENV, fake_gh.as_os_str()),
-            ("PORCH_FAKE_REVIEW_MODE", "clean".as_ref()),
+            ("PORCH_FAKE_REVIEW_MODE", review_mode.as_ref()),
             ("PORCH_FAKE_GH_MODE", "ok".as_ref()),
             ("PATH", path.as_ref()),
             ("PORCH_REVIEW_TIMEOUT_SECS", "10".as_ref()),
@@ -277,6 +297,7 @@ fn setup() -> Setup {
         fake_review,
         fake_gh,
         path,
+        review_mode: review_mode.to_string(),
     }
 }
 
@@ -286,7 +307,7 @@ fn push_feat(s: &Setup, branch: &str, intent: Option<&str>) {
         .env("PORCH_HOME", &s.home)
         .env(REVIEW_BIN_ENV, &s.fake_review)
         .env(GH_BIN_ENV, &s.fake_gh)
-        .env("PORCH_FAKE_REVIEW_MODE", "clean")
+        .env("PORCH_FAKE_REVIEW_MODE", &s.review_mode)
         .env("PORCH_FAKE_GH_MODE", "ok")
         .env("PATH", &s.path);
     if let Some(intent) = intent {
@@ -315,7 +336,7 @@ fn agent_cmd(s: &Setup) -> Command {
         .env("PORCH_HOME", &s.home)
         .env(REVIEW_BIN_ENV, &s.fake_review)
         .env(GH_BIN_ENV, &s.fake_gh)
-        .env("PORCH_FAKE_REVIEW_MODE", "clean")
+        .env("PORCH_FAKE_REVIEW_MODE", &s.review_mode)
         .env("PORCH_FAKE_GH_MODE", "ok")
         .env("PATH", &s.path);
     cmd
@@ -334,6 +355,28 @@ fn park_compose_run(s: &Setup, branch: &str) -> porch_gate::RunRow {
         Duration::from_secs(45),
     );
     assert_eq!(run.status, "parked", "err={:?}", run.error);
+    run
+}
+
+fn park_review_run(s: &Setup, branch: &str) -> porch_gate::RunRow {
+    git(&s.work, &["checkout", "-b", branch]);
+    commit_change(&s.work, &format!("{branch}.txt"), "x\n");
+    push_feat(s, branch, Some("review park phase terminal"));
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["parked", "failed"],
+        Duration::from_secs(45),
+    );
+    assert_eq!(run.status, "parked", "err={:?}", run.error);
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run.id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_some(),
+        "blocking review park must leave an open review attempt"
+    );
     run
 }
 
@@ -464,6 +507,82 @@ fn superseding_by_a_new_push_leaves_matching_phase_event_beside_status() {
                     || e.cause.as_deref() == Some("superseded by new push"))
         }),
         "supersede must leave a matching phase terminal beside cancelled status: {events:?}"
+    );
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn review_park_approve_terminals_review_attempt_beside_status() {
+    let s = setup_with_review_mode("blocking");
+    let run = park_review_run(&s, "feat-phase-review-approve");
+    agent_cmd(&s)
+        .args(["agent", "respond", "approve", "--run-id", &run.id])
+        .assert()
+        .success();
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert!(
+        run.status == "parked" || run.status == "completed",
+        "approve should leave parked compose or completed: {run:?}"
+    );
+    assert!(run.review_approved_head_sha.is_some());
+
+    let events = rounds::phase::events_for_run(&db, &run.id).unwrap();
+    let attempts = rounds::phase::attempts_for_run(&db, &run.id).unwrap();
+    let review = attempts
+        .iter()
+        .find(|a| a.phase == rounds::phase::PhaseName::Review && a.parent_attempt_id.is_none())
+        .expect("review attempt");
+    assert!(
+        events.iter().any(|e| {
+            e.attempt_id == review.id && e.kind == rounds::phase::PhaseEventKind::Terminal
+        }),
+        "review approve must terminal the review attempt beside status: events={events:?}"
+    );
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run.id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_none(),
+        "review must not stay open after approve"
+    );
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn review_park_abort_terminals_review_attempt_beside_cancelled_status() {
+    let s = setup_with_review_mode("blocking");
+    let run = park_review_run(&s, "feat-phase-review-abort");
+    let out = agent_cmd(&s)
+        .args(["agent", "respond", "abort", "--run-id", &run.id])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    assert_eq!(run.status, "cancelled");
+    assert_eq!(run.error.as_deref(), Some("agent abort"));
+
+    let events = rounds::phase::events_for_run(&db, &run.id).unwrap();
+    let attempts = rounds::phase::attempts_for_run(&db, &run.id).unwrap();
+    let review = attempts
+        .iter()
+        .find(|a| a.phase == rounds::phase::PhaseName::Review && a.parent_attempt_id.is_none())
+        .expect("review attempt");
+    assert!(
+        events.iter().any(|e| {
+            e.attempt_id == review.id
+                && e.kind == rounds::phase::PhaseEventKind::Terminal
+                && e.outcome.as_deref() == Some("cancelled")
+        }),
+        "review abort must terminal the review attempt beside cancelled status: events={events:?}"
+    );
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run.id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_none(),
+        "review must not stay open after abort"
     );
     kill_daemon(&s.home);
 }

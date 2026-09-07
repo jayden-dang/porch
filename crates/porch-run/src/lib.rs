@@ -2336,6 +2336,7 @@ fn respond_review_approve(
                 error: Some("approved".into()),
             }],
         },
+        Some(("completed", Some("approved"))),
         |db, run| {
             db.set_review_approved_head_sha(&run.id, Some(&head))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
@@ -2413,7 +2414,13 @@ fn respond_review_abort(
             members: vec![],
         }
     };
-    match persist_authority_with_run_effects(db, plan, effects, None) {
+    let phase = Some(review_phase_terminal(
+        db,
+        &run.id,
+        "cancelled",
+        Some("agent abort"),
+    )?);
+    match persist_authority_with_run_effects(db, plan, effects, phase) {
         Ok(_) => {}
         Err(AuthorityError::Stale) => {
             tracing::warn!(
@@ -2441,54 +2448,72 @@ fn respond_review_skip(
     wt: &Path,
 ) -> std::result::Result<(), UsageOrFail> {
     let head = porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    // Authority co-writes only the review Terminal + review step; certify/deliver skips and
+    // completed status land via the phase seam afterward (one transition per authority txn).
     persist_review_bulk_or_legacy(
         db,
         run,
         AuthorityKind::ReviewSkipped,
         &head,
         RunEffects {
-            status: Some("completed".into()),
+            status: None,
             error: None,
             approved_head: None,
-            steps: vec![
-                StepEffect {
-                    step: "review".into(),
-                    status: "skipped".into(),
-                    error: Some("agent skip".into()),
-                },
-                StepEffect {
-                    step: "certify".into(),
-                    status: "skipped".into(),
-                    error: Some("skip remaining".into()),
-                },
-                StepEffect {
-                    step: "deliver".into(),
-                    status: "skipped".into(),
-                    error: Some("skip remaining".into()),
-                },
-            ],
+            steps: vec![StepEffect {
+                step: "review".into(),
+                status: "skipped".into(),
+                error: Some("agent skip".into()),
+            }],
         },
+        Some(("skipped", Some("agent skip"))),
         |db, run| {
             complete_phase_step(db, &run.id, "review", "skipped", Some("agent skip"))
-                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            for phase in ["certify", "deliver"] {
-                skip_phase_step(db, &run.id, phase, "skip remaining")
-                    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            }
-            complete_run_with_phase(db, &run.id).map_err(|e| UsageOrFail::Fail(e.to_string()))
+                .map_err(|e| UsageOrFail::Fail(e.to_string()))
         },
     )?;
+    for phase in ["certify", "deliver"] {
+        skip_phase_step(db, &run.id, phase, "skip remaining")
+            .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    }
+    complete_run_with_phase(db, &run.id).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     finish_remove_worktree(bare, run, wt);
     Ok(())
 }
 
+/// Resolve (or start) the open review attempt and build its Terminal transition.
+fn review_phase_terminal(
+    db: &Db,
+    run_id: &str,
+    outcome: &str,
+    cause: Option<&str>,
+) -> std::result::Result<PhaseTransition, UsageOrFail> {
+    if phase::nonterminal_attempt(db, run_id, PhaseName::Review)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?
+        .is_none()
+    {
+        let _ = start_phase(db, run_id, PhaseName::Review, RunEffects::none())
+            .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    }
+    let attempt = open_attempt(db, run_id, PhaseName::Review)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    Ok(PhaseTransition::Terminal {
+        attempt,
+        outcome: outcome.to_string(),
+        cause: cause.map(str::to_string),
+    })
+}
+
 /// Persist a bulk review authority event with run effects, or fall back for legacy parks.
+///
+/// When `phase_terminal` is `Some((outcome, cause))`, the open review attempt is terminated in
+/// the same Immediate txn as the authority event and effects.
 fn persist_review_bulk_or_legacy<F>(
     db: &Db,
     run: &RunRow,
     kind: AuthorityKind,
     live_head: &str,
     effects: RunEffects,
+    phase_terminal: Option<(&str, Option<&str>)>,
     legacy: F,
 ) -> std::result::Result<(), UsageOrFail>
 where
@@ -2529,7 +2554,11 @@ where
         identity_unavailable: false,
         members,
     };
-    match persist_authority_with_run_effects(db, plan, effects, None) {
+    let phase = match phase_terminal {
+        Some((outcome, cause)) => Some(review_phase_terminal(db, &run.id, outcome, cause)?),
+        None => None,
+    };
+    match persist_authority_with_run_effects(db, plan, effects, phase) {
         Ok(_) => Ok(()),
         Err(AuthorityError::Stale) => {
             tracing::warn!(
