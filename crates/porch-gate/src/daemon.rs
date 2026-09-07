@@ -282,7 +282,7 @@ fn start_run(
     {
         let mut guard = state.lock().expect("daemon state");
         for old in &prior {
-            let _ = db.set_run_status(&old.id, "cancelled", Some("superseded by new push"));
+            let _ = crate::rounds::phase::cancel_run(db, &old.id, "superseded by new push");
             guard.hub.publish_state(&old.id);
             guard
                 .hub

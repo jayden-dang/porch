@@ -226,28 +226,7 @@ pub fn persist_phase_transition(
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
         .map_err(crate::Error::from)?;
 
-    let (run_id, attempt_id) = match plan {
-        PhaseTransition::Start { run_id, phase } => apply_start_tx(&tx, run_id, phase)?,
-        PhaseTransition::Terminal {
-            attempt,
-            outcome,
-            cause,
-        } => apply_terminal_tx(&tx, attempt, &outcome, cause.as_deref())?,
-        PhaseTransition::NestedStart { parent, kind } => apply_nested_start_tx(&tx, &parent, kind)?,
-        PhaseTransition::NestedTerminal {
-            attempt,
-            outcome,
-            cause,
-        } => apply_nested_terminal_tx(&tx, attempt, &outcome, cause.as_deref())?,
-        PhaseTransition::Handoff {
-            from,
-            to_phase,
-            outcome,
-            cause,
-        } => apply_handoff_tx(&tx, &from, to_phase, &outcome, cause.as_deref())?,
-        PhaseTransition::Evidence { attempt, cause } => apply_evidence_tx(&tx, attempt, &cause)?,
-    };
-
+    let (run_id, attempt_id) = apply_phase_transition_tx(&tx, plan)?;
     apply_run_effects_tx(&tx, &run_id, effects)?;
     tx.execute(
         "UPDATE runs SET audit_rev = audit_rev + 1 WHERE id = ?1",
@@ -256,6 +235,34 @@ pub fn persist_phase_transition(
     .map_err(crate::Error::from)?;
     tx.commit().map_err(crate::Error::from)?;
     Ok(attempt_id)
+}
+
+/// Apply a phase transition on an open Immediate transaction (no commit).
+pub(crate) fn apply_phase_transition_tx(
+    tx: &Transaction<'_>,
+    plan: PhaseTransition,
+) -> std::result::Result<(String, AttemptId), PhaseError> {
+    match plan {
+        PhaseTransition::Start { run_id, phase } => apply_start_tx(tx, run_id, phase),
+        PhaseTransition::Terminal {
+            attempt,
+            outcome,
+            cause,
+        } => apply_terminal_tx(tx, attempt, &outcome, cause.as_deref()),
+        PhaseTransition::NestedStart { parent, kind } => apply_nested_start_tx(tx, &parent, kind),
+        PhaseTransition::NestedTerminal {
+            attempt,
+            outcome,
+            cause,
+        } => apply_nested_terminal_tx(tx, attempt, &outcome, cause.as_deref()),
+        PhaseTransition::Handoff {
+            from,
+            to_phase,
+            outcome,
+            cause,
+        } => apply_handoff_tx(tx, &from, to_phase, &outcome, cause.as_deref()),
+        PhaseTransition::Evidence { attempt, cause } => apply_evidence_tx(tx, attempt, &cause),
+    }
 }
 
 fn apply_start_tx(
@@ -381,11 +388,22 @@ fn apply_nested_terminal_tx(
         cause,
         &created_at,
     )?;
-    let fail_or_interrupt = outcome == "failed" || outcome == "interrupted";
-    if fail_or_interrupt
-        && nested.operation_kind == Some(OperationKind::Fixer)
-        && nested.phase == PhaseName::Review
-    {
+    let close_parent = match nested.operation_kind {
+        Some(OperationKind::Fixer)
+            if nested.phase == PhaseName::Review
+                && (outcome == "failed" || outcome == "interrupted") =>
+        {
+            true
+        }
+        Some(OperationKind::Compose)
+            if nested.phase == PhaseName::Deliver
+                && matches!(outcome, "cancelled" | "failed" | "interrupted" | "abort") =>
+        {
+            true
+        }
+        _ => false,
+    };
+    if close_parent {
         if let Some(parent_id) = nested.parent_attempt_id.as_ref() {
             let parent_seq = next_event_seq_tx(tx, &run_id)?;
             insert_event_tx(
@@ -741,6 +759,120 @@ pub fn events_for_run(db: &Db, run_id: &str) -> Result<Vec<PhaseEventRow>> {
         out.push(map_event(row)?);
     }
     Ok(out)
+}
+
+/// Cancel a run with a justifying phase event co-written with `runs.status`.
+///
+/// Prefers terminating an open nested compose under deliver (which also closes
+/// deliver), then any other open top-level attempt; if none exist, starts and
+/// terminals an intent attempt.
+///
+/// # Errors
+///
+/// Returns a [`PhaseError`] when the transition cannot commit.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn cancel_run(db: &Db, run_id: &str, cause: &str) -> std::result::Result<(), PhaseError> {
+    let effects = RunEffects {
+        status: Some("cancelled".into()),
+        error: Some(cause.to_string()),
+        approved_head: None,
+        steps: vec![],
+    };
+    if let Some(deliver) = nonterminal_attempt(db, run_id, PhaseName::Deliver)? {
+        if let Some(compose) = open_nested_compose(db, run_id, &deliver.id)? {
+            persist_phase_transition(
+                db,
+                PhaseTransition::NestedTerminal {
+                    attempt: compose,
+                    outcome: "cancelled".into(),
+                    cause: Some(cause.to_string()),
+                },
+                RunEffects {
+                    status: effects.status.clone(),
+                    error: effects.error.clone(),
+                    approved_head: None,
+                    steps: vec![StepEffect {
+                        step: "compose".into(),
+                        status: "cancelled".into(),
+                        error: Some(cause.to_string()),
+                    }],
+                },
+            )?;
+            return Ok(());
+        }
+        persist_phase_transition(
+            db,
+            PhaseTransition::Terminal {
+                attempt: deliver.id,
+                outcome: "cancelled".into(),
+                cause: Some(cause.to_string()),
+            },
+            effects,
+        )?;
+        return Ok(());
+    }
+    for name in [
+        PhaseName::Review,
+        PhaseName::Rebase,
+        PhaseName::Certify,
+        PhaseName::Intent,
+    ] {
+        if let Some(open) = nonterminal_attempt(db, run_id, name)? {
+            persist_phase_transition(
+                db,
+                PhaseTransition::Terminal {
+                    attempt: open.id,
+                    outcome: "cancelled".into(),
+                    cause: Some(cause.to_string()),
+                },
+                effects,
+            )?;
+            return Ok(());
+        }
+    }
+    persist_phase_transition(
+        db,
+        PhaseTransition::Start {
+            run_id: run_id.to_string(),
+            phase: PhaseName::Intent,
+        },
+        RunEffects::none(),
+    )?;
+    let intent =
+        nonterminal_attempt(db, run_id, PhaseName::Intent)?.ok_or(PhaseError::UnknownAttempt)?;
+    persist_phase_transition(
+        db,
+        PhaseTransition::Terminal {
+            attempt: intent.id,
+            outcome: "cancelled".into(),
+            cause: Some(cause.to_string()),
+        },
+        effects,
+    )?;
+    Ok(())
+}
+
+fn open_nested_compose(
+    db: &Db,
+    run_id: &str,
+    deliver: &AttemptId,
+) -> std::result::Result<Option<AttemptId>, PhaseError> {
+    let attempts = attempts_for_run(db, run_id).map_err(PhaseError::Storage)?;
+    let events = events_for_run(db, run_id).map_err(PhaseError::Storage)?;
+    Ok(attempts.into_iter().rev().find_map(|a| {
+        let is_compose = a.parent_attempt_id.as_ref() == Some(deliver)
+            && a.operation_kind == Some(OperationKind::Compose);
+        if !is_compose {
+            return None;
+        }
+        let terminal = events
+            .iter()
+            .any(|e| e.attempt_id == a.id && e.kind == PhaseEventKind::Terminal);
+        (!terminal).then_some(a.id)
+    }))
 }
 
 /// The nonterminal top-level attempt for `phase` on `run_id`, if any.

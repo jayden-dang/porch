@@ -556,6 +556,8 @@ impl Db {
     /// # Panics
     ///
     /// Panics if the connection mutex is poisoned.
+    // Called from in-crate tests; production writers use the phase seam's txn SQL.
+    #[allow(dead_code)]
     pub(crate) fn set_run_status(&self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex");
         conn.execute(

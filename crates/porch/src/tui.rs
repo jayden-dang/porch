@@ -851,6 +851,7 @@ fn apply_gap_and_snapshot(app: &mut App, snapshot: RunSnapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use porch_gate::rounds::{self, RunEffects};
     use porch_gate::{Db, db_path, set_finding_note, wait_for_health};
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
@@ -1157,7 +1158,20 @@ mod tests {
         let run = db
             .insert_run("repo1", "feat/demo", "abc123", None, None)
             .unwrap();
-        db.set_run_status(&run.id, "parked", None).unwrap();
+        rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::Start {
+                run_id: run.id.clone(),
+                phase: rounds::phase::PhaseName::Review,
+            },
+            RunEffects {
+                status: Some("parked".into()),
+                error: None,
+                approved_head: None,
+                steps: vec![],
+            },
+        )
+        .unwrap();
         db.set_worktree_dir(&run.id, &wt).unwrap();
         db.set_findings_json(
             &run.id,
@@ -1299,7 +1313,20 @@ mod tests {
         let run = db
             .insert_run("repo1", "feat/demo", "abc123", None, None)
             .unwrap();
-        db.set_run_status(&run.id, "parked", None).unwrap();
+        rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::Start {
+                run_id: run.id.clone(),
+                phase: rounds::phase::PhaseName::Review,
+            },
+            RunEffects {
+                status: Some("parked".into()),
+                error: None,
+                approved_head: None,
+                steps: vec![],
+            },
+        )
+        .unwrap();
         db.set_worktree_dir(&run.id, &wt).unwrap();
         db.set_findings_json(
             &run.id,

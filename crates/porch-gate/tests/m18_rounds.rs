@@ -3715,8 +3715,12 @@ fn abort_with_cancelled_commits_together_and_rolls_back_on_write_failure() {
         .unwrap();
     }
 
-    let poisoned =
-        rounds::persist_authority_with_run_effects(&db, abort_plan.clone(), cancel_effects.clone());
+    let poisoned = rounds::persist_authority_with_run_effects(
+        &db,
+        abort_plan.clone(),
+        cancel_effects.clone(),
+        None,
+    );
     assert!(
         poisoned.is_err(),
         "injected write failure must abort the transaction"
@@ -3735,8 +3739,9 @@ fn abort_with_cancelled_commits_together_and_rolls_back_on_write_failure() {
             .unwrap();
     }
 
-    let event_id = rounds::persist_authority_with_run_effects(&db, abort_plan, cancel_effects)
-        .expect("abort with cancelled");
+    let event_id =
+        rounds::persist_authority_with_run_effects(&db, abort_plan, cancel_effects, None)
+            .expect("abort with cancelled");
     let events = rounds::events_for_run(&db, &run_id).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].id, event_id);
@@ -3778,6 +3783,7 @@ fn approve_with_run_effects_writes_approved_head_and_review_step() {
                 error: Some("approved".into()),
             }],
         },
+        None,
     )
     .expect("approve with effects");
 
@@ -4679,5 +4685,96 @@ fn handoff_from_already_terminal_attempt_is_refused() {
     assert_eq!(
         review_terminals, 1,
         "refused handoff must not append a second terminal on from"
+    );
+}
+
+#[test]
+fn compose_abort_nested_terminal_closes_owning_deliver_and_cancels_run() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let deliver = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("start deliver");
+
+    let compose = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: deliver.clone(),
+            kind: rounds::phase::OperationKind::Compose,
+        },
+        rounds::RunEffects {
+            status: Some("parked".into()),
+            error: Some("awaiting compose".into()),
+            approved_head: None,
+            steps: vec![rounds::StepEffect {
+                step: "compose".into(),
+                status: "parked".into(),
+                error: None,
+            }],
+        },
+    )
+    .expect("start nested compose");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedTerminal {
+            attempt: compose.clone(),
+            outcome: "cancelled".into(),
+            cause: Some("agent abort".into()),
+        },
+        rounds::RunEffects {
+            status: Some("cancelled".into()),
+            error: Some("agent abort".into()),
+            approved_head: None,
+            steps: vec![rounds::StepEffect {
+                step: "compose".into(),
+                status: "cancelled".into(),
+                error: Some("agent abort".into()),
+            }],
+        },
+    )
+    .expect("compose abort terminals nested and parent");
+
+    let run = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(run.status, "cancelled");
+    assert_eq!(run.error.as_deref(), Some("agent abort"));
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == rounds::phase::PhaseEventKind::Terminal)
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        2,
+        "compose + deliver terminals: {events:?}"
+    );
+    assert!(terminals.iter().any(|e| e.attempt_id == compose));
+    assert!(terminals.iter().any(|e| e.attempt_id == deliver));
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Deliver)
+            .unwrap()
+            .is_none()
+    );
+    let steps = db.step_results_for_run(&run_id).unwrap();
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.step == "compose" && s.status == "cancelled"),
+        "steps={steps:?}"
     );
 }

@@ -186,10 +186,13 @@ pub fn persist_authority(
     db: &Db,
     plan: PersistAuthorityPlan,
 ) -> std::result::Result<String, AuthorityError> {
-    persist_authority_with_run_effects(db, plan, RunEffects::none())
+    persist_authority_with_run_effects(db, plan, RunEffects::none(), None)
 }
 
 /// Append one authority event and optional run status / HEAD / step rows in one Immediate txn.
+///
+/// When `phase` is `Some`, the phase transition is applied in the same transaction before
+/// run effects (compat until authority and phase writes share one core).
 ///
 /// # Errors
 ///
@@ -203,6 +206,7 @@ pub fn persist_authority_with_run_effects(
     db: &Db,
     plan: PersistAuthorityPlan,
     effects: RunEffects,
+    phase: Option<super::phase::PhaseTransition>,
 ) -> std::result::Result<String, AuthorityError> {
     if plan.identity_unavailable {
         if plan.kind != AuthorityKind::ReviewAborted {
@@ -295,6 +299,11 @@ pub fn persist_authority_with_run_effects(
                 .execute(rusqlite::params![event_id, instance_id, role.as_str()])
                 .map_err(crate::Error::from)?;
         }
+    }
+
+    if let Some(phase) = phase {
+        super::phase::apply_phase_transition_tx(&tx, phase)
+            .map_err(|e| AuthorityError::Storage(crate::Error::Other(e.to_string())))?;
     }
 
     apply_run_effects_tx(&tx, &run_id, effects)?;

@@ -18,6 +18,9 @@ use porch_agent::{
     RunFixerOpts, fixer_bin, fixer_timeout, run_fixer, write_deliver_repair_inputs,
     write_fixer_inputs, write_rebase_fix_inputs,
 };
+use porch_gate::rounds::phase::{
+    self as phase, AttemptId, OperationKind, PhaseEventKind, PhaseName, PhaseTransition,
+};
 use porch_gate::rounds::{
     self, ActorKind, AssuranceCompletion, AuthorityError, AuthorityKind, ContextApplication,
     ContextApplicationState, ContextSource, EquivalenceInput, ExecutionState, FinalizeOutcome,
@@ -113,15 +116,341 @@ fn publish_run(run_id: &str, activity: &str) {
     }
 }
 
-fn set_status(db: &Db, run_id: &str, status: &str, error: Option<&str>) -> Result<()> {
-    db.set_run_status(run_id, status, error)?;
+fn phase_fail(err: &phase::PhaseError) -> RunError {
+    RunError::Msg(err.to_string())
+}
+
+fn gate_fail(err: &porch_gate::Error) -> RunError {
+    RunError::Msg(err.to_string())
+}
+
+fn apply_phase(db: &Db, transition: PhaseTransition, effects: RunEffects) -> Result<AttemptId> {
+    phase::persist_phase_transition(db, transition, effects).map_err(|e| phase_fail(&e))
+}
+
+#[allow(dead_code)] // thin seam wrapper; call sites prefer combined helpers
+fn set_status(
+    db: &Db,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+    transition: PhaseTransition,
+) -> Result<()> {
+    apply_phase(
+        db,
+        transition,
+        RunEffects {
+            status: Some(status.to_string()),
+            error: error.map(str::to_string),
+            approved_head: None,
+            steps: vec![],
+        },
+    )?;
     publish_run(run_id, &format!("status={status}"));
     Ok(())
 }
 
-fn record_step(db: &Db, run_id: &str, step: &str, status: &str, error: Option<&str>) -> Result<()> {
-    db.insert_step_result(run_id, step, status, error)?;
+#[allow(dead_code)] // thin seam wrapper; call sites prefer combined helpers
+fn record_step(
+    db: &Db,
+    run_id: &str,
+    step: &str,
+    status: &str,
+    error: Option<&str>,
+    transition: PhaseTransition,
+) -> Result<()> {
+    apply_phase(
+        db,
+        transition,
+        RunEffects {
+            status: None,
+            error: None,
+            approved_head: None,
+            steps: vec![StepEffect {
+                step: step.to_string(),
+                status: status.to_string(),
+                error: error.map(str::to_string),
+            }],
+        },
+    )?;
     publish_run(run_id, &format!("step={step} status={status}"));
+    Ok(())
+}
+
+fn persist_effects(
+    db: &Db,
+    run_id: &str,
+    transition: PhaseTransition,
+    effects: RunEffects,
+) -> Result<AttemptId> {
+    let status = effects.status.clone();
+    let steps = effects.steps.clone();
+    let id = apply_phase(db, transition, effects)?;
+    if let Some(status) = status.as_deref() {
+        publish_run(run_id, &format!("status={status}"));
+    }
+    for step in &steps {
+        publish_run(
+            run_id,
+            &format!("step={} status={}", step.step, step.status),
+        );
+    }
+    Ok(id)
+}
+
+fn open_attempt(db: &Db, run_id: &str, name: PhaseName) -> Result<AttemptId> {
+    phase::nonterminal_attempt(db, run_id, name)
+        .map_err(|e| gate_fail(&e))?
+        .map(|row| row.id)
+        .ok_or_else(|| {
+            RunError::Msg(format!(
+                "no open {} attempt for run {run_id}",
+                name.as_str()
+            ))
+        })
+}
+
+fn start_phase(db: &Db, run_id: &str, name: PhaseName, effects: RunEffects) -> Result<AttemptId> {
+    persist_effects(
+        db,
+        run_id,
+        PhaseTransition::Start {
+            run_id: run_id.to_string(),
+            phase: name,
+        },
+        effects,
+    )
+}
+
+fn terminal_open(
+    db: &Db,
+    run_id: &str,
+    name: PhaseName,
+    outcome: &str,
+    cause: Option<&str>,
+    effects: RunEffects,
+) -> Result<AttemptId> {
+    let attempt = open_attempt(db, run_id, name)?;
+    persist_effects(
+        db,
+        run_id,
+        PhaseTransition::Terminal {
+            attempt,
+            outcome: outcome.to_string(),
+            cause: cause.map(str::to_string),
+        },
+        effects,
+    )
+}
+
+fn evidence_open(
+    db: &Db,
+    run_id: &str,
+    name: PhaseName,
+    cause: &str,
+    effects: RunEffects,
+) -> Result<AttemptId> {
+    let attempt = open_attempt(db, run_id, name)?;
+    persist_effects(
+        db,
+        run_id,
+        PhaseTransition::Evidence {
+            attempt,
+            cause: cause.to_string(),
+        },
+        effects,
+    )
+}
+
+fn parse_phase_name(step: &str) -> Option<PhaseName> {
+    match step {
+        "intent" => Some(PhaseName::Intent),
+        "rebase" => Some(PhaseName::Rebase),
+        "review" => Some(PhaseName::Review),
+        "certify" => Some(PhaseName::Certify),
+        "deliver" => Some(PhaseName::Deliver),
+        _ => None,
+    }
+}
+
+fn skip_phase_step(db: &Db, run_id: &str, step: &str, detail: &str) -> Result<()> {
+    let Some(name) = parse_phase_name(step) else {
+        return Err(RunError::Msg(format!(
+            "cannot skip non-canonical step {step}"
+        )));
+    };
+    let _ = start_phase(db, run_id, name, RunEffects::none())?;
+    let _ = terminal_open(
+        db,
+        run_id,
+        name,
+        "skipped",
+        Some(detail),
+        RunEffects {
+            status: None,
+            error: None,
+            approved_head: None,
+            steps: vec![StepEffect {
+                step: step.to_string(),
+                status: "skipped".to_string(),
+                error: Some(detail.to_string()),
+            }],
+        },
+    )?;
+    Ok(())
+}
+
+fn complete_phase_step(
+    db: &Db,
+    run_id: &str,
+    step: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    let Some(name) = parse_phase_name(step) else {
+        return Err(RunError::Msg(format!(
+            "cannot complete non-canonical step {step}"
+        )));
+    };
+    if phase::nonterminal_attempt(db, run_id, name)
+        .map_err(|e| gate_fail(&e))?
+        .is_none()
+    {
+        let _ = start_phase(db, run_id, name, RunEffects::none())?;
+    }
+    let _ = terminal_open(
+        db,
+        run_id,
+        name,
+        status,
+        error,
+        RunEffects {
+            status: None,
+            error: None,
+            approved_head: None,
+            steps: vec![StepEffect {
+                step: step.to_string(),
+                status: status.to_string(),
+                error: error.map(str::to_string),
+            }],
+        },
+    )?;
+    Ok(())
+}
+
+fn park_phase_step(
+    db: &Db,
+    run_id: &str,
+    step: &str,
+    detail: Option<&str>,
+    run_status_error: Option<&str>,
+) -> Result<()> {
+    let Some(name) = parse_phase_name(step) else {
+        return Err(RunError::Msg(format!(
+            "cannot park non-canonical step {step}"
+        )));
+    };
+    if phase::nonterminal_attempt(db, run_id, name)
+        .map_err(|e| gate_fail(&e))?
+        .is_none()
+    {
+        let _ = start_phase(db, run_id, name, RunEffects::none())?;
+    }
+    let cause = detail.unwrap_or("parked");
+    let _ = evidence_open(
+        db,
+        run_id,
+        name,
+        cause,
+        RunEffects {
+            status: Some("parked".into()),
+            error: run_status_error.map(str::to_string),
+            approved_head: None,
+            steps: vec![StepEffect {
+                step: step.to_string(),
+                status: "parked".to_string(),
+                error: detail.map(str::to_string),
+            }],
+        },
+    )?;
+    Ok(())
+}
+
+fn cancel_run_with_phase(db: &Db, run_id: &str, cause: &str) -> Result<()> {
+    phase::cancel_run(db, run_id, cause).map_err(|e| phase_fail(&e))?;
+    publish_run(run_id, "status=cancelled");
+    Ok(())
+}
+
+fn fail_run_with_phase(db: &Db, run_id: &str, msg: &str) -> Result<()> {
+    let effects = RunEffects {
+        status: Some("failed".into()),
+        error: Some(msg.to_string()),
+        approved_head: None,
+        steps: vec![],
+    };
+    for name in [
+        PhaseName::Deliver,
+        PhaseName::Certify,
+        PhaseName::Review,
+        PhaseName::Rebase,
+        PhaseName::Intent,
+    ] {
+        if phase::nonterminal_attempt(db, run_id, name)
+            .map_err(|e| gate_fail(&e))?
+            .is_some()
+        {
+            let _ = terminal_open(db, run_id, name, "failed", Some(msg), effects)?;
+            return Ok(());
+        }
+    }
+    let _ = start_phase(db, run_id, PhaseName::Intent, RunEffects::none())?;
+    let _ = terminal_open(db, run_id, PhaseName::Intent, "failed", Some(msg), effects)?;
+    Ok(())
+}
+
+fn complete_run_with_phase(db: &Db, run_id: &str) -> Result<()> {
+    let effects = RunEffects {
+        status: Some("completed".into()),
+        error: None,
+        approved_head: None,
+        steps: vec![],
+    };
+    for name in [
+        PhaseName::Deliver,
+        PhaseName::Certify,
+        PhaseName::Review,
+        PhaseName::Rebase,
+        PhaseName::Intent,
+    ] {
+        if phase::nonterminal_attempt(db, run_id, name)
+            .map_err(|e| gate_fail(&e))?
+            .is_some()
+        {
+            let _ = terminal_open(db, run_id, name, "completed", None, effects)?;
+            return Ok(());
+        }
+    }
+    // All phases already terminal — still need a justifying event for status.
+    if let Some(deliver) = phase::attempts_for_run(db, run_id)
+        .map_err(|e| gate_fail(&e))?
+        .into_iter()
+        .rev()
+        .find(|a| a.phase == PhaseName::Deliver && a.parent_attempt_id.is_none())
+    {
+        let _ = persist_effects(
+            db,
+            run_id,
+            PhaseTransition::Evidence {
+                attempt: deliver.id,
+                cause: "run_completed".into(),
+            },
+            effects,
+        )?;
+        return Ok(());
+    }
+    let _ = start_phase(db, run_id, PhaseName::Deliver, RunEffects::none())?;
+    let _ = terminal_open(db, run_id, PhaseName::Deliver, "completed", None, effects)?;
     Ok(())
 }
 
@@ -148,12 +477,22 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
     let bare = GitDir::new(&repo.bare_path)?;
     let wt_path = run_worktree_dir(home, &run.repo_id, run_id);
 
-    set_status(&db, run_id, "running", None)?;
+    let _ = start_phase(
+        &db,
+        run_id,
+        PhaseName::Intent,
+        RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )?;
     db.set_worktree_dir(run_id, &wt_path)?;
 
     if let Err(e) = porch_git::worktree_add_detach(&bare, &wt_path, &run.sha) {
         let msg = format!("worktree add: {e}");
-        let _ = set_status(&db, run_id, "failed", Some(&msg));
+        let _ = fail_run_with_phase(&db, run_id, &msg);
         remove_run_worktree(&bare, &wt_path);
         return Err(RunError::Msg(msg));
     }
@@ -166,42 +505,46 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                 return Err(RunError::Msg("cancelled".into()));
             }
             if skip_remaining {
-                record_step(&db, run_id, phase, "skipped", Some("skip remaining"))?;
+                skip_phase_step(&db, run_id, phase, "skip remaining")?;
                 continue;
             }
             match *phase {
                 "intent" => {
                     if run.intent.as_ref().is_some_and(|s| !s.trim().is_empty()) {
-                        record_step(&db, run_id, phase, "completed", None)?;
+                        complete_phase_step(&db, run_id, phase, "completed", None)?;
                     } else {
-                        record_step(&db, run_id, phase, "skipped", Some("no intent"))?;
+                        complete_phase_step(&db, run_id, phase, "skipped", Some("no intent"))?;
                     }
                 }
                 "rebase" => {
+                    let _ = start_phase(&db, run_id, PhaseName::Rebase, RunEffects::none())?;
                     match run_rebase(&db, home, run_id, &bare, &wt_path, &repo.default_branch)? {
                         RebaseOutcome::Completed { empty } => {
-                            record_step(&db, run_id, phase, "completed", None)?;
+                            complete_phase_step(&db, run_id, phase, "completed", None)?;
                             if empty {
                                 skip_remaining = true;
                             }
                         }
                         RebaseOutcome::Parked { detail } => {
-                            record_step(&db, run_id, phase, "parked", Some(&detail))?;
-                            set_status(&db, run_id, "parked", Some(&detail))?;
+                            park_phase_step(&db, run_id, phase, Some(&detail), Some(&detail))?;
                             return Ok(PhaseLoop::Parked);
                         }
                     }
                 }
-                "review" => match run_review_phase(&db, home, run_id, &bare, &wt_path, false)? {
-                    ReviewPhase::Approved => {
-                        record_step(&db, run_id, phase, "completed", None)?;
+                "review" => {
+                    let _ = start_phase(&db, run_id, PhaseName::Review, RunEffects::none())?;
+                    match run_review_phase(&db, home, run_id, &bare, &wt_path, false)? {
+                        ReviewPhase::Approved => {
+                            complete_phase_step(&db, run_id, phase, "completed", None)?;
+                        }
+                        ReviewPhase::Parked => {
+                            park_phase_step(&db, run_id, phase, None, None)?;
+                            return Ok(PhaseLoop::Parked);
+                        }
                     }
-                    ReviewPhase::Parked => {
-                        record_step(&db, run_id, phase, "parked", None)?;
-                        return Ok(PhaseLoop::Parked);
-                    }
-                },
+                }
                 "certify" => {
+                    let _ = start_phase(&db, run_id, PhaseName::Certify, RunEffects::none())?;
                     execute_certify_step(
                         &db,
                         home,
@@ -213,6 +556,7 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                     )?;
                 }
                 "deliver" => {
+                    let _ = start_phase(&db, run_id, PhaseName::Deliver, RunEffects::none())?;
                     match execute_deliver_step(
                         &db,
                         home,
@@ -241,16 +585,16 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
         // Supersede wins over success and over deliver/certify failure (e.g.
         // watch poll timeout after cancel while babysitting checks).
         _ if cancelled => {
-            let _ = set_status(&db, run_id, "cancelled", Some("superseded by new push"));
+            let _ = cancel_run_with_phase(&db, run_id, "superseded by new push");
         }
         Ok(PhaseLoop::Continue) => {
-            let _ = set_status(&db, run_id, "completed", None);
+            let _ = complete_run_with_phase(&db, run_id);
         }
         Err(RunError::Msg(m)) if m == "cancelled" => {
-            let _ = set_status(&db, run_id, "cancelled", Some("superseded by new push"));
+            let _ = cancel_run_with_phase(&db, run_id, "superseded by new push");
         }
         Err(e) => {
-            let _ = set_status(&db, run_id, "failed", Some(&e.to_string()));
+            let _ = fail_run_with_phase(&db, run_id, &e.to_string());
         }
     }
     if let Ok(Some(final_run)) = db.run_by_id(run_id) {
@@ -320,7 +664,6 @@ fn run_review_phase(
     publish_run(run_id, "findings updated");
 
     if spawned.has_blocking() {
-        set_status(db, run_id, "parked", None)?;
         return Ok(ReviewPhase::Parked);
     }
 
@@ -505,7 +848,7 @@ fn refuse_shape_mismatch(
         "attempted_shape": attempted_shape,
     })
     .to_string();
-    record_step(db, run_id, "review", "failed", Some(&payload))?;
+    complete_phase_step(db, run_id, "review", "failed", Some(&payload))?;
     Err(RunError::Msg(payload))
 }
 
@@ -1176,12 +1519,12 @@ fn execute_certify_step(
     assert_head_continuity(db, run_id, wt)?;
     match certify::run_certify_phase(db, home, run_id, bare, wt, default_branch, Some(cancel)) {
         Ok(()) => {
-            record_step(db, run_id, "certify", "completed", None)?;
+            complete_phase_step(db, run_id, "certify", "completed", None)?;
             Ok(())
         }
         Err(e) => {
             let msg = e.to_string();
-            record_step(db, run_id, "certify", "failed", Some(&msg))?;
+            complete_phase_step(db, run_id, "certify", "failed", Some(&msg))?;
             if msg == "cancelled" {
                 return Err(RunError::Msg("cancelled".into()));
             }
@@ -1205,6 +1548,7 @@ fn execute_deliver_step(
 
 /// Push/PR/watch; on mechanical allowlisted red or CONFLICTING PR, repair and
 /// restart at review → certify → deliver (same `run_id`, no intent/rebase).
+#[allow(clippy::too_many_lines)] // repair loop co-writes nested ops and handoff
 fn deliver_with_repair(
     db: &Db,
     home: &Path,
@@ -1224,20 +1568,45 @@ fn deliver_with_repair(
                 return Ok(PhaseLoop::Parked);
             }
             Ok(deliver::DeliverOutcome::Completed) => {
-                record_step(db, run_id, "deliver", "completed", None)?;
+                complete_phase_step(db, run_id, "deliver", "completed", None)?;
                 return Ok(PhaseLoop::Continue);
             }
             Err(e) => {
                 let msg = e.to_string();
-                record_step(db, run_id, "deliver", "failed", Some(&msg))?;
-                if msg == "cancelled" {
-                    return Err(RunError::Msg("cancelled".into()));
-                }
+                // Repairable failures stay nonterminal evidence on deliver (PHASE-2.8).
                 let repairable = matches!(
                     &e,
                     deliver::DeliverError::AllowlistFailed { .. }
                         | deliver::DeliverError::MergeConflicting
                 );
+                if repairable {
+                    let cause = match &e {
+                        deliver::DeliverError::AllowlistFailed { .. } => "AllowlistFailed",
+                        deliver::DeliverError::MergeConflicting => "MergeConflicting",
+                        _ => "deliver_failed",
+                    };
+                    let _ = evidence_open(
+                        db,
+                        run_id,
+                        PhaseName::Deliver,
+                        cause,
+                        RunEffects {
+                            status: None,
+                            error: None,
+                            approved_head: None,
+                            steps: vec![StepEffect {
+                                step: "deliver".into(),
+                                status: "failed".into(),
+                                error: Some(msg.clone()),
+                            }],
+                        },
+                    )?;
+                } else {
+                    complete_phase_step(db, run_id, "deliver", "failed", Some(&msg))?;
+                }
+                if msg == "cancelled" {
+                    return Err(RunError::Msg("cancelled".into()));
+                }
                 if !repairable {
                     return Err(RunError::Deliver(e));
                 }
@@ -1250,6 +1619,16 @@ fn deliver_with_repair(
                     )));
                 }
                 let attempt = db.increment_deliver_repair_attempts(run_id)?;
+                let deliver_attempt = open_attempt(db, run_id, PhaseName::Deliver)?;
+                let repair_attempt = persist_effects(
+                    db,
+                    run_id,
+                    PhaseTransition::NestedStart {
+                        parent: deliver_attempt.clone(),
+                        kind: OperationKind::DeliverRepair,
+                    },
+                    RunEffects::none(),
+                )?;
                 let pre_repair_head = porch_git::rev_parse_c(wt, "HEAD")?;
                 match &e {
                     deliver::DeliverError::AllowlistFailed { checks } => {
@@ -1264,25 +1643,75 @@ fn deliver_with_repair(
                 if new_head == pre_repair_head {
                     // Attempt counted; loop will re-deliver / re-watch or exhaust.
                     tracing::warn!(run_id, attempt, "deliver repair attempt did not move HEAD");
+                    let _ = persist_effects(
+                        db,
+                        run_id,
+                        PhaseTransition::NestedTerminal {
+                            attempt: repair_attempt,
+                            outcome: "completed".into(),
+                            cause: Some(format!("attempt {attempt} unchanged_head")),
+                        },
+                        RunEffects {
+                            status: None,
+                            error: None,
+                            approved_head: None,
+                            steps: vec![StepEffect {
+                                step: "deliver_repair".into(),
+                                status: "completed".into(),
+                                error: Some(format!("attempt {attempt}")),
+                            }],
+                        },
+                    )?;
                     continue;
                 }
                 // Revoke review binding; do not upsert uncertified_pipeline_ranges.
                 db.set_review_approved_head_sha(run_id, None)?;
                 db.set_run_shas(run_id, Some(&new_head), None)?;
-                record_step(
+                let _ = persist_effects(
                     db,
                     run_id,
-                    "deliver_repair",
-                    "completed",
-                    Some(&format!("attempt {attempt}")),
+                    PhaseTransition::NestedTerminal {
+                        attempt: repair_attempt,
+                        outcome: "completed".into(),
+                        cause: Some(format!("attempt {attempt}")),
+                    },
+                    RunEffects {
+                        status: None,
+                        error: None,
+                        approved_head: None,
+                        steps: vec![StepEffect {
+                            step: "deliver_repair".into(),
+                            status: "completed".into(),
+                            error: Some(format!("attempt {attempt}")),
+                        }],
+                    },
+                )?;
+                // Head moved: hand deliver → review before rereview.
+                let _ = persist_effects(
+                    db,
+                    run_id,
+                    PhaseTransition::Handoff {
+                        from: deliver_attempt,
+                        to_phase: PhaseName::Review,
+                        outcome: "deliver_repair".into(),
+                        cause: Some(format!("attempt {attempt}")),
+                    },
+                    RunEffects::none(),
                 )?;
 
                 // Session-free rereview (after_fix never passes fixer session).
                 match run_review_phase(db, home, run_id, bare, wt, true)? {
                     ReviewPhase::Approved => {
-                        record_step(db, run_id, "review", "completed", Some("deliver_repair"))?;
+                        complete_phase_step(
+                            db,
+                            run_id,
+                            "review",
+                            "completed",
+                            Some("deliver_repair"),
+                        )?;
                         let local_cancel = AtomicBool::new(false);
                         let cancel_flag = cancel.unwrap_or(&local_cancel);
+                        let _ = start_phase(db, run_id, PhaseName::Certify, RunEffects::none())?;
                         execute_certify_step(
                             db,
                             home,
@@ -1294,9 +1723,10 @@ fn deliver_with_repair(
                         )?;
                         assert_head_continuity(db, run_id, wt)?;
                         // Loop: lease-push + PR update + re-watch.
+                        let _ = start_phase(db, run_id, PhaseName::Deliver, RunEffects::none())?;
                     }
                     ReviewPhase::Parked => {
-                        record_step(db, run_id, "review", "parked", Some("deliver_repair"))?;
+                        park_phase_step(db, run_id, "review", Some("deliver_repair"), None)?;
                         return Ok(PhaseLoop::Parked);
                     }
                 }
@@ -1859,7 +2289,7 @@ fn agent_respond_inner(
             respond_review_skip(&db, &run, &bare, &wt)?;
         }
         AgentResponse::Abort if phase == "rebase" => {
-            set_status(&db, &run.id, "cancelled", Some("agent abort"))
+            cancel_run_with_phase(&db, &run.id, "agent abort")
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             finish_remove_worktree(&bare, &run, &wt);
         }
@@ -1909,7 +2339,7 @@ fn respond_review_approve(
         |db, run| {
             db.set_review_approved_head_sha(&run.id, Some(&head))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-            record_step(db, &run.id, "review", "completed", Some("approved"))
+            complete_phase_step(db, &run.id, "review", "completed", Some("approved"))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))
         },
     )?;
@@ -1983,7 +2413,7 @@ fn respond_review_abort(
             members: vec![],
         }
     };
-    match persist_authority_with_run_effects(db, plan, effects) {
+    match persist_authority_with_run_effects(db, plan, effects, None) {
         Ok(_) => {}
         Err(AuthorityError::Stale) => {
             tracing::warn!(
@@ -2039,13 +2469,13 @@ fn respond_review_skip(
             ],
         },
         |db, run| {
-            record_step(db, &run.id, "review", "skipped", Some("agent skip"))
+            complete_phase_step(db, &run.id, "review", "skipped", Some("agent skip"))
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             for phase in ["certify", "deliver"] {
-                record_step(db, &run.id, phase, "skipped", Some("skip remaining"))
+                skip_phase_step(db, &run.id, phase, "skip remaining")
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             }
-            set_status(db, &run.id, "completed", None).map_err(|e| UsageOrFail::Fail(e.to_string()))
+            complete_run_with_phase(db, &run.id).map_err(|e| UsageOrFail::Fail(e.to_string()))
         },
     )?;
     finish_remove_worktree(bare, run, wt);
@@ -2099,7 +2529,7 @@ where
         identity_unavailable: false,
         members,
     };
-    match persist_authority_with_run_effects(db, plan, effects) {
+    match persist_authority_with_run_effects(db, plan, effects, None) {
         Ok(_) => Ok(()),
         Err(AuthorityError::Stale) => {
             tracing::warn!(
@@ -2158,12 +2588,23 @@ fn respond_compose(
             Ok(())
         }
         Err(deliver::DeliverError::ComposeRejected(msg)) => {
-            let _ = db.set_run_status(&run.id, "parked", Some(&msg));
+            let _ = evidence_open(
+                db,
+                &run.id,
+                PhaseName::Deliver,
+                &msg,
+                RunEffects {
+                    status: Some("parked".into()),
+                    error: Some(msg.clone()),
+                    approved_head: None,
+                    steps: vec![],
+                },
+            );
             Err(UsageOrFail::Fail(msg))
         }
         Err(e) => {
             let msg = e.to_string();
-            let _ = set_status(db, &run.id, "failed", Some(&msg));
+            let _ = fail_run_with_phase(db, &run.id, &msg);
             if let Ok(Some(run)) = db.run_by_id(&run.id) {
                 finish_remove_worktree(bare, &run, wt);
             } else {
@@ -2187,6 +2628,7 @@ fn parked_phase(db: &Db, run: &RunRow) -> String {
 }
 
 /// Fixer for rebase-parked runs: edit tip, then retry rebase and continue pipeline.
+#[allow(clippy::too_many_lines)] // rebase resume parks/fails/continues through the seam
 fn respond_rebase_fix(
     db: &Db,
     home: &Path,
@@ -2221,7 +2663,20 @@ fn respond_rebase_fix(
     let (prompt_file, findings_file) = write_rebase_fix_inputs(&fixer_dir, &findings_json)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
 
-    set_status(db, &run.id, "running", None).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    // Resume the parked rebase attempt.
+    evidence_open(
+        db,
+        &run.id,
+        PhaseName::Rebase,
+        "fixer_resume",
+        RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
 
     let bin = match fixer_bin() {
         Ok(b) => b,
@@ -2249,15 +2704,13 @@ fn respond_rebase_fix(
         match porch_git::rebase_abort(wt) {
             Ok(()) => {
                 let msg = format!("rebase conflict: {e}");
-                record_step(db, &run.id, "rebase", "parked", Some(&msg))
-                    .map_err(|err| UsageOrFail::Fail(err.to_string()))?;
-                set_status(db, &run.id, "parked", Some(&msg))
+                park_phase_step(db, &run.id, "rebase", Some(&msg), Some(&msg))
                     .map_err(|err| UsageOrFail::Fail(err.to_string()))?;
                 return Ok(());
             }
             Err(abort_err) => {
                 let msg = format!("rebase conflict: {e}; rebase --abort failed: {abort_err}");
-                set_status(db, &run.id, "failed", Some(&msg))
+                fail_run_with_phase(db, &run.id, &msg)
                     .map_err(|err| UsageOrFail::Fail(err.to_string()))?;
                 finish_remove_worktree(bare, run, wt);
                 return Ok(());
@@ -2268,32 +2721,34 @@ fn respond_rebase_fix(
     let head = porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     db.set_run_shas(&run.id, Some(&head), Some(&onto))
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-    record_step(db, &run.id, "rebase", "completed", Some("after fix"))
+    complete_phase_step(db, &run.id, "rebase", "completed", Some("after fix"))
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
 
     let range = format!("{onto}..{head}");
     let empty = porch_git::diff_is_empty(wt, &range).unwrap_or(false);
     if empty {
         for phase in ["review", "certify", "deliver"] {
-            record_step(db, &run.id, phase, "skipped", Some("empty after rebase"))
+            skip_phase_step(db, &run.id, phase, "empty after rebase")
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
         }
-        set_status(db, &run.id, "completed", None).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+        complete_run_with_phase(db, &run.id).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
         finish_remove_worktree(bare, run, wt);
         return Ok(());
     }
 
+    start_phase(db, &run.id, PhaseName::Review, RunEffects::none())
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     match run_review_phase(db, home, &run.id, bare, wt, false) {
         Ok(ReviewPhase::Approved) => {
             complete_after_review(db, home, bare, wt, run, None)?;
         }
         Ok(ReviewPhase::Parked) => {
-            record_step(db, &run.id, "review", "parked", None)
+            park_phase_step(db, &run.id, "review", None, None)
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
         }
         Err(e) => {
             let msg = e.to_string();
-            set_status(db, &run.id, "failed", Some(&msg))
+            fail_run_with_phase(db, &run.id, &msg)
                 .map_err(|err| UsageOrFail::Fail(err.to_string()))?;
             finish_remove_worktree(bare, run, wt);
         }
@@ -2427,7 +2882,24 @@ fn spawn_and_wait_fixer(
     let (prompt_file, findings_file) = write_fixer_inputs(&fixer_dir, &findings_json)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
 
-    set_status(db, &run.id, "running", None).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    // Nested fixer under the parked review attempt.
+    let review = open_attempt(db, &run.id, PhaseName::Review)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    persist_effects(
+        db,
+        &run.id,
+        PhaseTransition::NestedStart {
+            parent: review,
+            kind: OperationKind::Fixer,
+        },
+        RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     let pre_fix_head =
         porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
 
@@ -2462,6 +2934,7 @@ fn spawn_and_wait_fixer(
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // callers use `?` in Result contexts
 fn fail_fix_run(
     db: &Db,
     bare: &GitDir,
@@ -2473,7 +2946,38 @@ fn fail_fix_run(
     if let Ok(new_head) = porch_git::rev_parse_c(wt, "HEAD") {
         let _ = persist_uncertified_after_fix(db, wt, run, pre_fix_head, &new_head);
     }
-    set_status(db, &run.id, "failed", Some(msg)).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    // Failed nested fixer also terminals parent review (seam NestedTerminal).
+    if let Ok(review) = open_attempt(db, &run.id, PhaseName::Review) {
+        let attempts = phase::attempts_for_run(db, &run.id).unwrap_or_default();
+        let events = phase::events_for_run(db, &run.id).unwrap_or_default();
+        if let Some(fixer) = attempts.into_iter().rev().find(|a| {
+            a.parent_attempt_id.as_ref() == Some(&review)
+                && a.operation_kind == Some(OperationKind::Fixer)
+                && !events
+                    .iter()
+                    .any(|e| e.attempt_id == a.id && e.kind == PhaseEventKind::Terminal)
+        }) {
+            let _ = persist_effects(
+                db,
+                &run.id,
+                PhaseTransition::NestedTerminal {
+                    attempt: fixer.id,
+                    outcome: "failed".into(),
+                    cause: Some(msg.to_string()),
+                },
+                RunEffects {
+                    status: Some("failed".into()),
+                    error: Some(msg.to_string()),
+                    approved_head: None,
+                    steps: vec![],
+                },
+            );
+        } else {
+            let _ = fail_run_with_phase(db, &run.id, msg);
+        }
+    } else {
+        let _ = fail_run_with_phase(db, &run.id, msg);
+    }
     finish_remove_worktree(bare, run, wt);
     Ok(())
 }
@@ -2509,14 +3013,13 @@ fn finish_rereview(
                     finish_remove_worktree(bare, run, wt);
                 }
             } else {
-                record_step(db, &run.id, "review", "parked", Some("fix_review"))
+                park_phase_step(db, &run.id, "review", Some("fix_review"), None)
                     .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             }
         }
         Err(e) => {
             let msg = e.to_string();
-            set_status(db, &run.id, "failed", Some(&msg))
-                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            fail_run_with_phase(db, &run.id, &msg).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             finish_remove_worktree(bare, run, wt);
         }
     }
@@ -2540,7 +3043,7 @@ fn persist_standing_consent_approve(
         );
         db.set_review_approved_head_sha(&run.id, Some(live_head))
             .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
-        record_step(
+        complete_phase_step(
             db,
             &run.id,
             "review",
@@ -2600,7 +3103,7 @@ fn persist_standing_consent_approve(
             error: Some("approved remaining after --yes".into()),
         }],
     };
-    match persist_authority_with_run_effects(db, plan, effects) {
+    match persist_authority_with_run_effects(db, plan, effects, None) {
         Ok(_) => Ok(()),
         Err(AuthorityError::Stale) => {
             tracing::warn!(
@@ -2625,7 +3128,7 @@ fn complete_after_review(
     run: &RunRow,
     review_note: Option<&str>,
 ) -> std::result::Result<(), UsageOrFail> {
-    record_step(db, &run.id, "review", "completed", review_note)
+    complete_phase_step(db, &run.id, "review", "completed", review_note)
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     let repo = db
         .repo_by_id(&run.repo_id)
@@ -2650,15 +3153,17 @@ fn finish_certify_and_deliver(
     default_branch: &str,
 ) -> std::result::Result<bool, UsageOrFail> {
     assert_head_continuity(db, run_id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    start_phase(db, run_id, PhaseName::Certify, RunEffects::none())
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     match certify::run_certify_phase(db, home, run_id, bare, wt, default_branch, None) {
         Ok(()) => {
-            record_step(db, run_id, "certify", "completed", None)
+            complete_phase_step(db, run_id, "certify", "completed", None)
                 .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
         }
         Err(e) => {
             let msg = e.to_string();
-            let _ = record_step(db, run_id, "certify", "failed", Some(&msg));
-            let _ = set_status(db, run_id, "failed", Some(&msg));
+            let _ = complete_phase_step(db, run_id, "certify", "failed", Some(&msg));
+            let _ = fail_run_with_phase(db, run_id, &msg);
             if let Ok(Some(run)) = db.run_by_id(run_id) {
                 finish_remove_worktree(bare, &run, wt);
             } else {
@@ -2668,16 +3173,17 @@ fn finish_certify_and_deliver(
         }
     }
     assert_head_continuity(db, run_id, wt).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    start_phase(db, run_id, PhaseName::Deliver, RunEffects::none())
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     match deliver_with_repair(db, home, run_id, bare, wt, default_branch, None) {
         Ok(PhaseLoop::Continue) => {
-            set_status(db, run_id, "completed", None)
-                .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+            complete_run_with_phase(db, run_id).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
             Ok(false)
         }
         Ok(PhaseLoop::Parked) => Ok(true),
         Err(e) => {
             let msg = e.to_string();
-            let _ = set_status(db, run_id, "failed", Some(&msg));
+            let _ = fail_run_with_phase(db, run_id, &msg);
             if let Ok(Some(run)) = db.run_by_id(run_id) {
                 finish_remove_worktree(bare, &run, wt);
             } else {
