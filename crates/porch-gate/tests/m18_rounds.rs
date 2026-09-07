@@ -3511,7 +3511,7 @@ fn modern_review_aborted_and_skipped_persist_with_context_freeze() {
             kind: rounds::AuthorityKind::ReviewSkipped,
             expected_round_id: Some(skip_round.clone()),
             expected_head: Some("to".into()),
-            live_head: None,
+            live_head: Some("to".into()),
             actor_kind: rounds::ActorKind::Porch,
             authority_event_id: None,
             head_changed: None,
