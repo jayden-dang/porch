@@ -4550,3 +4550,134 @@ fn allowlist_and_merge_conflicts_are_nonterminal_evidence_on_deliver() {
         .expect("deliver stays nonterminal after repairable-failure evidence");
     assert_eq!(open.id, deliver);
 }
+
+#[test]
+fn handoff_into_open_destination_phase_is_refused() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let deliver = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start deliver");
+
+    let review = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    let refused = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: deliver.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("head_changed_repair".into()),
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        matches!(refused, Err(rounds::phase::PhaseError::NonterminalExists)),
+        "handoff into an open destination phase must be refused, got {refused:?}"
+    );
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|a| a.caused_by_attempt_id.is_none()));
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Deliver)
+            .unwrap()
+            .is_some_and(|a| a.id == deliver)
+    );
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_some_and(|a| a.id == review)
+    );
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|e| e.kind == rounds::phase::PhaseEventKind::Started)
+    );
+}
+
+#[test]
+fn handoff_from_already_terminal_attempt_is_refused() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let review = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    let fixer = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: review.clone(),
+            kind: rounds::phase::OperationKind::Fixer,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start fixer");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedTerminal {
+            attempt: fixer,
+            outcome: "failed".into(),
+            cause: Some("fixer_error".into()),
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("failed fixer terminals nested and parent");
+
+    let refused = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: review.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("misuse_after_fail".into()),
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        matches!(refused, Err(rounds::phase::PhaseError::AlreadyTerminal)),
+        "handoff from an already-terminal attempt must be refused, got {refused:?}"
+    );
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 2, "refused handoff must mint no successor");
+    assert!(attempts.iter().all(|a| a.caused_by_attempt_id.is_none()));
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    let review_terminals = events
+        .iter()
+        .filter(|e| e.attempt_id == review && e.kind == rounds::phase::PhaseEventKind::Terminal)
+        .count();
+    assert_eq!(
+        review_terminals, 1,
+        "refused handoff must not append a second terminal on from"
+    );
+}

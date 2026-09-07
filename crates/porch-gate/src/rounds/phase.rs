@@ -196,6 +196,8 @@ pub enum PhaseError {
     ParentTerminated,
     #[error("handoff refused: attempt already has a successor")]
     SuccessorExists,
+    #[error("handoff refused: attempt already has a terminal event")]
+    AlreadyTerminal,
     #[error(transparent)]
     Storage(#[from] crate::Error),
 }
@@ -204,12 +206,13 @@ pub enum PhaseError {
 ///
 /// # Errors
 ///
-/// Returns [`PhaseError::NonterminalExists`] when `Start` would open a second nonterminal
-/// attempt for the same top-level phase, [`PhaseError::ParentTerminated`] when `NestedStart`
-/// targets a parent that already has a terminal event, [`PhaseError::SuccessorExists`] when
-/// `Handoff` would create a second successor for the same attempt,
-/// [`PhaseError::UnknownAttempt`] when the referenced attempt is missing, or a storage error
-/// when the transaction cannot commit.
+/// Returns [`PhaseError::NonterminalExists`] when `Start` or `Handoff` would open a second
+/// nonterminal attempt for the same top-level phase, [`PhaseError::ParentTerminated`] when
+/// `NestedStart` targets a parent that already has a terminal event,
+/// [`PhaseError::AlreadyTerminal`] when `Handoff` targets an attempt that already has a
+/// terminal event, [`PhaseError::SuccessorExists`] when `Handoff` would create a second
+/// successor for the same attempt, [`PhaseError::UnknownAttempt`] when the referenced attempt
+/// is missing, or a storage error when the transaction cannot commit.
 ///
 /// # Panics
 ///
@@ -410,8 +413,18 @@ fn apply_handoff_tx(
     if successor_for_tx(tx, from)?.is_some() {
         return Err(PhaseError::SuccessorExists);
     }
+    if attempt_has_terminal_tx(tx, from)? {
+        return Err(PhaseError::AlreadyTerminal);
+    }
     let from_row = attempt_row_tx(tx, from)?;
     let run_id = from_row.run_id;
+    // Same-phase handoff: `from` is the open attempt for `to_phase` and is allowed.
+    // Cross-phase into an already-open destination must fail closed before mutate.
+    if let Some(open) = nonterminal_attempt_tx(tx, &run_id, to_phase)? {
+        if open.id != *from {
+            return Err(PhaseError::NonterminalExists);
+        }
+    }
     let created_at = now_secs();
     let terminal_seq = next_event_seq_tx(tx, &run_id)?;
     insert_event_tx(
