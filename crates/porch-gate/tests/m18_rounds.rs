@@ -4157,3 +4157,396 @@ fn start_refused_when_a_nonterminal_attempt_for_the_phase_exists() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].kind, rounds::phase::PhaseEventKind::Started);
 }
+
+#[test]
+fn nested_start_under_a_terminated_parent_is_refused() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let parent = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Terminal {
+            attempt: parent.clone(),
+            outcome: "completed".into(),
+            cause: Some("done".into()),
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("terminal review");
+
+    let refused = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: parent.clone(),
+            kind: rounds::phase::OperationKind::Fixer,
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        matches!(refused, Err(rounds::phase::PhaseError::ParentTerminated)),
+        "nested start under a terminated parent must be refused, got {refused:?}"
+    );
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].id, parent);
+    assert!(attempts[0].parent_attempt_id.is_none());
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|e| e.kind != rounds::phase::PhaseEventKind::Started || e.attempt_id == parent)
+    );
+}
+
+#[test]
+fn handoff_writes_old_terminal_and_new_started_at_consecutive_seq() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let from = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    let successor = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: from.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("fixer_ok".into()),
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("handoff to next review");
+
+    assert_ne!(successor, from);
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 2);
+    let old = attempts.iter().find(|a| a.id == from).expect("old attempt");
+    let neu = attempts
+        .iter()
+        .find(|a| a.id == successor)
+        .expect("new attempt");
+    assert_eq!(old.ordinal, 1);
+    assert_eq!(neu.ordinal, 2);
+    assert_eq!(neu.phase, rounds::phase::PhaseName::Review);
+    assert_eq!(neu.caused_by_attempt_id.as_ref(), Some(&from));
+    assert!(neu.parent_attempt_id.is_none());
+    assert!(neu.operation_kind.is_none());
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, rounds::phase::PhaseEventKind::Started);
+    assert_eq!(events[0].attempt_id, from);
+    assert_eq!(events[0].seq, 1);
+
+    assert_eq!(events[1].kind, rounds::phase::PhaseEventKind::Terminal);
+    assert_eq!(events[1].attempt_id, from);
+    assert_eq!(events[1].seq, 2);
+    assert_eq!(events[1].outcome.as_deref(), Some("rereview"));
+    assert_eq!(events[1].cause.as_deref(), Some("fixer_ok"));
+
+    assert_eq!(events[2].kind, rounds::phase::PhaseEventKind::Started);
+    assert_eq!(events[2].attempt_id, successor);
+    assert_eq!(events[2].seq, 3);
+    assert_eq!(
+        events[2].seq,
+        events[1].seq + 1,
+        "handoff terminal and new started must be consecutive"
+    );
+
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_some_and(|a| a.id == successor)
+    );
+}
+
+#[test]
+fn canonical_phase_name_is_refused_as_nested_operation_kind() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let path = db_path(home);
+
+    let parent = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start deliver");
+
+    let nested = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: parent.clone(),
+            kind: rounds::phase::OperationKind::Compose,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("compose nested under deliver");
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    let child = attempts
+        .iter()
+        .find(|a| a.id == nested)
+        .expect("nested attempt");
+    assert_eq!(child.parent_attempt_id.as_ref(), Some(&parent));
+    assert_eq!(child.phase, rounds::phase::PhaseName::Deliver);
+    assert_eq!(
+        child.operation_kind,
+        Some(rounds::phase::OperationKind::Compose)
+    );
+    // Typed NestedStart accepts only OperationKind::{Compose, Fixer, DeliverRepair};
+    // canonical PhaseName values are not expressible as kind.
+    match child.operation_kind {
+        Some(
+            rounds::phase::OperationKind::Compose
+            | rounds::phase::OperationKind::Fixer
+            | rounds::phase::OperationKind::DeliverRepair,
+        ) => {}
+        other => panic!("nested operation_kind must be a nested kind, got {other:?}"),
+    }
+
+    let conn = Connection::open(&path).unwrap();
+    let rejected = conn.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, 'deliver', 2, ?3, NULL, 'review', '99')",
+        rusqlite::params!["att-bad-kind", &run_id, parent.as_str()],
+    );
+    assert!(
+        rejected.is_err(),
+        "store must reject a canonical phase name as nested operation_kind"
+    );
+}
+
+#[test]
+fn review_attempt_yields_at_most_one_successor() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let review1 = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    let fixer = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: review1.clone(),
+            kind: rounds::phase::OperationKind::Fixer,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start fixer");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedTerminal {
+            attempt: fixer,
+            outcome: "completed".into(),
+            cause: Some("head_unchanged".into()),
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("successful fixer terminal");
+
+    let review2 = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: review1.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("fixer_ok".into()),
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("handoff after successful fixer");
+
+    let second = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: review1.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("again".into()),
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        matches!(second, Err(rounds::phase::PhaseError::SuccessorExists)),
+        "a review attempt must yield at most one successor, got {second:?}"
+    );
+
+    let attempts_after_handoff = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    let successors: Vec<_> = attempts_after_handoff
+        .iter()
+        .filter(|a| a.caused_by_attempt_id.as_ref() == Some(&review1))
+        .collect();
+    assert_eq!(successors.len(), 1);
+    assert_eq!(successors[0].id, review2);
+}
+
+#[test]
+fn failed_nested_op_yields_no_successor() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let review = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    let fixer = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: review.clone(),
+            kind: rounds::phase::OperationKind::Fixer,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start fixer");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedTerminal {
+            attempt: fixer.clone(),
+            outcome: "failed".into(),
+            cause: Some("fixer_error".into()),
+        },
+        rounds::RunEffects {
+            status: Some("failed".into()),
+            error: Some("fixer_error".into()),
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("failed fixer terminals nested and parent");
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 2, "failed nested must create no successor");
+    assert!(attempts.iter().all(|a| a.caused_by_attempt_id.is_none()));
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|a| a.caused_by_attempt_id.as_ref() == Some(&review))
+            .count(),
+        0,
+        "failed nested op must yield no successor"
+    );
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == rounds::phase::PhaseEventKind::Terminal)
+        .collect();
+    assert_eq!(terminals.len(), 2);
+    assert!(terminals.iter().any(|e| e.attempt_id == fixer));
+    assert!(terminals.iter().any(|e| e.attempt_id == review));
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn allowlist_and_merge_conflicts_are_nonterminal_evidence_on_deliver() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let deliver = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("start deliver");
+
+    for cause in ["AllowlistFailed", "MergeConflicting"] {
+        rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::Evidence {
+                attempt: deliver.clone(),
+                cause: cause.into(),
+            },
+            rounds::RunEffects::none(),
+        )
+        .unwrap_or_else(|e| panic!("evidence {cause}: {e}"));
+    }
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, rounds::phase::PhaseEventKind::Started);
+    assert_eq!(events[1].kind, rounds::phase::PhaseEventKind::Evidence);
+    assert_eq!(events[1].cause.as_deref(), Some("AllowlistFailed"));
+    assert_eq!(events[2].kind, rounds::phase::PhaseEventKind::Evidence);
+    assert_eq!(events[2].cause.as_deref(), Some("MergeConflicting"));
+    assert!(
+        events
+            .iter()
+            .all(|e| e.kind != rounds::phase::PhaseEventKind::Terminal)
+    );
+
+    let open = rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Deliver)
+        .unwrap()
+        .expect("deliver stays nonterminal after repairable-failure evidence");
+    assert_eq!(open.id, deliver);
+}

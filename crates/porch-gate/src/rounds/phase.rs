@@ -164,6 +164,21 @@ pub enum PhaseTransition {
         outcome: String,
         cause: Option<String>,
     },
+    NestedStart {
+        parent: AttemptId,
+        kind: OperationKind,
+    },
+    NestedTerminal {
+        attempt: AttemptId,
+        outcome: String,
+        cause: Option<String>,
+    },
+    Handoff {
+        from: AttemptId,
+        to_phase: PhaseName,
+        outcome: String,
+        cause: Option<String>,
+    },
     Evidence {
         attempt: AttemptId,
         cause: String,
@@ -177,6 +192,10 @@ pub enum PhaseError {
     NonterminalExists,
     #[error("phase transition refused: unknown attempt")]
     UnknownAttempt,
+    #[error("nested start refused: parent attempt already has a terminal event")]
+    ParentTerminated,
+    #[error("handoff refused: attempt already has a successor")]
+    SuccessorExists,
     #[error(transparent)]
     Storage(#[from] crate::Error),
 }
@@ -186,8 +205,11 @@ pub enum PhaseError {
 /// # Errors
 ///
 /// Returns [`PhaseError::NonterminalExists`] when `Start` would open a second nonterminal
-/// attempt for the same top-level phase, [`PhaseError::UnknownAttempt`] when the referenced
-/// attempt is missing, or a storage error when the transaction cannot commit.
+/// attempt for the same top-level phase, [`PhaseError::ParentTerminated`] when `NestedStart`
+/// targets a parent that already has a terminal event, [`PhaseError::SuccessorExists`] when
+/// `Handoff` would create a second successor for the same attempt,
+/// [`PhaseError::UnknownAttempt`] when the referenced attempt is missing, or a storage error
+/// when the transaction cannot commit.
 ///
 /// # Panics
 ///
@@ -202,74 +224,25 @@ pub fn persist_phase_transition(
         .map_err(crate::Error::from)?;
 
     let (run_id, attempt_id) = match plan {
-        PhaseTransition::Start { run_id, phase } => {
-            if nonterminal_attempt_tx(&tx, &run_id, phase)?.is_some() {
-                return Err(PhaseError::NonterminalExists);
-            }
-            let ordinal = next_top_level_ordinal_tx(&tx, &run_id, phase)?;
-            let attempt_id = AttemptId(Ulid::new().to_string());
-            let created_at = now_secs();
-            tx.execute(
-                "INSERT INTO phase_attempts (
-                    id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
-                    operation_kind, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5)",
-                rusqlite::params![
-                    attempt_id.as_str(),
-                    &run_id,
-                    phase.as_str(),
-                    ordinal,
-                    created_at,
-                ],
-            )
-            .map_err(crate::Error::from)?;
-            let seq = next_event_seq_tx(&tx, &run_id)?;
-            insert_event_tx(
-                &tx,
-                &run_id,
-                &attempt_id,
-                seq,
-                PhaseEventKind::Started,
-                None,
-                None,
-                &created_at,
-            )?;
-            (run_id, attempt_id)
-        }
+        PhaseTransition::Start { run_id, phase } => apply_start_tx(&tx, run_id, phase)?,
         PhaseTransition::Terminal {
             attempt,
             outcome,
             cause,
-        } => {
-            let run_id = attempt_run_id_tx(&tx, &attempt)?;
-            let seq = next_event_seq_tx(&tx, &run_id)?;
-            insert_event_tx(
-                &tx,
-                &run_id,
-                &attempt,
-                seq,
-                PhaseEventKind::Terminal,
-                Some(outcome.as_str()),
-                cause.as_deref(),
-                &now_secs(),
-            )?;
-            (run_id, attempt)
-        }
-        PhaseTransition::Evidence { attempt, cause } => {
-            let run_id = attempt_run_id_tx(&tx, &attempt)?;
-            let seq = next_event_seq_tx(&tx, &run_id)?;
-            insert_event_tx(
-                &tx,
-                &run_id,
-                &attempt,
-                seq,
-                PhaseEventKind::Evidence,
-                None,
-                Some(cause.as_str()),
-                &now_secs(),
-            )?;
-            (run_id, attempt)
-        }
+        } => apply_terminal_tx(&tx, attempt, &outcome, cause.as_deref())?,
+        PhaseTransition::NestedStart { parent, kind } => apply_nested_start_tx(&tx, &parent, kind)?,
+        PhaseTransition::NestedTerminal {
+            attempt,
+            outcome,
+            cause,
+        } => apply_nested_terminal_tx(&tx, attempt, &outcome, cause.as_deref())?,
+        PhaseTransition::Handoff {
+            from,
+            to_phase,
+            outcome,
+            cause,
+        } => apply_handoff_tx(&tx, &from, to_phase, &outcome, cause.as_deref())?,
+        PhaseTransition::Evidence { attempt, cause } => apply_evidence_tx(&tx, attempt, &cause)?,
     };
 
     apply_run_effects_tx(&tx, &run_id, effects)?;
@@ -280,6 +253,226 @@ pub fn persist_phase_transition(
     .map_err(crate::Error::from)?;
     tx.commit().map_err(crate::Error::from)?;
     Ok(attempt_id)
+}
+
+fn apply_start_tx(
+    tx: &Transaction<'_>,
+    run_id: String,
+    phase: PhaseName,
+) -> std::result::Result<(String, AttemptId), PhaseError> {
+    if nonterminal_attempt_tx(tx, &run_id, phase)?.is_some() {
+        return Err(PhaseError::NonterminalExists);
+    }
+    let ordinal = next_top_level_ordinal_tx(tx, &run_id, phase)?;
+    let attempt_id = AttemptId(Ulid::new().to_string());
+    let created_at = now_secs();
+    tx.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5)",
+        rusqlite::params![
+            attempt_id.as_str(),
+            &run_id,
+            phase.as_str(),
+            ordinal,
+            created_at,
+        ],
+    )
+    .map_err(crate::Error::from)?;
+    let seq = next_event_seq_tx(tx, &run_id)?;
+    insert_event_tx(
+        tx,
+        &run_id,
+        &attempt_id,
+        seq,
+        PhaseEventKind::Started,
+        None,
+        None,
+        &created_at,
+    )?;
+    Ok((run_id, attempt_id))
+}
+
+fn apply_terminal_tx(
+    tx: &Transaction<'_>,
+    attempt: AttemptId,
+    outcome: &str,
+    cause: Option<&str>,
+) -> std::result::Result<(String, AttemptId), PhaseError> {
+    let run_id = attempt_run_id_tx(tx, &attempt)?;
+    let seq = next_event_seq_tx(tx, &run_id)?;
+    insert_event_tx(
+        tx,
+        &run_id,
+        &attempt,
+        seq,
+        PhaseEventKind::Terminal,
+        Some(outcome),
+        cause,
+        &now_secs(),
+    )?;
+    Ok((run_id, attempt))
+}
+
+fn apply_nested_start_tx(
+    tx: &Transaction<'_>,
+    parent: &AttemptId,
+    kind: OperationKind,
+) -> std::result::Result<(String, AttemptId), PhaseError> {
+    let parent_row = attempt_row_tx(tx, parent)?;
+    if attempt_has_terminal_tx(tx, parent)? {
+        return Err(PhaseError::ParentTerminated);
+    }
+    let run_id = parent_row.run_id;
+    let ordinal = next_nested_ordinal_tx(tx, parent)?;
+    let attempt_id = AttemptId(Ulid::new().to_string());
+    let created_at = now_secs();
+    tx.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+        rusqlite::params![
+            attempt_id.as_str(),
+            &run_id,
+            parent_row.phase.as_str(),
+            ordinal,
+            parent.as_str(),
+            kind.as_str(),
+            created_at,
+        ],
+    )
+    .map_err(crate::Error::from)?;
+    let seq = next_event_seq_tx(tx, &run_id)?;
+    insert_event_tx(
+        tx,
+        &run_id,
+        &attempt_id,
+        seq,
+        PhaseEventKind::Started,
+        None,
+        None,
+        &created_at,
+    )?;
+    Ok((run_id, attempt_id))
+}
+
+fn apply_nested_terminal_tx(
+    tx: &Transaction<'_>,
+    attempt: AttemptId,
+    outcome: &str,
+    cause: Option<&str>,
+) -> std::result::Result<(String, AttemptId), PhaseError> {
+    let nested = attempt_row_tx(tx, &attempt)?;
+    let run_id = nested.run_id.clone();
+    let created_at = now_secs();
+    let seq = next_event_seq_tx(tx, &run_id)?;
+    insert_event_tx(
+        tx,
+        &run_id,
+        &attempt,
+        seq,
+        PhaseEventKind::Terminal,
+        Some(outcome),
+        cause,
+        &created_at,
+    )?;
+    let fail_or_interrupt = outcome == "failed" || outcome == "interrupted";
+    if fail_or_interrupt
+        && nested.operation_kind == Some(OperationKind::Fixer)
+        && nested.phase == PhaseName::Review
+    {
+        if let Some(parent_id) = nested.parent_attempt_id.as_ref() {
+            let parent_seq = next_event_seq_tx(tx, &run_id)?;
+            insert_event_tx(
+                tx,
+                &run_id,
+                parent_id,
+                parent_seq,
+                PhaseEventKind::Terminal,
+                Some(outcome),
+                cause,
+                &created_at,
+            )?;
+        }
+    }
+    Ok((run_id, attempt))
+}
+
+fn apply_handoff_tx(
+    tx: &Transaction<'_>,
+    from: &AttemptId,
+    to_phase: PhaseName,
+    outcome: &str,
+    cause: Option<&str>,
+) -> std::result::Result<(String, AttemptId), PhaseError> {
+    if successor_for_tx(tx, from)?.is_some() {
+        return Err(PhaseError::SuccessorExists);
+    }
+    let from_row = attempt_row_tx(tx, from)?;
+    let run_id = from_row.run_id;
+    let created_at = now_secs();
+    let terminal_seq = next_event_seq_tx(tx, &run_id)?;
+    insert_event_tx(
+        tx,
+        &run_id,
+        from,
+        terminal_seq,
+        PhaseEventKind::Terminal,
+        Some(outcome),
+        cause,
+        &created_at,
+    )?;
+    let ordinal = next_top_level_ordinal_tx(tx, &run_id, to_phase)?;
+    let new_attempt = AttemptId(Ulid::new().to_string());
+    tx.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6)",
+        rusqlite::params![
+            new_attempt.as_str(),
+            &run_id,
+            to_phase.as_str(),
+            ordinal,
+            from.as_str(),
+            created_at,
+        ],
+    )
+    .map_err(crate::Error::from)?;
+    let started_seq = next_event_seq_tx(tx, &run_id)?;
+    insert_event_tx(
+        tx,
+        &run_id,
+        &new_attempt,
+        started_seq,
+        PhaseEventKind::Started,
+        None,
+        None,
+        &created_at,
+    )?;
+    Ok((run_id, new_attempt))
+}
+
+fn apply_evidence_tx(
+    tx: &Transaction<'_>,
+    attempt: AttemptId,
+    cause: &str,
+) -> std::result::Result<(String, AttemptId), PhaseError> {
+    let run_id = attempt_run_id_tx(tx, &attempt)?;
+    let seq = next_event_seq_tx(tx, &run_id)?;
+    insert_event_tx(
+        tx,
+        &run_id,
+        &attempt,
+        seq,
+        PhaseEventKind::Evidence,
+        None,
+        Some(cause),
+        &now_secs(),
+    )?;
+    Ok((run_id, attempt))
 }
 
 fn nonterminal_attempt_tx(
@@ -343,14 +536,73 @@ fn attempt_run_id_tx(
     tx: &Transaction<'_>,
     attempt: &AttemptId,
 ) -> std::result::Result<String, PhaseError> {
-    match tx.query_row(
-        "SELECT run_id FROM phase_attempts WHERE id = ?1",
-        [attempt.as_str()],
-        |row| row.get(0),
-    ) {
-        Ok(run_id) => Ok(run_id),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Err(PhaseError::UnknownAttempt),
-        Err(err) => Err(PhaseError::Storage(err.into())),
+    Ok(attempt_row_tx(tx, attempt)?.run_id)
+}
+
+fn attempt_row_tx(
+    tx: &Transaction<'_>,
+    attempt: &AttemptId,
+) -> std::result::Result<PhaseAttemptRow, PhaseError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+                    operation_kind, created_at
+             FROM phase_attempts
+             WHERE id = ?1",
+        )
+        .map_err(crate::Error::from)?;
+    let mut rows = stmt.query([attempt.as_str()]).map_err(crate::Error::from)?;
+    match rows.next().map_err(crate::Error::from)? {
+        Some(row) => Ok(map_attempt(row).map_err(PhaseError::Storage)?),
+        None => Err(PhaseError::UnknownAttempt),
+    }
+}
+
+fn attempt_has_terminal_tx(
+    tx: &Transaction<'_>,
+    attempt: &AttemptId,
+) -> std::result::Result<bool, PhaseError> {
+    let count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM phase_events
+             WHERE attempt_id = ?1 AND kind = 'terminal'",
+            [attempt.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(crate::Error::from)?;
+    Ok(count > 0)
+}
+
+fn next_nested_ordinal_tx(
+    tx: &Transaction<'_>,
+    parent: &AttemptId,
+) -> std::result::Result<i64, PhaseError> {
+    let max: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(ordinal) FROM phase_attempts WHERE parent_attempt_id = ?1",
+            [parent.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(crate::Error::from)?;
+    Ok(max.unwrap_or(0) + 1)
+}
+
+fn successor_for_tx(
+    tx: &Transaction<'_>,
+    from: &AttemptId,
+) -> std::result::Result<Option<AttemptId>, PhaseError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT id FROM phase_attempts
+             WHERE caused_by_attempt_id = ?1
+             ORDER BY ordinal ASC, id ASC
+             LIMIT 1",
+        )
+        .map_err(crate::Error::from)?;
+    let mut rows = stmt.query([from.as_str()]).map_err(crate::Error::from)?;
+    match rows.next().map_err(crate::Error::from)? {
+        Some(row) => Ok(Some(AttemptId(row.get(0).map_err(crate::Error::from)?))),
+        None => Ok(None),
     }
 }
 
