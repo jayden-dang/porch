@@ -1385,3 +1385,155 @@ fn audit_build_for_200_phase_events_is_fast_and_index_backed() {
         "phase_events query must be index-backed, plan={plan_text:?}"
     );
 }
+
+fn start_daemon_on_home(home: &Path) {
+    let bin = assert_cmd::cargo::cargo_bin("porch");
+    porch_gate::spawn_detached_with_env(&bin, home, &[]).unwrap();
+    porch_gate::wait_for_health(home, Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn porch_audit_prints_phase_tree_with_nested_operations() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().to_path_buf();
+    let (db, run_id) = seed_deliver_with_open_compose(&home);
+    drop(db);
+    start_daemon_on_home(&home);
+
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&home)
+        .env("PORCH_HOME", &home)
+        .args(["audit", "--run-id", &run_id])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["deliver #1 started", "  compose #1 started"],
+        "human audit must print phase/ordinal/outcome with nested ops indented: {text:?}"
+    );
+
+    kill_daemon(&home);
+}
+
+#[test]
+fn porch_audit_tree_is_unambiguous_without_colour() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().to_path_buf();
+    let (db, run_id) = seed_deliver_with_open_compose(&home);
+    drop(db);
+    start_daemon_on_home(&home);
+
+    let tree_out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&home)
+        .env("PORCH_HOME", &home)
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .args(["audit", "--run-id", &run_id])
+        .output()
+        .unwrap();
+    assert!(tree_out.status.success());
+    let tree = String::from_utf8_lossy(&tree_out.stdout);
+    assert!(
+        !tree.contains('\u{1b}'),
+        "phase tree must not use ANSI colour: {tree:?}"
+    );
+    assert!(
+        tree.contains("deliver #1 started") && tree.contains("  compose #1 started"),
+        "outcome and nesting must stay in plain text: {tree:?}"
+    );
+    kill_daemon(&home);
+
+    let tmp2 = TempDir::new().unwrap();
+    let home2 = tmp2.path().to_path_buf();
+    std::fs::create_dir_all(&home2).unwrap();
+    let db = Db::open(&home2.join("state.sqlite")).unwrap();
+    db.upsert_repo("repo1", &home2, &home2.join("bare.git"), "main")
+        .unwrap();
+    let run = db
+        .insert_run("repo1", "feat-audit-unavail-cli", "deadbeef", None, None)
+        .unwrap();
+    let unavail_id = run.id.clone();
+    // Terminal status so the daemon executor does not mint phase events on pickup.
+    let raw = Connection::open(home2.join("state.sqlite")).unwrap();
+    raw.execute(
+        "UPDATE runs SET status = 'failed', error = 'pre-phase fixture' WHERE id = ?1",
+        [&unavail_id],
+    )
+    .unwrap();
+    drop(raw);
+    drop(db);
+    start_daemon_on_home(&home2);
+
+    let unavail_out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&home2)
+        .env("PORCH_HOME", &home2)
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .args(["audit", "--run-id", &unavail_id])
+        .output()
+        .unwrap();
+    assert!(unavail_out.status.success());
+    let unavail = String::from_utf8_lossy(&unavail_out.stdout);
+    assert!(
+        !unavail.contains('\u{1b}'),
+        "unavailable rendering must not use ANSI colour: {unavail:?}"
+    );
+    assert_eq!(
+        unavail.lines().collect::<Vec<_>>(),
+        vec!["phase: unavailable"],
+        "unavailability must be plain text: {unavail:?}"
+    );
+    kill_daemon(&home2);
+}
+
+#[test]
+fn porch_audit_json_matches_agent_audit_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().to_path_buf();
+    let (db, run_id) = seed_deliver_with_open_compose(&home);
+    drop(db);
+    start_daemon_on_home(&home);
+
+    let human_json = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&home)
+        .env("PORCH_HOME", &home)
+        .args(["audit", "--json", "--run-id", &run_id])
+        .output()
+        .unwrap();
+    let agent_json = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(&home)
+        .env("PORCH_HOME", &home)
+        .args(["agent", "audit", "--run-id", &run_id])
+        .output()
+        .unwrap();
+    assert!(
+        human_json.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&human_json.stdout),
+        String::from_utf8_lossy(&human_json.stderr)
+    );
+    assert!(
+        agent_json.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&agent_json.stdout),
+        String::from_utf8_lossy(&agent_json.stderr)
+    );
+    assert_eq!(
+        human_json.stdout, agent_json.stdout,
+        "porch audit --json must emit identical bytes to porch agent audit"
+    );
+    kill_daemon(&home);
+}

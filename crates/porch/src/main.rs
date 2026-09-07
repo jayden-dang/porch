@@ -7,9 +7,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use porch_gate::{
-    EjectOptions, InitOptions, admit_push, eject, ensure_daemon, get_audit, get_run,
-    git_dir_from_env, health_check, init, install_service, list_runs, notify_push, porch_home,
-    repo_id_for, run_daemon, service_status, start_service, stop_daemon, uninstall_service,
+    AuditAttempt, AuditDocument, EjectOptions, InitOptions, admit_push, eject, ensure_daemon,
+    get_audit, get_run, git_dir_from_env, health_check, init, install_service, list_runs,
+    notify_push, porch_home, repo_id_for, run_daemon, service_status, start_service, stop_daemon,
+    uninstall_service,
 };
 use porch_run::{
     AgentCliResult, AgentResponse, AgentRunOpts, PipelineExecutor, agent_respond, agent_run,
@@ -102,11 +103,14 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// Pretty-print the derived audit document for a run (same builder as `porch agent audit`).
+    /// Print the human-readable phase tree for a run (`--json` for the audit document).
     Audit {
         /// Run id (ULID). Defaults to latest parked run for the cwd repo.
         #[arg(long)]
         run_id: Option<String>,
+        /// Emit the same pretty-printed audit document JSON as `porch agent audit`.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -316,12 +320,9 @@ fn main_inner() -> Result<ExitCode> {
                 recover,
             )))
         }
-        Some(
-            Command::Agent {
-                command: AgentCommand::Audit { run_id },
-            }
-            | Command::Audit { run_id },
-        ) => {
+        Some(Command::Agent {
+            command: AgentCommand::Audit { run_id },
+        }) => {
             let home = porch_home();
             let work = env::current_dir()?;
             Ok(emit_agent(&run_agent_audit(
@@ -329,6 +330,78 @@ fn main_inner() -> Result<ExitCode> {
                 run_id.as_deref(),
                 &work,
             )))
+        }
+        Some(Command::Audit { run_id, json }) => {
+            let home = porch_home();
+            let work = env::current_dir()?;
+            if json {
+                Ok(emit_agent(&run_agent_audit(
+                    &home,
+                    run_id.as_deref(),
+                    &work,
+                )))
+            } else {
+                Ok(run_human_audit(&home, run_id.as_deref(), &work))
+            }
+        }
+    }
+}
+
+fn render_phase_tree(doc: &AuditDocument) -> String {
+    if doc.phase.kind == "unavailable" {
+        return "phase: unavailable\n".into();
+    }
+    let mut out = String::new();
+    for attempt in &doc.phase.attempts {
+        render_phase_attempt(&mut out, attempt, 0);
+    }
+    out
+}
+
+fn render_phase_attempt(out: &mut String, attempt: &AuditAttempt, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+    let name = if depth == 0 {
+        attempt.phase.as_str()
+    } else {
+        attempt
+            .operation
+            .as_deref()
+            .unwrap_or(attempt.phase.as_str())
+    };
+    let outcome = attempt.terminal.as_deref().unwrap_or("started");
+    out.push_str(name);
+    out.push_str(" #");
+    out.push_str(&attempt.ordinal.to_string());
+    out.push(' ');
+    out.push_str(outcome);
+    out.push('\n');
+    for child in &attempt.children {
+        render_phase_attempt(out, child, depth + 1);
+    }
+}
+
+fn run_human_audit(home: &Path, run_id: Option<&str>, work_tree: &Path) -> ExitCode {
+    let resolved = if let Some(id) = run_id {
+        id.to_string()
+    } else {
+        match resolve_agent_run_id(home, None, work_tree) {
+            Ok(id) => id,
+            Err(err) => {
+                eprintln!("porch: {}", err.json);
+                return ExitCode::from(u8::try_from(err.exit_code).unwrap_or(1));
+            }
+        }
+    };
+    match get_audit(home, &resolved) {
+        Ok(doc) => {
+            print!("{}", render_phase_tree(&doc));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("porch: {e:#}");
+            ExitCode::from(1)
         }
     }
 }

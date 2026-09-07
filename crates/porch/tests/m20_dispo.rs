@@ -1807,7 +1807,7 @@ fn human_audit_cli_prints_same_builder_document() {
         .env("PORCH_HOME", &home)
         .env(REVIEW_BIN_ENV, &fake)
         .env("PATH", &path)
-        .args(["audit", "--run-id", &run.id])
+        .args(["audit", "--json", "--run-id", &run.id])
         .output()
         .unwrap();
     assert!(
