@@ -875,6 +875,123 @@ fn open_nested_compose(
     }))
 }
 
+/// Append interrupted terminals for every nonterminal attempt on each `running` run,
+/// co-writing that run's stale status in the same Immediate transaction.
+///
+/// Returns the number of attempts terminalized.
+///
+/// # Errors
+///
+/// Returns a storage error if listing or reconciling a run fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn reconcile_interrupted(db: &Db) -> Result<usize> {
+    reconcile_interrupted_with_error(db, "daemon restarted while run was in progress")
+}
+
+/// Like [`reconcile_interrupted`], using `error` for `runs.error` and event cause.
+pub(crate) fn reconcile_interrupted_with_error(db: &Db, error: &str) -> Result<usize> {
+    let stale: Vec<(String, Option<String>)> = {
+        let conn = db.conn();
+        let mut stmt =
+            conn.prepare("SELECT id, pr_url FROM runs WHERE status = 'running' ORDER BY id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        out
+    };
+
+    let mut closed = 0usize;
+    for (run_id, pr_url) in stale {
+        closed += reconcile_one_running(db, &run_id, pr_url.as_deref(), error)?;
+    }
+    Ok(closed)
+}
+
+fn reconcile_one_running(
+    db: &Db,
+    run_id: &str,
+    pr_url: Option<&str>,
+    error: &str,
+) -> Result<usize> {
+    let conn = db.conn();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+
+    let open = nonterminal_attempts_for_run_tx(&tx, run_id).map_err(phase_err_to_storage)?;
+    let n = open.len();
+    for attempt in open {
+        apply_phase_transition_tx(
+            &tx,
+            PhaseTransition::Terminal {
+                attempt: attempt.id,
+                outcome: "interrupted".into(),
+                cause: Some(error.to_string()),
+            },
+        )
+        .map_err(phase_err_to_storage)?;
+    }
+
+    let status = if pr_url.is_some_and(|u| !u.trim().is_empty()) {
+        "ci_monitor_interrupted"
+    } else {
+        "failed"
+    };
+    apply_run_effects_tx(
+        &tx,
+        run_id,
+        RunEffects {
+            status: Some(status.into()),
+            error: Some(error.to_string()),
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .map_err(phase_err_to_storage)?;
+    tx.execute(
+        "UPDATE runs SET audit_rev = audit_rev + 1 WHERE id = ?1",
+        [run_id],
+    )?;
+    tx.commit()?;
+    Ok(n)
+}
+
+fn nonterminal_attempts_for_run_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+) -> std::result::Result<Vec<PhaseAttemptRow>, PhaseError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT a.id, a.run_id, a.phase, a.ordinal, a.parent_attempt_id, a.caused_by_attempt_id,
+                    a.operation_kind, a.created_at
+             FROM phase_attempts a
+             WHERE a.run_id = ?1
+               AND NOT EXISTS (
+                    SELECT 1 FROM phase_events e
+                    WHERE e.attempt_id = a.id AND e.kind = 'terminal'
+               )
+             ORDER BY CASE WHEN a.parent_attempt_id IS NULL THEN 1 ELSE 0 END,
+                      a.ordinal ASC, a.id ASC",
+        )
+        .map_err(crate::Error::from)?;
+    let mut rows = stmt.query([run_id]).map_err(crate::Error::from)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(crate::Error::from)? {
+        out.push(map_attempt(row).map_err(PhaseError::Storage)?);
+    }
+    Ok(out)
+}
+
+fn phase_err_to_storage(err: PhaseError) -> crate::Error {
+    match err {
+        PhaseError::Storage(e) => e,
+        other => crate::Error::Other(other.to_string()),
+    }
+}
+
 /// The nonterminal top-level attempt for `phase` on `run_id`, if any.
 ///
 /// # Errors

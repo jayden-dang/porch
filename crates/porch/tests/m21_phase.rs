@@ -682,3 +682,141 @@ fn standing_consent_yes_terminals_review_attempt_beside_status() {
     );
     kill_daemon(&s.home);
 }
+
+fn seed_running_with_open_review(home: &Path) -> (Db, String) {
+    std::fs::create_dir_all(home).unwrap();
+    let db = Db::open(&home.join("state.sqlite")).unwrap();
+    db.upsert_repo("repo1", home, &home.join("bare.git"), "main")
+        .unwrap();
+    let run = db
+        .insert_run("repo1", "feat-crash", "deadbeef", None, None)
+        .unwrap();
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run.id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .unwrap();
+    let review = rounds::phase::nonterminal_attempt(&db, &run.id, rounds::phase::PhaseName::Review)
+        .unwrap()
+        .expect("review open");
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: review.id,
+            kind: rounds::phase::OperationKind::Fixer,
+        },
+        rounds::RunEffects::none(),
+    )
+    .unwrap();
+    (db, run.id)
+}
+
+#[test]
+fn killed_mid_phase_after_restart_reconciles_attempts_and_status() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let (db, run_id) = seed_running_with_open_review(home);
+
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_some(),
+        "precondition: review left nonterminal mid-phase"
+    );
+
+    let closed = rounds::phase::reconcile_interrupted(&db).expect("reconcile");
+    assert!(
+        closed >= 2,
+        "must terminal nested fixer and review, got {closed}"
+    );
+
+    let run = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(run.status, "failed");
+    assert!(
+        run.error
+            .as_deref()
+            .is_some_and(|e| e.contains("daemon restarted")),
+        "status error must name restart, got {:?}",
+        run.error
+    );
+
+    for phase in [
+        rounds::phase::PhaseName::Intent,
+        rounds::phase::PhaseName::Rebase,
+        rounds::phase::PhaseName::Review,
+        rounds::phase::PhaseName::Certify,
+        rounds::phase::PhaseName::Deliver,
+    ] {
+        assert!(
+            rounds::phase::nonterminal_attempt(&db, &run_id, phase)
+                .unwrap()
+                .is_none(),
+            "canonical phase {phase:?} must not stay nonterminal after reconcile"
+        );
+    }
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    let interrupted: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.kind == rounds::phase::PhaseEventKind::Terminal
+                && e.outcome.as_deref() == Some("interrupted")
+        })
+        .collect();
+    assert!(
+        interrupted.len() >= 2,
+        "interrupted terminals must cover nested and parent: {events:?}"
+    );
+}
+
+#[test]
+fn interrupted_terminal_rolls_back_with_status_when_txn_fails() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let (db, run_id) = seed_running_with_open_review(home);
+    let before_events = rounds::phase::events_for_run(&db, &run_id).unwrap().len();
+    let before = db.run_by_id(&run_id).unwrap().unwrap();
+
+    {
+        let conn = rusqlite::Connection::open(home.join("state.sqlite")).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TRIGGER poison_stale_status BEFORE UPDATE ON runs
+            BEGIN
+                SELECT RAISE(ABORT, 'forced mid-txn write failure');
+            END;
+            ",
+        )
+        .unwrap();
+    }
+
+    let poisoned = rounds::phase::reconcile_interrupted(&db);
+    assert!(
+        poisoned.is_err(),
+        "injected status write failure must abort reconcile"
+    );
+
+    let after = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.error, before.error);
+    assert_eq!(
+        rounds::phase::events_for_run(&db, &run_id).unwrap().len(),
+        before_events,
+        "rolled-back txn must leave no interrupted terminal"
+    );
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_some(),
+        "review must stay nonterminal when reconcile rolls back"
+    );
+}

@@ -513,36 +513,23 @@ impl Db {
     ///
     /// Panics if the connection mutex is poisoned.
     pub fn fail_stale_running(&self, error: &str) -> Result<Vec<RunRow>> {
-        let conn = self.conn.lock().expect("db mutex");
-        let mut stmt = conn.prepare(&format!("{RUN_SELECT_FROM} WHERE status = 'running'"))?;
-        let rows = stmt.query_map([], map_run)?;
+        let stale_ids: Vec<String> = {
+            let conn = self.conn.lock().expect("db mutex");
+            let mut stmt = conn.prepare(&format!("{RUN_SELECT_FROM} WHERE status = 'running'"))?;
+            let rows = stmt.query_map([], map_run)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row?.id);
+            }
+            ids
+        };
+        // Status change and interrupted phase terminals share one Immediate txn per run.
+        crate::rounds::phase::reconcile_interrupted_with_error(self, error)?;
         let mut stale = Vec::new();
-        for row in rows {
-            stale.push(row?);
-        }
-        drop(stmt);
-        // Runs that already opened a PR were likely only babysitting checks —
-        // mark interrupted, not failed, so an open PR is not claimed as a failed push.
-        for run in &stale {
-            if run.pr_url.as_ref().is_some_and(|u| !u.trim().is_empty()) {
-                conn.execute(
-                    "UPDATE runs SET status = 'ci_monitor_interrupted', error = ?1 WHERE id = ?2",
-                    rusqlite::params![error, run.id],
-                )?;
-            } else {
-                conn.execute(
-                    "UPDATE runs SET status = 'failed', error = ?1 WHERE id = ?2",
-                    rusqlite::params![error, run.id],
-                )?;
+        for id in stale_ids {
+            if let Some(run) = self.run_by_id(&id)? {
+                stale.push(run);
             }
-        }
-        for run in &mut stale {
-            if run.pr_url.as_ref().is_some_and(|u| !u.trim().is_empty()) {
-                run.status = "ci_monitor_interrupted".into();
-            } else {
-                run.status = "failed".into();
-            }
-            run.error = Some(error.to_string());
         }
         Ok(stale)
     }
