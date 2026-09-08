@@ -3,8 +3,8 @@
 use porch_gate::rounds::{
     self, AssuranceCompletion, ContextApplication, ContextApplicationState, ContextSource,
     CoverageState, ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal,
-    OpenRoundPlan, ProducerInvocation, RoundBindings, RoundCoverageProposal,
-    capture_context_element, context_applicability_digest, sha256_hex,
+    OpenRoundPlan, PROTOCOL_SCHEMA_VERSION, ProducerInvocation, RoundBindings,
+    RoundCoverageProposal, capture_context_element, context_applicability_digest, sha256_hex,
 };
 use porch_gate::{AuditDocument, Db, build_audit};
 use serde_json::json;
@@ -66,7 +66,7 @@ fn open_round_with_producers(
         inventory_digest: digest,
         inventory_bytes: inventory.to_vec(),
         trusted_config_sha: "config".into(),
-        protocol_schema_version: 1,
+        protocol_schema_version: PROTOCOL_SCHEMA_VERSION,
         fingerprint_version: 1,
         intent_source: Some("flag".into()),
         context_elements: vec![intent],
@@ -295,7 +295,11 @@ fn v2_audit_json_without_producers_or_later_scalars_deserializes() {
     assert!(doc.producers.is_empty());
     assert!(doc.coverage.is_empty());
     assert_eq!(doc.rounds.len(), 1);
+    assert_eq!(doc.rounds[0].trusted_config_sha, "");
+    assert_eq!(doc.rounds[0].protocol_schema_version, 0);
     assert_eq!(doc.instances.len(), 1);
+    assert_eq!(doc.instances[0].producer_invocation_id, "");
+    assert_eq!(doc.instances[0].consequence, "");
 }
 
 #[test]
@@ -469,4 +473,111 @@ fn waived_and_failed_coverage_keep_stored_reason_and_authority() {
     assert_eq!(waived.state, "waived");
     assert_eq!(waived.reason.as_deref(), Some("generated"));
     assert_eq!(waived.authority.as_deref(), Some("operator"));
+}
+
+#[test]
+fn finalized_instance_producer_key_matches_a_producer_on_the_document() {
+    let tmp = TempDir::new().unwrap();
+    let (db, run_id) = seed_pending_run(tmp.path());
+    let round = open_round_with_producers(
+        &db,
+        &run_id,
+        vec![ProducerInvocation {
+            descriptor_json: projectable_descriptor(),
+            descriptor_equivalence_digest: "equiv-finding".into(),
+        }],
+    );
+    let producer = producer_id(&db, &round);
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+    assert_eq!(
+        rounds::finalize_round(&db, &round, &sample_complete_proposal(&producer), rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+
+    let doc = build_audit(&db, &run_id).unwrap();
+    assert_eq!(doc.instances.len(), 1);
+    let instance = &doc.instances[0];
+    assert_eq!(instance.round_id, round.as_str());
+    assert_eq!(instance.producer_invocation_id, producer);
+    assert_eq!(instance.consequence, "panic risk");
+    assert_eq!(instance.fingerprint, "fp-one");
+    assert_eq!(instance.fingerprint_version, 1);
+    assert_eq!(instance.path, "a.rs");
+    assert_eq!(instance.criterion_id, "rust/unwrap-in-lib");
+    assert_eq!(instance.evidence, "unwrap here");
+    assert_eq!(instance.severity, "error");
+    assert_eq!(instance.action, "must-fix");
+    assert!(
+        doc.producers
+            .iter()
+            .any(|p| p.id == instance.producer_invocation_id),
+        "instance producer_invocation_id must equal some producers[].id"
+    );
+    assert!(doc.anomaly.is_none());
+}
+
+#[test]
+fn round_pins_trusted_config_sha_and_protocol_schema_version() {
+    let tmp = TempDir::new().unwrap();
+    let (db, run_id) = seed_pending_run(tmp.path());
+    let round = open_round_with_producers(
+        &db,
+        &run_id,
+        vec![ProducerInvocation {
+            descriptor_json: projectable_descriptor(),
+            descriptor_equivalence_digest: "equiv-pins".into(),
+        }],
+    );
+
+    let doc = build_audit(&db, &run_id).unwrap();
+    assert_eq!(doc.rounds.len(), 1);
+    let audit_round = &doc.rounds[0];
+    assert_eq!(audit_round.id, round.as_str());
+    assert_eq!(audit_round.ordinal, 1);
+    assert_eq!(audit_round.from_sha, "from");
+    assert_eq!(audit_round.to_sha, "to");
+    assert_eq!(audit_round.execution, "running");
+    assert_eq!(audit_round.assurance_completion, "pending");
+    assert_eq!(audit_round.finalized_at, None);
+    assert_eq!(audit_round.trusted_config_sha, "config");
+    assert_eq!(audit_round.protocol_schema_version, PROTOCOL_SCHEMA_VERSION);
+
+    let wire = serde_json::to_value(audit_round).unwrap();
+    assert!(wire.get("inventory_digest").is_none());
+    assert!(wire.get("round_context_elements").is_none());
+    assert!(wire.get("round_context_applications").is_none());
+    assert!(wire.get("round_producer_durations").is_none());
+    assert!(wire.get("round_required_producers").is_none());
+    assert!(wire.get("context").is_none());
+    assert!(wire.get("durations").is_none());
+}
+
+#[test]
+fn instance_json_omits_provenance_candidate_key_and_confidence() {
+    let tmp = TempDir::new().unwrap();
+    let (db, run_id) = seed_pending_run(tmp.path());
+    let round = open_round_with_producers(
+        &db,
+        &run_id,
+        vec![ProducerInvocation {
+            descriptor_json: projectable_descriptor(),
+            descriptor_equivalence_digest: "equiv-omit".into(),
+        }],
+    );
+    let producer = producer_id(&db, &round);
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+    assert_eq!(
+        rounds::finalize_round(&db, &round, &sample_complete_proposal(&producer), rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+
+    let doc = build_audit(&db, &run_id).unwrap();
+    assert_eq!(doc.instances.len(), 1);
+    let wire = serde_json::to_value(&doc.instances[0]).unwrap();
+    assert!(wire.get("provenance_json").is_none());
+    assert!(wire.get("candidate_key").is_none());
+    assert!(wire.get("confidence_value").is_none());
+    assert!(wire.get("confidence_kind").is_none());
+    assert_eq!(wire["producer_invocation_id"], producer);
+    assert_eq!(wire["consequence"], "panic risk");
 }

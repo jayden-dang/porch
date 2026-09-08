@@ -79,6 +79,10 @@ pub struct AuditRound {
     pub assurance_completion: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finalized_at: Option<String>,
+    #[serde(default)]
+    pub trusted_config_sha: String,
+    #[serde(default)]
+    pub protocol_schema_version: i64,
 }
 
 /// Finding instance row in the audit document.
@@ -93,6 +97,10 @@ pub struct AuditInstance {
     pub evidence: String,
     pub severity: String,
     pub action: String,
+    #[serde(default)]
+    pub producer_invocation_id: String,
+    #[serde(default)]
+    pub consequence: String,
 }
 
 /// Authority event member in the audit document.
@@ -257,6 +265,7 @@ pub fn build_audit(db: &Db, run_id: &str) -> Result<AuditDocument> {
         })
     } else {
         unreadable_producer_anomaly(&producers)
+            .or_else(|| unresolved_producer_anomaly(&instances, &producers))
     };
 
     tx.commit()?;
@@ -331,6 +340,25 @@ fn unreadable_producer_anomaly(producers: &[AuditProducer]) -> Option<AuditAnoma
         })
 }
 
+fn unresolved_producer_anomaly(
+    instances: &[AuditInstance],
+    producers: &[AuditProducer],
+) -> Option<AuditAnomaly> {
+    instances.iter().find_map(|instance| {
+        if producers
+            .iter()
+            .any(|producer| producer.id == instance.producer_invocation_id)
+        {
+            None
+        } else {
+            Some(AuditAnomaly {
+                code: "unresolved_producer_invocation".into(),
+                detail: instance.producer_invocation_id.clone(),
+            })
+        }
+    })
+}
+
 fn project_descriptor(descriptor_json: &str) -> ProducerDescriptorView {
     serde_json::from_str(descriptor_json).unwrap_or_else(|err| {
         let reason = err.to_string();
@@ -380,7 +408,8 @@ fn load_coverage(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditCoverage
 
 fn load_rounds(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditRound>> {
     let mut stmt = tx.prepare(
-        "SELECT id, ordinal, from_sha, to_sha, execution, assurance_completion, finalized_at
+        "SELECT id, ordinal, from_sha, to_sha, execution, assurance_completion, finalized_at,
+                trusted_config_sha, protocol_schema_version
          FROM review_rounds
          WHERE run_id = ?1
          ORDER BY ordinal, id",
@@ -394,6 +423,8 @@ fn load_rounds(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditRound>> {
             execution: row.get(4)?,
             assurance_completion: row.get(5)?,
             finalized_at: row.get(6)?,
+            trusted_config_sha: row.get(7)?,
+            protocol_schema_version: row.get(8)?,
         })
     })?;
     let mut out = Vec::new();
@@ -406,7 +437,8 @@ fn load_rounds(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditRound>> {
 fn load_instances(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditInstance>> {
     let mut stmt = tx.prepare(
         "SELECT i.id, i.round_id, i.fingerprint, i.fingerprint_version, i.path,
-                i.criterion_id, i.evidence, i.severity, i.action
+                i.criterion_id, i.evidence, i.severity, i.action,
+                i.producer_invocation_id, i.consequence
          FROM finding_instances i
          INNER JOIN review_rounds r ON r.id = i.round_id
          WHERE r.run_id = ?1
@@ -423,6 +455,8 @@ fn load_instances(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditInstanc
             evidence: row.get(6)?,
             severity: row.get(7)?,
             action: row.get(8)?,
+            producer_invocation_id: row.get(9)?,
+            consequence: row.get(10)?,
         })
     })?;
     let mut out = Vec::new();
