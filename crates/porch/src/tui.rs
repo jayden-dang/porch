@@ -140,17 +140,15 @@ impl App {
         self.snapshot.status == "parked" && !self.working && self.note_editing.is_none()
     }
 
-    /// True when the parked step driving the run is `compose`.
+    /// True when the parked run's phase view is nested compose.
     #[must_use]
     pub fn compose_parked(&self) -> bool {
         self.snapshot.status == "parked"
             && self
                 .snapshot
-                .steps
-                .iter()
-                .rev()
-                .find(|s| s.status == "parked")
-                .is_some_and(|s| s.step == "compose")
+                .phase
+                .as_ref()
+                .is_some_and(|p| p.operation.as_deref() == Some("compose"))
     }
 
     /// Apply a fresh snapshot (e.g. after `stream_gap` + `get_run`).
@@ -851,6 +849,7 @@ fn apply_gap_and_snapshot(app: &mut App, snapshot: RunSnapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use porch_gate::rounds::{self, RunEffects};
     use porch_gate::{Db, db_path, set_finding_note, wait_for_health};
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
@@ -916,6 +915,11 @@ mod tests {
             ],
             state_rev: 1,
             audit_available: true,
+            phase: Some(porch_gate::PhaseView {
+                phase: "review".into(),
+                ordinal: 1,
+                operation: None,
+            }),
         }
     }
 
@@ -923,6 +927,11 @@ mod tests {
         let mut snap = parked_snapshot();
         snap.pr_url = Some("https://example.com/pull/1".into());
         snap.findings = serde_json::json!([]);
+        snap.phase = Some(porch_gate::PhaseView {
+            phase: "deliver".into(),
+            ordinal: 1,
+            operation: Some("compose".into()),
+        });
         snap.steps = vec![
             porch_gate::StepSnapshot {
                 step: "intent".into(),
@@ -1157,7 +1166,20 @@ mod tests {
         let run = db
             .insert_run("repo1", "feat/demo", "abc123", None, None)
             .unwrap();
-        db.set_run_status(&run.id, "parked", None).unwrap();
+        rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::Start {
+                run_id: run.id.clone(),
+                phase: rounds::phase::PhaseName::Review,
+            },
+            RunEffects {
+                status: Some("parked".into()),
+                error: None,
+                approved_head: None,
+                steps: vec![],
+            },
+        )
+        .unwrap();
         db.set_worktree_dir(&run.id, &wt).unwrap();
         db.set_findings_json(
             &run.id,
@@ -1299,7 +1321,20 @@ mod tests {
         let run = db
             .insert_run("repo1", "feat/demo", "abc123", None, None)
             .unwrap();
-        db.set_run_status(&run.id, "parked", None).unwrap();
+        rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::Start {
+                run_id: run.id.clone(),
+                phase: rounds::phase::PhaseName::Review,
+            },
+            RunEffects {
+                status: Some("parked".into()),
+                error: None,
+                approved_head: None,
+                steps: vec![],
+            },
+        )
+        .unwrap();
         db.set_worktree_dir(&run.id, &wt).unwrap();
         db.set_findings_json(
             &run.id,
@@ -1337,7 +1372,7 @@ mod tests {
             .as_ref()
             .expect("history open loads audit");
         assert_eq!(loaded.run_id, run.id);
-        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.schema_version, 2);
 
         apply_gap_and_snapshot(&mut app, get_run(&home, &run.id).unwrap());
         assert_eq!(

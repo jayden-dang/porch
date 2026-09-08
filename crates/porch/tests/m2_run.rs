@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use porch_deliver::GH_BIN_ENV;
+use porch_gate::rounds::{self, RunEffects};
 use porch_gate::{Db, kill_group, repo_id_for, run_worktree_dir};
 use porch_git::{GitDir, init_bare, run as git_run, stdout_trim, worktree_add_detach};
 use porch_review::REVIEW_BIN_ENV;
@@ -523,7 +524,20 @@ fn daemon_restart_fails_running_run_and_removes_worktree() {
         .unwrap();
     let wt = run_worktree_dir(&home, &repo_id, &run.id);
     db.set_worktree_dir(&run.id, &wt).unwrap();
-    db.set_run_status(&run.id, "running", None).unwrap();
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run.id.clone(),
+            phase: rounds::phase::PhaseName::Intent,
+        },
+        RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .unwrap();
     worktree_add_detach(&GitDir::new(&repo.bare_path).unwrap(), &wt, &sha).unwrap();
     assert!(wt.exists(), "precondition: worktree on disk");
 

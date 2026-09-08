@@ -184,8 +184,9 @@ Compose `skip` ≠ review `skip`: it accepts the scaffold and **continues** deli
 
 ```sh
 porch agent status
-porch agent audit                 # or: porch audit [--run-id]
-porch audit --run-id <ULID>
+porch agent audit                 # pretty audit-document JSON
+porch audit [--run-id]            # human-readable phase tree
+porch audit --json [--run-id]     # same JSON as agent audit
 # review park
 porch agent respond approve
 porch agent respond skip
@@ -211,7 +212,7 @@ Stdout is JSON (JSONL with `agent run --wait`). Exit `0` ok/parked/completed, `1
 | `fix` | review / rebase | Native fixer, then **session-free** rereview (or rebase retry). Modern review fix appends `fix_requested` **before** the fixer spawns |
 | `--body-file` [+ `--title`] | compose | Merge Agent prose into porch-managed PR regions; complete deliver |
 
-Status / `get_run` stay a **compact** live snapshot (findings, optional `audit_available`). Reconstruct disposition/authority from `porch agent audit` or `porch audit` (same typed audit document as daemon `get_audit` / TUI `h`).
+Status / `get_run` stay a **compact** live snapshot (findings, optional `audit_available`). Reconstruct disposition/authority from `porch agent audit` or `porch audit --json` (same typed audit document as daemon `get_audit` / TUI `h`). Default `porch audit` prints the phase tree as plain text.
 
 Read the packet at `compose_packet_path` before writing `--body-file`. Empty or theater-shaped bodies (gate Review/Certify/Pipeline boards) are rejected; the run stays parked. Do not combine `--body-file` with approve/skip/abort/fix.
 
@@ -329,4 +330,26 @@ That allocates a new run from the prior tip and intent. It does not reuse the fa
 authorization.
 
 **Downgrade** after new-format round rows exist is **unsupported**.
+
+## S. Upgrading porch (phase-event history)
+
+**Back up `$PORCH_HOME` before upgrading.** Finish parked and running work first, or lose it:
+the first open of a phase-events binary against an older `$PORCH_HOME` raises the
+**database-resident compatibility fence** to **protocol 3**. That transaction
+**terminalizes** every still-active (`pending` / `running` / `parked`) run with an explicit
+phase-events upgrade cause in `runs.error` and **clears undelivered**
+`review_approved_head_sha`. Those runs become `failed`. They are **not** still approvable —
+recover with `porch rerun --run-id <ULID>` (new run, new worktree, nothing carries forward).
+
+Pre-existing runs keep whatever history they already had. The upgrade **does not** invent
+phase attempts, ordinals, timestamps, or nesting for them; `porch audit` reports their phase
+slice as unavailable until a fresh run writes real phase events.
+
+The protocol-2 insert and approval triggers stay in force. Protocol 3 adds a status-update
+trigger beside them so an under-protocol writer cannot change `runs.status` either.
+
+**Rollback** to a pre-phase-events binary against a protocol-3 state root is **unsupported**.
+The fence refuses new runs, approvals, and status writes from a writer that does not
+understand protocol 3. Restore a backup of `$PORCH_HOME` taken before the upgrade if you must
+run an older binary.
 

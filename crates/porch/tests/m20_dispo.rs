@@ -1438,7 +1438,7 @@ fn audit_snapshot_includes_events_instances_and_related_occurrences() {
     assert_eq!(second_instances[0].fingerprint_version, first_fp_ver);
 
     let doc = build_audit(&db, &run.id).unwrap();
-    assert_eq!(doc.schema_version, 1);
+    assert_eq!(doc.schema_version, 2);
     assert_eq!(doc.run_id, run.id);
     assert!(
         doc.rounds.len() >= 2,
@@ -1534,10 +1534,14 @@ fn parked_audit_is_as_of_with_audit_rev_watermark_and_inferred_phase() {
         .unwrap();
     assert_eq!(doc.watermark.audit_rev, audit_rev);
     assert_eq!(doc.watermark.review_history_revision, history_rev);
-    assert_eq!(doc.phase.kind, "step_results_inferred");
+    assert_eq!(doc.phase.kind, "phase_events");
+    assert!(
+        !doc.phase.attempts.is_empty(),
+        "parked run with phase log must expose an attempt tree"
+    );
     assert!(
         !doc.phase.steps.is_empty(),
-        "inferred phase must copy durable step_results"
+        "phase slice steps rebuild from durable phase events"
     );
 
     kill_daemon(&home);
@@ -1589,6 +1593,15 @@ fn get_run_stays_compact_with_display_handles_and_may_advertise_audit() {
     assert!(findings[0].get("fingerprint").is_none());
     assert!(findings[0].get("criterion_id").is_none());
     assert!(
+        !snap.steps.is_empty(),
+        "compact snapshot must carry steps[] as live state"
+    );
+    assert!(
+        snap.steps.iter().any(|s| s.step == "review"),
+        "steps[] should include the review row: {:?}",
+        snap.steps
+    );
+    assert!(
         snap.audit_available,
         "compact snapshot may advertise audit_available"
     );
@@ -1596,6 +1609,8 @@ fn get_run_stays_compact_with_display_handles_and_may_advertise_audit() {
     assert!(raw.get("related_occurrences").is_none());
     assert!(raw.get("events").is_none());
     assert!(raw.get("schema_version").is_none());
+    assert!(raw.get("watermark").is_none());
+    assert!(raw.get("completeness").is_none());
 
     kill_daemon(&home);
 }
@@ -1803,7 +1818,7 @@ fn human_audit_cli_prints_same_builder_document() {
         .env("PORCH_HOME", &home)
         .env(REVIEW_BIN_ENV, &fake)
         .env("PATH", &path)
-        .args(["audit", "--run-id", &run.id])
+        .args(["audit", "--json", "--run-id", &run.id])
         .output()
         .unwrap();
     assert!(

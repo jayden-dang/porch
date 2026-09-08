@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use assert_cmd::Command;
 use porch_agent::FIXER_BIN_ENV;
 use porch_deliver::GH_BIN_ENV;
+use porch_gate::rounds;
 use porch_gate::{Db, kill_group, repo_id_for};
 use porch_git::init_bare;
 use porch_review::REVIEW_BIN_ENV;
@@ -614,7 +615,10 @@ fn red_lint_fixer_rereview_certify_second_lease_push() {
         Duration::from_secs(60),
     );
     assert_eq!(run.status, "completed", "err={:?}", run.error);
-    assert_eq!(run.deliver_repair_attempts, 1);
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run.id).unwrap(),
+        1
+    );
     assert_eq!(fixer_spawn_count(&s.home), 1);
 
     let remote = origin_branch_sha(&s.origin, "feat-repair").expect("origin tip");
@@ -689,7 +693,10 @@ fn budget_exhaust_no_fourth_fixer_spawn() {
         "err={:?}",
         run.error
     );
-    assert_eq!(run.deliver_repair_attempts, 3);
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run.id).unwrap(),
+        3
+    );
     assert_eq!(fixer_spawn_count(&s.home), 3);
 }
 
@@ -712,7 +719,7 @@ fn missing_fixer_bin_fails_closed() {
     assert_eq!(run.status, "failed", "err={:?}", run.error);
     assert_ne!(run.status, "completed");
     assert_eq!(fixer_spawn_count(&s.home), 0);
-    assert!(run.deliver_repair_attempts >= 1);
+    assert!(rounds::phase::repair_attempts_started(&db, &run.id).unwrap() >= 1);
 }
 
 #[test]
@@ -737,7 +744,10 @@ fn cancelled_allowlisted_check_no_fixer() {
     let run = db.run_by_id(&parked.id).unwrap().unwrap();
     assert_eq!(run.status, "failed", "err={:?}", run.error);
     assert_eq!(fixer_spawn_count(&s.home), 0);
-    assert_eq!(run.deliver_repair_attempts, 0);
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run.id).unwrap(),
+        0
+    );
     assert!(
         run.error
             .as_deref()
@@ -769,7 +779,10 @@ fn timed_out_allowlisted_check_no_fixer() {
     let run = db.run_by_id(&parked.id).unwrap().unwrap();
     assert_eq!(run.status, "failed", "err={:?}", run.error);
     assert_eq!(fixer_spawn_count(&s.home), 0);
-    assert_eq!(run.deliver_repair_attempts, 0);
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run.id).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -798,7 +811,10 @@ fn unlisted_e2e_failure_with_lint_green_completes_no_fixer() {
     let run = db.run_by_id(&parked.id).unwrap().unwrap();
     assert_eq!(run.status, "completed", "err={:?}", run.error);
     assert_eq!(fixer_spawn_count(&s.home), 0);
-    assert_eq!(run.deliver_repair_attempts, 0);
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run.id).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -836,7 +852,10 @@ fn rereview_parks_no_second_lease_push_of_unreviewed_sha() {
         Duration::from_secs(60),
     );
     assert_eq!(run.status, "parked", "err={:?}", run.error);
-    assert_eq!(run.deliver_repair_attempts, 1);
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run.id).unwrap(),
+        1
+    );
     assert!(
         run.review_approved_head_sha.is_none(),
         "approved SHA cleared on repair then park: {:?}",
@@ -898,7 +917,10 @@ fn mergeable_conflicting_rebase_conflict_fails_closed() {
         "deliver repair rebase must conflict, got {:?}",
         run.error
     );
-    assert_eq!(run.deliver_repair_attempts, 1);
+    assert_eq!(
+        rounds::phase::repair_attempts_started(&db, &run.id).unwrap(),
+        1
+    );
     assert_eq!(fixer_spawn_count(&s.home), 0);
     let steps = db.step_results_for_run(&run.id).unwrap();
     assert!(
@@ -957,11 +979,8 @@ fn mergeable_conflicting_clean_rebase_rereview_second_lease_push() {
     );
     helper.join().unwrap();
     assert_eq!(run.status, "parked", "err={:?}", run.error);
-    assert!(
-        run.deliver_repair_attempts >= 1,
-        "attempts={}",
-        run.deliver_repair_attempts
-    );
+    let started = rounds::phase::repair_attempts_started(&db, &run.id).unwrap();
+    assert!(started >= 1, "attempts={started}");
     assert_eq!(fixer_spawn_count(&s.home), 0, "rebase path needs no fixer");
 
     let steps = db.step_results_for_run(&run.id).unwrap();

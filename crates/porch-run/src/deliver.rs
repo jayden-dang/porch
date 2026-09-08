@@ -31,6 +31,10 @@ fn resolve_gh_bin() -> String {
     }
     gh_bin()
 }
+use porch_gate::rounds::phase::{
+    self as phase, AttemptId, OperationKind, PhaseName, PhaseTransition,
+};
+use porch_gate::rounds::{RunEffects, StepEffect};
 use porch_gate::{Db, event_hub, resolve_run_assurance, run_artifact_dir};
 use porch_git::{
     GitDir, PushDecision, RemoteTip, ls_remote_sha, push_exact_sha, remote_commits_incorporated,
@@ -39,6 +43,35 @@ use porch_git::{
 use serde_json::json;
 
 use crate::config::{PorchConfig, effective_base_branch, load_trusted_at_sha};
+
+fn deliver_err(err: &phase::PhaseError) -> DeliverError {
+    DeliverError::Msg(err.to_string())
+}
+
+fn ensure_deliver_attempt(db: &Db, run_id: &str) -> Result<AttemptId, DeliverError> {
+    if let Some(open) = phase::nonterminal_attempt(db, run_id, PhaseName::Deliver)? {
+        return Ok(open.id);
+    }
+    phase::persist_phase_transition(
+        db,
+        PhaseTransition::Start {
+            run_id: run_id.to_string(),
+            phase: PhaseName::Deliver,
+        },
+        RunEffects::none(),
+    )
+    .map_err(|e| deliver_err(&e))
+}
+
+fn open_nested_compose(
+    db: &Db,
+    run_id: &str,
+    deliver: &AttemptId,
+) -> Result<AttemptId, DeliverError> {
+    phase::open_nested_attempt(db, run_id, deliver, Some(OperationKind::Compose))?
+        .map(|a| a.id)
+        .ok_or_else(|| DeliverError::Msg(format!("no open compose attempt for run {run_id}")))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DeliverError {
@@ -280,8 +313,25 @@ fn probe_mergeable(
 }
 
 fn park_compose(db: &Db, run_id: &str) -> Result<(), DeliverError> {
-    db.insert_step_result(run_id, "compose", "parked", None)?;
-    db.set_run_status(run_id, "parked", Some("awaiting compose"))?;
+    let deliver = ensure_deliver_attempt(db, run_id)?;
+    phase::persist_phase_transition(
+        db,
+        PhaseTransition::NestedStart {
+            parent: deliver,
+            kind: OperationKind::Compose,
+        },
+        RunEffects {
+            status: Some("parked".into()),
+            error: Some("awaiting compose".into()),
+            approved_head: None,
+            steps: vec![StepEffect {
+                step: "compose".into(),
+                status: "parked".into(),
+                error: None,
+            }],
+        },
+    )
+    .map_err(|e| deliver_err(&e))?;
     if let Some(hub) = event_hub() {
         hub.publish_state(run_id);
         hub.publish_activity(run_id, "step=compose status=parked");
@@ -447,8 +497,27 @@ pub(crate) fn resume_deliver_after_compose(
 
     match resolution {
         ComposeResolution::Abort => {
-            db.insert_step_result(run_id, "compose", "cancelled", Some("agent abort"))?;
-            db.set_run_status(run_id, "cancelled", Some("agent abort"))?;
+            let deliver = ensure_deliver_attempt(db, run_id)?;
+            let compose = open_nested_compose(db, run_id, &deliver)?;
+            phase::persist_phase_transition(
+                db,
+                PhaseTransition::NestedTerminal {
+                    attempt: compose,
+                    outcome: "cancelled".into(),
+                    cause: Some("agent abort".into()),
+                },
+                RunEffects {
+                    status: Some("cancelled".into()),
+                    error: Some("agent abort".into()),
+                    approved_head: None,
+                    steps: vec![StepEffect {
+                        step: "compose".into(),
+                        status: "cancelled".into(),
+                        error: Some("agent abort".into()),
+                    }],
+                },
+            )
+            .map_err(|e| deliver_err(&e))?;
             if let Some(hub) = event_hub() {
                 hub.publish_state(run_id);
                 hub.publish_activity(run_id, "step=compose status=cancelled");
@@ -503,22 +572,17 @@ fn apply_compose_respond(
 
     let trusted = load_trusted_deliver(db, &run.id, bare, default_branch)?;
     // Compose + deliver steps resolve before allowlist watch.
-    db.insert_step_result(&run.id, "compose", "completed", Some("compose=agent"))?;
-    db.insert_step_result(&run.id, "deliver", "completed", Some("compose=agent"))?;
-    maybe_watch(
+    finish_compose_and_deliver(
+        db,
+        &run.id,
+        "completed",
+        "compose=agent",
         &bin,
         timeout,
         wt,
         pr.number,
         &trusted.deliver_github.watch_checks,
-        None,
-    )?;
-    db.set_run_status(&run.id, "completed", None)?;
-    if let Some(hub) = event_hub() {
-        hub.publish_state(&run.id);
-        hub.publish_activity(&run.id, "step=deliver status=completed");
-    }
-    Ok(())
+    )
 }
 
 fn apply_compose_skip(
@@ -549,20 +613,90 @@ fn apply_compose_skip(
 
     let trusted = load_trusted_deliver(db, &run.id, bare, default_branch)?;
     // Compose + deliver steps resolve before allowlist watch.
-    db.insert_step_result(&run.id, "compose", "skipped", Some("compose=scaffold"))?;
-    db.insert_step_result(&run.id, "deliver", "completed", Some("compose=scaffold"))?;
-    maybe_watch(
+    finish_compose_and_deliver(
+        db,
+        &run.id,
+        "skipped",
+        "compose=scaffold",
         &bin,
         timeout,
         wt,
         pr.number,
         &trusted.deliver_github.watch_checks,
-        None,
-    )?;
-    db.set_run_status(&run.id, "completed", None)?;
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // watch + compose terminal share one helper
+fn finish_compose_and_deliver(
+    db: &Db,
+    run_id: &str,
+    compose_status: &str,
+    detail: &str,
+    bin: &str,
+    timeout: std::time::Duration,
+    wt: &Path,
+    pr_number: u64,
+    watch_checks: &[String],
+) -> Result<(), DeliverError> {
+    let deliver = ensure_deliver_attempt(db, run_id)?;
+    let compose = open_nested_compose(db, run_id, &deliver)?;
+    // Compose + deliver step rows resolve before allowlist watch (watch fail keeps them).
+    phase::persist_phase_transition(
+        db,
+        PhaseTransition::NestedTerminal {
+            attempt: compose,
+            outcome: compose_status.to_string(),
+            cause: Some(detail.to_string()),
+        },
+        RunEffects {
+            status: None,
+            error: None,
+            approved_head: None,
+            steps: vec![StepEffect {
+                step: "compose".into(),
+                status: compose_status.to_string(),
+                error: Some(detail.to_string()),
+            }],
+        },
+    )
+    .map_err(|e| deliver_err(&e))?;
+    phase::persist_phase_transition(
+        db,
+        PhaseTransition::Evidence {
+            attempt: deliver.clone(),
+            cause: detail.to_string(),
+        },
+        RunEffects {
+            status: None,
+            error: None,
+            approved_head: None,
+            steps: vec![StepEffect {
+                step: "deliver".into(),
+                status: "completed".into(),
+                error: Some(detail.to_string()),
+            }],
+        },
+    )
+    .map_err(|e| deliver_err(&e))?;
+    maybe_watch(bin, timeout, wt, pr_number, watch_checks, None)?;
+    phase::persist_phase_transition(
+        db,
+        PhaseTransition::Terminal {
+            attempt: deliver,
+            outcome: "completed".into(),
+            cause: Some(detail.to_string()),
+        },
+        RunEffects {
+            status: Some("completed".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .map_err(|e| deliver_err(&e))?;
     if let Some(hub) = event_hub() {
-        hub.publish_state(&run.id);
-        hub.publish_activity(&run.id, "step=deliver status=completed");
+        hub.publish_state(run_id);
+        hub.publish_activity(run_id, "step=deliver status=completed");
     }
     Ok(())
 }
@@ -985,11 +1119,51 @@ esac
             .unwrap();
         db.set_pr_title_written(&run.id, Some("porch: feat-composed"))
             .unwrap();
-        // Simulate Task-5 compose resolve on this tip (only completed row needed;
+        // Simulate compose already resolved on this tip (only completed row needed;
         // same-second parked+completed can make latest_step_for_run non-deterministic).
-        db.insert_step_result(&run.id, "compose", "completed", Some("compose=scaffold"))
-            .unwrap();
-        db.set_run_status(&run.id, "running", None).unwrap();
+        let deliver = phase::persist_phase_transition(
+            &db,
+            PhaseTransition::Start {
+                run_id: run.id.clone(),
+                phase: PhaseName::Deliver,
+            },
+            RunEffects {
+                status: Some("running".into()),
+                error: None,
+                approved_head: None,
+                steps: vec![],
+            },
+        )
+        .unwrap();
+        let compose = phase::persist_phase_transition(
+            &db,
+            PhaseTransition::NestedStart {
+                parent: deliver.clone(),
+                kind: OperationKind::Compose,
+            },
+            RunEffects::none(),
+        )
+        .unwrap();
+        phase::persist_phase_transition(
+            &db,
+            PhaseTransition::NestedTerminal {
+                attempt: compose,
+                outcome: "completed".into(),
+                cause: Some("compose=scaffold".into()),
+            },
+            RunEffects {
+                status: Some("running".into()),
+                error: None,
+                approved_head: None,
+                steps: vec![StepEffect {
+                    step: "compose".into(),
+                    status: "completed".into(),
+                    error: Some("compose=scaffold".into()),
+                }],
+            },
+        )
+        .unwrap();
+        let _ = deliver;
 
         let outcome = match run_deliver_phase(&db, &home, &run.id, &bare, &wt, "main", None) {
             Ok(o) => o,

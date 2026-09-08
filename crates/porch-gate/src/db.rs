@@ -50,7 +50,7 @@ pub struct RunRow {
     pub findings_json: Option<String>,
     pub fixer_session_id: Option<String>,
     pub pr_url: Option<String>,
-    /// Deliver mechanical repair attempts started (budget default 3).
+    /// Frozen unused column; deliver-repair budget counts phase `deliver_repair` started events.
     pub deliver_repair_attempts: u32,
     /// Pinned default-branch tip SHA used for trusted `.porch.yaml` (E10).
     pub trusted_config_sha: Option<String>,
@@ -513,36 +513,23 @@ impl Db {
     ///
     /// Panics if the connection mutex is poisoned.
     pub fn fail_stale_running(&self, error: &str) -> Result<Vec<RunRow>> {
-        let conn = self.conn.lock().expect("db mutex");
-        let mut stmt = conn.prepare(&format!("{RUN_SELECT_FROM} WHERE status = 'running'"))?;
-        let rows = stmt.query_map([], map_run)?;
+        let stale_ids: Vec<String> = {
+            let conn = self.conn.lock().expect("db mutex");
+            let mut stmt = conn.prepare(&format!("{RUN_SELECT_FROM} WHERE status = 'running'"))?;
+            let rows = stmt.query_map([], map_run)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row?.id);
+            }
+            ids
+        };
+        // Status change and interrupted phase terminals share one Immediate txn per run.
+        crate::rounds::phase::reconcile_interrupted_with_error(self, error)?;
         let mut stale = Vec::new();
-        for row in rows {
-            stale.push(row?);
-        }
-        drop(stmt);
-        // Runs that already opened a PR were likely only babysitting checks —
-        // mark interrupted, not failed, so an open PR is not claimed as a failed push.
-        for run in &stale {
-            if run.pr_url.as_ref().is_some_and(|u| !u.trim().is_empty()) {
-                conn.execute(
-                    "UPDATE runs SET status = 'ci_monitor_interrupted', error = ?1 WHERE id = ?2",
-                    rusqlite::params![error, run.id],
-                )?;
-            } else {
-                conn.execute(
-                    "UPDATE runs SET status = 'failed', error = ?1 WHERE id = ?2",
-                    rusqlite::params![error, run.id],
-                )?;
+        for id in stale_ids {
+            if let Some(run) = self.run_by_id(&id)? {
+                stale.push(run);
             }
-        }
-        for run in &mut stale {
-            if run.pr_url.as_ref().is_some_and(|u| !u.trim().is_empty()) {
-                run.status = "ci_monitor_interrupted".into();
-            } else {
-                run.status = "failed".into();
-            }
-            run.error = Some(error.to_string());
         }
         Ok(stale)
     }
@@ -556,7 +543,9 @@ impl Db {
     /// # Panics
     ///
     /// Panics if the connection mutex is poisoned.
-    pub fn set_run_status(&self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
+    // Called from in-crate tests; production writers use the phase seam's txn SQL.
+    #[allow(dead_code)]
+    pub(crate) fn set_run_status(&self, id: &str, status: &str, error: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex");
         conn.execute(
             "UPDATE runs SET status = ?1, error = ?2 WHERE id = ?3",
@@ -715,30 +704,6 @@ impl Db {
         Ok(())
     }
 
-    /// Increment `deliver_repair_attempts` when a fix attempt starts; returns the new count.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `SQLite` error if the update fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the connection mutex is poisoned.
-    pub fn increment_deliver_repair_attempts(&self, id: &str) -> Result<u32> {
-        let conn = self.conn.lock().expect("db mutex");
-        conn.execute(
-            "UPDATE runs SET deliver_repair_attempts = deliver_repair_attempts + 1 WHERE id = ?1",
-            rusqlite::params![id],
-        )?;
-        let n: i64 = conn.query_row(
-            "SELECT deliver_repair_attempts FROM runs WHERE id = ?1",
-            rusqlite::params![id],
-            |row| row.get(0),
-        )?;
-        u32::try_from(n)
-            .map_err(|_| crate::Error::Other(format!("deliver_repair_attempts out of range: {n}")))
-    }
-
     /// Insert or replace the uncertified fixer range for a repo branch.
     ///
     /// # Errors
@@ -825,6 +790,8 @@ impl Db {
 
     /// Insert a step result row.
     ///
+    /// In-crate test helper; production writes go through `phase::persist_phase_transition`.
+    ///
     /// # Errors
     ///
     /// Returns a `SQLite` error if the insert fails.
@@ -832,7 +799,8 @@ impl Db {
     /// # Panics
     ///
     /// Panics if the connection mutex is poisoned.
-    pub fn insert_step_result(
+    #[allow(dead_code)]
+    pub(crate) fn insert_step_result(
         &self,
         run_id: &str,
         step: &str,
@@ -1067,52 +1035,83 @@ fn writer_fence_present(conn: &Connection) -> Result<bool> {
     Ok(n > 0)
 }
 
-fn install_writer_fence(conn: &Connection) -> Result<()> {
-    if writer_fence_present(conn)? {
-        return Ok(());
-    }
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    if writer_fence_present(&tx)? {
-        tx.commit()?;
-        return Ok(());
-    }
-    tx.execute_batch(
+fn install_status_writer_trigger(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS porch_state_meta (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            min_writer_protocol INTEGER NOT NULL
-        );
-        CREATE TRIGGER IF NOT EXISTS porch_runs_writer_insert
-        BEFORE INSERT ON runs
-        BEGIN
-            SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
-            WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
-        END;
-        CREATE TRIGGER IF NOT EXISTS porch_runs_writer_approve
-        BEFORE UPDATE OF review_approved_head_sha ON runs
+        CREATE TRIGGER IF NOT EXISTS porch_runs_writer_status
+        BEFORE UPDATE OF status ON runs
         BEGIN
             SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
             WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
         END;
         ",
     )?;
-    tx.execute(
-        "INSERT OR IGNORE INTO porch_state_meta (id, min_writer_protocol) VALUES (1, ?1)",
-        [crate::rounds::PROTOCOL_SCHEMA_VERSION],
-    )?;
-    tx.execute(
+    Ok(())
+}
+
+fn fail_forward_active_runs_for_phase_upgrade(conn: &Connection) -> Result<()> {
+    conn.execute(
         "UPDATE runs
          SET status = 'failed',
-             error = 'state root upgraded to the mandatory-floor regime; start a fresh run',
+             error = 'state root upgraded to the phase-events regime; start a fresh run',
              review_approved_head_sha = NULL
-         WHERE status IN ('pending', 'running', 'parked')
-           AND NOT EXISTS (
-               SELECT 1 FROM review_rounds
-               WHERE review_rounds.run_id = runs.id
-                 AND review_rounds.protocol_schema_version >= ?1
-           )",
-        [crate::rounds::PROTOCOL_SCHEMA_VERSION],
+         WHERE status IN ('pending', 'running', 'parked')",
+        [],
     )?;
+    Ok(())
+}
+
+fn install_writer_fence(conn: &Connection) -> Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if !writer_fence_present(&tx)? {
+        tx.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS porch_state_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                min_writer_protocol INTEGER NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS porch_runs_writer_insert
+            BEFORE INSERT ON runs
+            BEGIN
+                SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
+                WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
+            END;
+            CREATE TRIGGER IF NOT EXISTS porch_runs_writer_approve
+            BEFORE UPDATE OF review_approved_head_sha ON runs
+            BEGIN
+                SELECT RAISE(ABORT, 'porch writer protocol is below this state root minimum')
+                WHERE porch_writer_protocol() < (SELECT min_writer_protocol FROM porch_state_meta);
+            END;
+            ",
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO porch_state_meta (id, min_writer_protocol) VALUES (1, ?1)",
+            [crate::rounds::PROTOCOL_SCHEMA_VERSION],
+        )?;
+        // Status trigger must be created after fail-forward writes in this transaction.
+        fail_forward_active_runs_for_phase_upgrade(&tx)?;
+        install_status_writer_trigger(&tx)?;
+        tx.commit()?;
+        return Ok(());
+    }
+
+    let min: i64 = tx.query_row(
+        "SELECT min_writer_protocol FROM porch_state_meta WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if min < crate::rounds::PROTOCOL_SCHEMA_VERSION {
+        tx.execute(
+            "UPDATE porch_state_meta SET min_writer_protocol = ?1 WHERE id = 1",
+            [crate::rounds::PROTOCOL_SCHEMA_VERSION],
+        )?;
+        fail_forward_active_runs_for_phase_upgrade(&tx)?;
+        install_status_writer_trigger(&tx)?;
+        tx.commit()?;
+        return Ok(());
+    }
+
+    install_status_writer_trigger(&tx)?;
     tx.commit()?;
     Ok(())
 }

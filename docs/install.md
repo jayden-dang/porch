@@ -51,9 +51,12 @@ Do not set `PORCH_REVIEW_BIN=ocr`.
 
 ## Upgrading
 
-Before upgrading a machine that already has `$PORCH_HOME` state, see
-[usage.md — Upgrading porch](usage.md#r-upgrading-porch-review-round-identity-and-the-mandatory-floor):
-finish parked runs when you can, back up `$PORCH_HOME`, and do not expect downgrade after
-new-format rounds exist. Rollback of an upgraded state root to a pre-floor binary is
-**unsupported**. Recovery after a floor failure is `porch rerun --run-id <ULID>` (restart the
+Before upgrading a machine that already has `$PORCH_HOME` state, see both upgrade fences in
+usage: [§R — review-round / mandatory floor](usage.md#r-upgrading-porch-review-round-identity-and-the-mandatory-floor)
+and [§S — phase-event history (protocol 3)](usage.md#s-upgrading-porch-phase-event-history).
+Finish parked runs when you can, back up `$PORCH_HOME`, and do not expect downgrade after
+new-format rounds or phase-events exist. Opening a phase-events binary against an older
+`$PORCH_HOME` fail-forwards every still-active run under **protocol 3**. Rollback of an
+upgraded state root to a pre-floor or pre-phase-events binary is **unsupported**. Recovery
+after a floor failure or fail-forwarded run is `porch rerun --run-id <ULID>` (restart the
 daemon first when the floor executable could not be resolved).

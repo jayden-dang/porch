@@ -19,7 +19,20 @@ use porch_gate::rounds::{
 use porch_gate::{Db, Error, RunExecutor, db_path, run_daemon, wait_for_health};
 use porch_git::GitDir;
 use rusqlite::Connection;
+use rusqlite::functions::FunctionFlags;
 use tempfile::TempDir;
+
+fn register_current_writer_protocol(conn: &Connection) {
+    conn.create_scalar_function(
+        "porch_writer_protocol",
+        0,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |_| Ok(rounds::PROTOCOL_SCHEMA_VERSION),
+    )
+    .unwrap();
+}
 
 fn seed_legacy_db(path: &Path) {
     let conn = Connection::open(path).unwrap();
@@ -63,6 +76,16 @@ fn seed_run(db: &Db, home: &Path) -> String {
         .id
 }
 
+fn set_run_status_raw(home: &Path, run_id: &str, status: &str, error: Option<&str>) {
+    let conn = Connection::open(db_path(home)).unwrap();
+    register_current_writer_protocol(&conn);
+    conn.execute(
+        "UPDATE runs SET status = ?1, error = ?2 WHERE id = ?3",
+        rusqlite::params![status, error, run_id],
+    )
+    .unwrap();
+}
+
 fn sample_plan(run_id: &str) -> OpenRoundPlan {
     OpenRoundPlan {
         run_id: run_id.to_string(),
@@ -93,7 +116,7 @@ fn sample_bindings(inventory: &[u8]) -> RoundBindings {
         inventory_digest: digest,
         inventory_bytes: inventory.to_vec(),
         trusted_config_sha: "config".into(),
-        protocol_schema_version: 2,
+        protocol_schema_version: rounds::PROTOCOL_SCHEMA_VERSION,
         fingerprint_version: 1,
         intent_source: Some("flag".into()),
         context_elements: vec![intent.clone()],
@@ -125,7 +148,7 @@ fn opening_legacy_database_adds_round_tables_and_keeps_existing_rows() {
     );
     assert_eq!(run.branch, "feat");
 
-    db.set_run_status("run-legacy", "pending", None).unwrap();
+    set_run_status_raw(home, "run-legacy", "pending", None);
     let active = db.active_runs(Some("repo-legacy"), None).unwrap();
     assert!(active.iter().any(|r| r.id == "run-legacy"));
 
@@ -217,7 +240,10 @@ fn open_round_commits_before_returning_id_and_allocates_ordinals() {
     assert_eq!(loaded.to_sha, "to");
     assert_eq!(loaded.inventory_digest, digest);
     assert_eq!(loaded.trusted_config_sha, "config");
-    assert_eq!(loaded.protocol_schema_version, 2);
+    assert_eq!(
+        loaded.protocol_schema_version,
+        rounds::PROTOCOL_SCHEMA_VERSION
+    );
     assert_eq!(loaded.fingerprint_version, 1);
 
     let producers = rounds::producers_for_round(&db, &first).unwrap();
@@ -1095,7 +1121,7 @@ fn bindings_for_producers(inventory: &[u8], producer_count: usize) -> RoundBindi
         inventory_digest: digest,
         inventory_bytes: inventory.to_vec(),
         trusted_config_sha: "config".into(),
-        protocol_schema_version: 2,
+        protocol_schema_version: rounds::PROTOCOL_SCHEMA_VERSION,
         fingerprint_version: 1,
         intent_source: Some("flag".into()),
         context_elements: vec![intent],
@@ -2331,11 +2357,11 @@ fn requirement_count(conn: &Connection, round_id: &str) -> i64 {
 }
 
 #[test]
-fn this_feature_records_protocol_two_and_leaves_legacy_rounds_untouched() {
+fn this_feature_records_current_protocol_and_leaves_legacy_rounds_untouched() {
     let home = TempDir::new().unwrap();
     let home = home.path();
     let db = fixture_db(home);
-    let inventory = b"inv-protocol-two\n";
+    let inventory = b"inv-protocol-current\n";
     let digest = floor_equiv_digest();
 
     let current_run = seed_run(&db, home);
@@ -2347,8 +2373,9 @@ fn this_feature_records_protocol_two_and_leaves_legacy_rounds_untouched() {
     .unwrap();
     let current = rounds::get_round(&db, &current_id).unwrap().unwrap();
     assert_eq!(
-        current.protocol_schema_version, 2,
-        "rounds opened by this feature must record protocol version 2"
+        current.protocol_schema_version,
+        rounds::PROTOCOL_SCHEMA_VERSION,
+        "rounds opened by this binary must record the current protocol version"
     );
 
     let legacy_run = {
@@ -2437,10 +2464,11 @@ fn a_round_above_the_understood_protocol_fails_closed() {
         inventory,
     );
 
+    let future = rounds::PROTOCOL_SCHEMA_VERSION + 1;
     let conn = Connection::open(db_path(home)).unwrap();
     conn.execute(
-        "UPDATE review_rounds SET protocol_schema_version = 3 WHERE id = ?1",
-        [round_id.as_str()],
+        "UPDATE review_rounds SET protocol_schema_version = ?1 WHERE id = ?2",
+        rusqlite::params![future, round_id.as_str()],
     )
     .unwrap();
 
@@ -2455,7 +2483,8 @@ fn a_round_above_the_understood_protocol_fails_closed() {
     };
     match err {
         Error::Other(msg) => assert!(
-            msg.contains("protocol") && (msg.contains('3') || msg.contains("understood")),
+            msg.contains("protocol")
+                && (msg.contains(&future.to_string()) || msg.contains("understood")),
             "unexpected fail-closed message: {msg}"
         ),
         other => panic!("expected a fail-closed error, got {other:?}"),
@@ -2799,6 +2828,42 @@ fn a_connection_without_the_writer_function_cannot_create_or_approve_a_run() {
     assert_eq!(sha.as_deref(), Some("approved-sha"));
 }
 
+#[test]
+fn a_connection_without_the_writer_function_cannot_update_run_status() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    drop(db);
+
+    let conn = Connection::open(db_path(home)).unwrap();
+    let status_before: String = conn
+        .query_row("SELECT status FROM runs WHERE id = ?1", [&run_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status_before, "pending");
+
+    let status_err = conn
+        .execute(
+            "UPDATE runs SET status = 'failed', error = 'sneak' WHERE id = ?1",
+            [&run_id],
+        )
+        .expect_err("an unregistered connection must not update run status");
+    let status_msg = status_err.to_string();
+    assert!(
+        status_msg.contains("porch_writer_protocol"),
+        "absence must fail closed on status, got {status_msg}"
+    );
+
+    let status_after: String = conn
+        .query_row("SELECT status FROM runs WHERE id = ?1", [&run_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status_after, "pending");
+}
+
 fn seed_active_legacy_runs(path: &Path) {
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(
@@ -2916,8 +2981,8 @@ fn assert_legacy_runs_terminalized(db: &Db) {
         parked
             .error
             .as_deref()
-            .is_some_and(|e| e.contains("upgraded")),
-        "legacy active runs must name the upgrade, got {:?}",
+            .is_some_and(|e| { e.contains("upgraded") && e.contains("phase-events") }),
+        "legacy active runs must name the phase-events upgrade, got {:?}",
         parked.error
     );
     assert!(parked.review_approved_head_sha.is_none());
@@ -2955,14 +3020,18 @@ fn upgrading_the_state_root_is_atomic_and_idempotent() {
         writer_fence_installed(&conn),
         "upgrade must install the marker and both run triggers"
     );
-    assert_eq!(min_writer_protocol(&conn), 2);
+    assert!(
+        trigger_exists(&conn, "porch_runs_writer_status"),
+        "upgrade must also install the status writer trigger"
+    );
+    assert_eq!(min_writer_protocol(&conn), rounds::PROTOCOL_SCHEMA_VERSION);
     assert_legacy_runs_terminalized(&db);
 
     let live = db
         .insert_run("repo-legacy", "feat-live", "eeee", None, None)
         .unwrap();
     rounds::open_round(&db, &sample_plan(&live.id), &sample_bindings(b"live.rs\n")).unwrap();
-    db.set_run_status(&live.id, "parked", None).unwrap();
+    set_run_status_raw(home, &live.id, "parked", None);
     db.set_review_approved_head_sha(&live.id, Some("live-approved"))
         .unwrap();
     let admitted = db
@@ -3030,16 +3099,15 @@ fn contending_runs_still_count_only_pending_running_and_parked() {
 
     let pending = db.insert_run("repo1", "feat", "aaa", None, None).unwrap();
     let running = db.insert_run("repo1", "feat", "bbb", None, None).unwrap();
-    db.set_run_status(&running.id, "running", None).unwrap();
+    set_run_status_raw(home, &running.id, "running", None);
     let parked = db.insert_run("repo1", "feat", "ccc", None, None).unwrap();
-    db.set_run_status(&parked.id, "parked", None).unwrap();
+    set_run_status_raw(home, &parked.id, "parked", None);
     let failed = db.insert_run("repo1", "feat", "ddd", None, None).unwrap();
-    db.set_run_status(&failed.id, "failed", None).unwrap();
+    set_run_status_raw(home, &failed.id, "failed", None);
     let completed = db.insert_run("repo1", "feat", "eee", None, None).unwrap();
-    db.set_run_status(&completed.id, "completed", None).unwrap();
+    set_run_status_raw(home, &completed.id, "completed", None);
     let interrupted = db.insert_run("repo1", "feat", "fff", None, None).unwrap();
-    db.set_run_status(&interrupted.id, "ci_monitor_interrupted", None)
-        .unwrap();
+    set_run_status_raw(home, &interrupted.id, "ci_monitor_interrupted", None);
 
     let active: Vec<String> = db
         .active_runs(Some("repo1"), Some("feat"))
@@ -3101,7 +3169,7 @@ fn daemon_startup_still_recovers_stale_runs_and_refuses_when_recovery_fails() {
         db.upsert_repo("repo1", &home, &home.join("bare.git"), "main")
             .unwrap();
         let run = db.insert_run("repo1", "feat", "abc", None, None).unwrap();
-        db.set_run_status(&run.id, "running", None).unwrap();
+        set_run_status_raw(&home, &run.id, "running", None);
         drop(db);
 
         let home_t = home.clone();
@@ -3339,7 +3407,10 @@ fn drifted_round_or_head_fails_closed_without_writing_an_event() {
             members: vec![(instance_id, rounds::MemberRole::Context)],
         },
     );
-    assert!(matches!(skip_wrong_live, Err(rounds::AuthorityError::Stale)));
+    assert!(matches!(
+        skip_wrong_live,
+        Err(rounds::AuthorityError::Stale)
+    ));
     assert!(rounds::events_for_run(&db, &run_id).unwrap().is_empty());
 }
 
@@ -3670,7 +3741,7 @@ fn abort_with_cancelled_commits_together_and_rolls_back_on_write_failure() {
     let home = home.path();
     let db = fixture_db(home);
     let (run_id, round_id, instance_id) = park_finished_round(&db, home);
-    db.set_run_status(&run_id, "parked", None).unwrap();
+    set_run_status_raw(home, &run_id, "parked", None);
 
     let abort_plan = rounds::PersistAuthorityPlan {
         run_id: run_id.clone(),
@@ -3704,8 +3775,12 @@ fn abort_with_cancelled_commits_together_and_rolls_back_on_write_failure() {
         .unwrap();
     }
 
-    let poisoned =
-        rounds::persist_authority_with_run_effects(&db, abort_plan.clone(), cancel_effects.clone());
+    let poisoned = rounds::persist_authority_with_run_effects(
+        &db,
+        abort_plan.clone(),
+        cancel_effects.clone(),
+        None,
+    );
     assert!(
         poisoned.is_err(),
         "injected write failure must abort the transaction"
@@ -3724,8 +3799,9 @@ fn abort_with_cancelled_commits_together_and_rolls_back_on_write_failure() {
             .unwrap();
     }
 
-    let event_id = rounds::persist_authority_with_run_effects(&db, abort_plan, cancel_effects)
-        .expect("abort with cancelled");
+    let event_id =
+        rounds::persist_authority_with_run_effects(&db, abort_plan, cancel_effects, None)
+            .expect("abort with cancelled");
     let events = rounds::events_for_run(&db, &run_id).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].id, event_id);
@@ -3741,7 +3817,7 @@ fn approve_with_run_effects_writes_approved_head_and_review_step() {
     let home = home.path();
     let db = fixture_db(home);
     let (run_id, round_id, instance_id) = park_finished_round(&db, home);
-    db.set_run_status(&run_id, "parked", None).unwrap();
+    set_run_status_raw(home, &run_id, "parked", None);
 
     let event_id = rounds::persist_authority_with_run_effects(
         &db,
@@ -3767,6 +3843,7 @@ fn approve_with_run_effects_writes_approved_head_and_review_step() {
                 error: Some("approved".into()),
             }],
         },
+        None,
     )
     .expect("approve with effects");
 
@@ -3784,4 +3861,1170 @@ fn approve_with_run_effects_writes_approved_head_and_review_step() {
     assert_eq!(steps[0].step, "review");
     assert_eq!(steps[0].status, "completed");
     assert_eq!(steps[0].error.as_deref(), Some("approved"));
+}
+
+#[test]
+fn opening_legacy_database_adds_phase_tables_and_keeps_existing_rows() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let path = db_path(home);
+    std::fs::create_dir_all(home).unwrap();
+    seed_legacy_db(&path);
+
+    let db = Db::open(&path).unwrap();
+    let run = db.run_by_id("run-legacy").unwrap().expect("legacy run");
+    assert_eq!(run.branch, "feat");
+
+    let conn = Connection::open(&path).unwrap();
+    for table in ["phase_attempts", "phase_events"] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "missing table {table}");
+    }
+    let index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='phase_events_run'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index, 1, "missing phase_events_run index");
+
+    conn.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES ('att-1', 'run-legacy', 'review', 1, NULL, NULL, NULL, '10')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO phase_events (
+            id, run_id, attempt_id, seq, kind, outcome, cause, created_at
+         ) VALUES ('evt-1', 'run-legacy', 'att-1', 1, 'started', NULL, NULL, '10')",
+        [],
+    )
+    .unwrap();
+
+    let attempts = rounds::phase::attempts_for_run(&db, "run-legacy").unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].id.as_str(), "att-1");
+    assert_eq!(attempts[0].phase, rounds::phase::PhaseName::Review);
+    assert_eq!(attempts[0].ordinal, 1);
+    assert!(attempts[0].parent_attempt_id.is_none());
+    assert!(attempts[0].caused_by_attempt_id.is_none());
+    assert!(attempts[0].operation_kind.is_none());
+
+    let events = rounds::phase::events_for_run(&db, "run-legacy").unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "evt-1");
+    assert_eq!(events[0].attempt_id.as_str(), "att-1");
+    assert_eq!(events[0].seq, 1);
+    assert_eq!(events[0].kind, rounds::phase::PhaseEventKind::Started);
+
+    let open =
+        rounds::phase::nonterminal_attempt(&db, "run-legacy", rounds::phase::PhaseName::Review)
+            .unwrap()
+            .expect("started attempt without terminal is nonterminal");
+    assert_eq!(open.id.as_str(), "att-1");
+}
+
+#[test]
+fn duplicate_top_level_phase_attempt_ordinal_is_rejected() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let path = db_path(home);
+    let conn = Connection::open(&path).unwrap();
+
+    conn.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, 'intent', 1, NULL, NULL, NULL, '1')",
+        rusqlite::params!["att-a", &run_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO phase_events (
+            id, run_id, attempt_id, seq, kind, outcome, cause, created_at
+         ) VALUES (?1, ?2, 'att-a', 1, 'started', NULL, NULL, '1')",
+        rusqlite::params!["evt-a", &run_id],
+    )
+    .unwrap();
+
+    let dup = conn.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, 'intent', 1, NULL, NULL, NULL, '2')",
+        rusqlite::params!["att-b", &run_id],
+    );
+    assert!(
+        dup.is_err(),
+        "store must reject a second top-level attempt with the same run/phase/ordinal"
+    );
+
+    conn.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, 'intent', 2, NULL, NULL, NULL, '3')",
+        rusqlite::params!["att-c", &run_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO phase_events (
+            id, run_id, attempt_id, seq, kind, outcome, cause, created_at
+         ) VALUES (?1, ?2, 'att-c', 2, 'started', NULL, NULL, '3')",
+        rusqlite::params!["evt-c", &run_id],
+    )
+    .unwrap();
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].ordinal, 1);
+    assert_eq!(attempts[1].ordinal, 2);
+}
+
+#[test]
+fn start_transition_commits_attempt_event_and_status_together() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let before = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_ne!(before.status, "running");
+
+    let attempt_id = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![rounds::StepEffect {
+                step: "review".into(),
+                status: "running".into(),
+                error: None,
+            }],
+        },
+    )
+    .expect("start transition");
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].id, attempt_id);
+    assert_eq!(attempts[0].phase, rounds::phase::PhaseName::Review);
+    assert_eq!(attempts[0].ordinal, 1);
+    assert!(attempts[0].parent_attempt_id.is_none());
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].attempt_id, attempt_id);
+    assert_eq!(events[0].kind, rounds::phase::PhaseEventKind::Started);
+    assert_eq!(events[0].seq, 1);
+    assert!(events[0].outcome.is_none());
+
+    let run = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(run.status, "running");
+    assert!(run.error.is_none());
+
+    let steps = db.step_results_for_run(&run_id).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].step, "review");
+    assert_eq!(steps[0].status, "running");
+
+    let open = rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+        .unwrap()
+        .expect("started attempt without terminal stays nonterminal");
+    assert_eq!(open.id, attempt_id);
+}
+
+#[test]
+fn failed_status_write_rolls_back_attempt_and_event() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let before = db.run_by_id(&run_id).unwrap().unwrap();
+
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TRIGGER poison_phase_status BEFORE UPDATE ON runs
+            BEGIN
+                SELECT RAISE(ABORT, 'forced mid-txn write failure');
+            END;
+            ",
+        )
+        .unwrap();
+    }
+
+    let poisoned = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Intent,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    );
+    assert!(
+        poisoned.is_err(),
+        "injected status write failure must abort the transition"
+    );
+    assert!(
+        rounds::phase::attempts_for_run(&db, &run_id)
+            .unwrap()
+            .is_empty(),
+        "rolled-back txn must leave no attempt"
+    );
+    assert!(
+        rounds::phase::events_for_run(&db, &run_id)
+            .unwrap()
+            .is_empty(),
+        "rolled-back txn must leave no phase event"
+    );
+    let after = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.error, before.error);
+}
+
+/// PHASE-8.3: poison between Start's attempt insert and event insert.
+/// Immediate txn still rolls the whole transition back (no partial commit).
+#[test]
+fn start_poison_after_attempt_insert_rolls_back_and_stays_consistent_after_reopen() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let before = db.run_by_id(&run_id).unwrap().unwrap();
+
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TRIGGER poison_phase_event_insert BEFORE INSERT ON phase_events
+            BEGIN
+                SELECT RAISE(ABORT, 'forced kill between attempt insert and event append');
+            END;
+            ",
+        )
+        .unwrap();
+    }
+
+    let poisoned = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    );
+    assert!(
+        poisoned.is_err(),
+        "poison between Start writes must abort the Immediate txn"
+    );
+    assert!(
+        rounds::phase::attempts_for_run(&db, &run_id)
+            .unwrap()
+            .is_empty(),
+        "rolled-back Start must leave no attempt"
+    );
+    assert!(
+        rounds::phase::events_for_run(&db, &run_id)
+            .unwrap()
+            .is_empty(),
+        "rolled-back Start must leave no event"
+    );
+    let after = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.error, before.error);
+
+    // Drop poison and reopen: log + status remain consistent; ≤1 nonterminal.
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch("DROP TRIGGER IF EXISTS poison_phase_event_insert;")
+            .unwrap();
+    }
+    let reopened = Db::open(&db_path(home)).unwrap();
+    let _ = rounds::phase::reconcile_interrupted(&reopened).expect("reconcile after reopen");
+    assert!(
+        rounds::phase::nonterminal_attempt(&reopened, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_none(),
+        "failed Start must leave zero nonterminal review attempts after reopen"
+    );
+    let status = reopened.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(status.status, before.status);
+}
+
+/// PHASE-8.3: poison between Handoff's terminal-event write and successor attempt insert.
+#[test]
+#[allow(clippy::too_many_lines)] // setup + poison + reopen/reconcile assertions
+fn handoff_poison_after_terminal_event_rolls_back_and_stays_consistent_after_reopen() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let review = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("start review");
+    let before_events = rounds::phase::events_for_run(&db, &run_id).unwrap().len();
+    let before_attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap().len();
+    let before = db.run_by_id(&run_id).unwrap().unwrap();
+
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TRIGGER poison_handoff_successor BEFORE INSERT ON phase_attempts
+            WHEN NEW.caused_by_attempt_id IS NOT NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'forced kill between handoff terminal and successor');
+            END;
+            ",
+        )
+        .unwrap();
+    }
+
+    let poisoned = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: review.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("fixer_ok".into()),
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        poisoned.is_err(),
+        "poison between Handoff writes must abort the Immediate txn"
+    );
+    assert_eq!(
+        rounds::phase::events_for_run(&db, &run_id).unwrap().len(),
+        before_events,
+        "rolled-back Handoff must not keep the from-attempt Terminal"
+    );
+    assert_eq!(
+        rounds::phase::attempts_for_run(&db, &run_id).unwrap().len(),
+        before_attempts,
+        "rolled-back Handoff must not mint a successor"
+    );
+    let open = rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+        .unwrap()
+        .expect("from review stays nonterminal");
+    assert_eq!(open.id, review);
+    let after = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(after.status, before.status);
+
+    {
+        let conn = Connection::open(db_path(home)).unwrap();
+        conn.execute_batch("DROP TRIGGER IF EXISTS poison_handoff_successor;")
+            .unwrap();
+    }
+    // Pre-reconcile invariant after rollback: ≤1 nonterminal, status matches log.
+    assert_eq!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .map(|a| a.id),
+        Some(review.clone())
+    );
+    assert_eq!(db.run_by_id(&run_id).unwrap().unwrap().status, "running");
+
+    let reopened = Db::open(&db_path(home)).unwrap();
+    let closed = rounds::phase::reconcile_interrupted(&reopened).expect("reconcile after reopen");
+    assert!(
+        closed >= 1,
+        "running+open review must be interrupted on restart"
+    );
+    assert!(
+        rounds::phase::nonterminal_attempt(&reopened, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_none(),
+        "post-restart must leave ≤1 (here 0) nonterminal review"
+    );
+    let status = reopened.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(
+        status.status, "failed",
+        "status must match interrupted terminals in the log"
+    );
+    assert!(
+        rounds::phase::events_for_run(&reopened, &run_id)
+            .unwrap()
+            .iter()
+            .any(|e| {
+                e.attempt_id == review
+                    && e.kind == rounds::phase::PhaseEventKind::Terminal
+                    && e.outcome.as_deref() == Some("interrupted")
+            }),
+        "reconcile must terminal the rolled-back-open review"
+    );
+}
+
+#[test]
+fn terminal_transition_appends_a_row_and_leaves_started_unchanged() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let attempt_id = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Certify,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start certify");
+
+    let started_before = rounds::phase::events_for_run(&db, &run_id)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.kind == rounds::phase::PhaseEventKind::Started)
+        .expect("started event");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Terminal {
+            attempt: attempt_id.clone(),
+            outcome: "completed".into(),
+            cause: Some("certified".into()),
+        },
+        rounds::RunEffects {
+            status: Some("completed".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![rounds::StepEffect {
+                step: "certify".into(),
+                status: "completed".into(),
+                error: None,
+            }],
+        },
+    )
+    .expect("terminal certify");
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 2);
+    let started_after = events
+        .iter()
+        .find(|e| e.id == started_before.id)
+        .expect("started row still present");
+    assert_eq!(started_after, &started_before);
+    assert_eq!(started_after.kind, rounds::phase::PhaseEventKind::Started);
+    assert!(started_after.outcome.is_none());
+
+    let terminal = events
+        .iter()
+        .find(|e| e.kind == rounds::phase::PhaseEventKind::Terminal)
+        .expect("terminal event appended");
+    assert_ne!(terminal.id, started_before.id);
+    assert_eq!(terminal.attempt_id, attempt_id);
+    assert_eq!(terminal.seq, started_before.seq + 1);
+    assert_eq!(terminal.outcome.as_deref(), Some("completed"));
+    assert_eq!(terminal.cause.as_deref(), Some("certified"));
+
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Certify)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn start_refused_when_a_nonterminal_attempt_for_the_phase_exists() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let first = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects {
+            status: Some("parked".into()),
+            error: Some("awaiting compose".into()),
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("first deliver start");
+
+    let open = rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Deliver)
+        .unwrap()
+        .expect("parked attempt stays nonterminal");
+    assert_eq!(open.id, first);
+
+    let refused = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        matches!(refused, Err(rounds::phase::PhaseError::NonterminalExists)),
+        "second start must refuse while a nonterminal attempt exists, got {refused:?}"
+    );
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].id, first);
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, rounds::phase::PhaseEventKind::Started);
+}
+
+#[test]
+fn nested_start_under_a_terminated_parent_is_refused() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let parent = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Terminal {
+            attempt: parent.clone(),
+            outcome: "completed".into(),
+            cause: Some("done".into()),
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("terminal review");
+
+    let refused = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: parent.clone(),
+            kind: rounds::phase::OperationKind::Fixer,
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        matches!(refused, Err(rounds::phase::PhaseError::ParentTerminated)),
+        "nested start under a terminated parent must be refused, got {refused:?}"
+    );
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].id, parent);
+    assert!(attempts[0].parent_attempt_id.is_none());
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|e| e.kind != rounds::phase::PhaseEventKind::Started || e.attempt_id == parent)
+    );
+}
+
+#[test]
+fn handoff_writes_old_terminal_and_new_started_at_consecutive_seq() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let from = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    let successor = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: from.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("fixer_ok".into()),
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("handoff to next review");
+
+    assert_ne!(successor, from);
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 2);
+    let old = attempts.iter().find(|a| a.id == from).expect("old attempt");
+    let neu = attempts
+        .iter()
+        .find(|a| a.id == successor)
+        .expect("new attempt");
+    assert_eq!(old.ordinal, 1);
+    assert_eq!(neu.ordinal, 2);
+    assert_eq!(neu.phase, rounds::phase::PhaseName::Review);
+    assert_eq!(neu.caused_by_attempt_id.as_ref(), Some(&from));
+    assert!(neu.parent_attempt_id.is_none());
+    assert!(neu.operation_kind.is_none());
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, rounds::phase::PhaseEventKind::Started);
+    assert_eq!(events[0].attempt_id, from);
+    assert_eq!(events[0].seq, 1);
+
+    assert_eq!(events[1].kind, rounds::phase::PhaseEventKind::Terminal);
+    assert_eq!(events[1].attempt_id, from);
+    assert_eq!(events[1].seq, 2);
+    assert_eq!(events[1].outcome.as_deref(), Some("rereview"));
+    assert_eq!(events[1].cause.as_deref(), Some("fixer_ok"));
+
+    assert_eq!(events[2].kind, rounds::phase::PhaseEventKind::Started);
+    assert_eq!(events[2].attempt_id, successor);
+    assert_eq!(events[2].seq, 3);
+    assert_eq!(
+        events[2].seq,
+        events[1].seq + 1,
+        "handoff terminal and new started must be consecutive"
+    );
+
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_some_and(|a| a.id == successor)
+    );
+}
+
+#[test]
+fn canonical_phase_name_is_refused_as_nested_operation_kind() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+    let path = db_path(home);
+
+    let parent = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start deliver");
+
+    let nested = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: parent.clone(),
+            kind: rounds::phase::OperationKind::Compose,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("compose nested under deliver");
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    let child = attempts
+        .iter()
+        .find(|a| a.id == nested)
+        .expect("nested attempt");
+    assert_eq!(child.parent_attempt_id.as_ref(), Some(&parent));
+    assert_eq!(child.phase, rounds::phase::PhaseName::Deliver);
+    assert_eq!(
+        child.operation_kind,
+        Some(rounds::phase::OperationKind::Compose)
+    );
+    // Typed NestedStart accepts only OperationKind::{Compose, Fixer, DeliverRepair};
+    // canonical PhaseName values are not expressible as kind.
+    match child.operation_kind {
+        Some(
+            rounds::phase::OperationKind::Compose
+            | rounds::phase::OperationKind::Fixer
+            | rounds::phase::OperationKind::DeliverRepair,
+        ) => {}
+        other => panic!("nested operation_kind must be a nested kind, got {other:?}"),
+    }
+
+    let conn = Connection::open(&path).unwrap();
+    let rejected = conn.execute(
+        "INSERT INTO phase_attempts (
+            id, run_id, phase, ordinal, parent_attempt_id, caused_by_attempt_id,
+            operation_kind, created_at
+         ) VALUES (?1, ?2, 'deliver', 2, ?3, NULL, 'review', '99')",
+        rusqlite::params!["att-bad-kind", &run_id, parent.as_str()],
+    );
+    assert!(
+        rejected.is_err(),
+        "store must reject a canonical phase name as nested operation_kind"
+    );
+}
+
+#[test]
+fn review_attempt_yields_at_most_one_successor() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let review1 = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    let fixer = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: review1.clone(),
+            kind: rounds::phase::OperationKind::Fixer,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start fixer");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedTerminal {
+            attempt: fixer,
+            outcome: "completed".into(),
+            cause: Some("head_unchanged".into()),
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("successful fixer terminal");
+
+    let review2 = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: review1.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("fixer_ok".into()),
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("handoff after successful fixer");
+
+    let second = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: review1.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("again".into()),
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        matches!(second, Err(rounds::phase::PhaseError::SuccessorExists)),
+        "a review attempt must yield at most one successor, got {second:?}"
+    );
+
+    let attempts_after_handoff = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    let successors: Vec<_> = attempts_after_handoff
+        .iter()
+        .filter(|a| a.caused_by_attempt_id.as_ref() == Some(&review1))
+        .collect();
+    assert_eq!(successors.len(), 1);
+    assert_eq!(successors[0].id, review2);
+}
+
+#[test]
+fn failed_nested_op_yields_no_successor() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let review = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    let fixer = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: review.clone(),
+            kind: rounds::phase::OperationKind::Fixer,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start fixer");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedTerminal {
+            attempt: fixer.clone(),
+            outcome: "failed".into(),
+            cause: Some("fixer_error".into()),
+        },
+        rounds::RunEffects {
+            status: Some("failed".into()),
+            error: Some("fixer_error".into()),
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("failed fixer terminals nested and parent");
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 2, "failed nested must create no successor");
+    assert!(attempts.iter().all(|a| a.caused_by_attempt_id.is_none()));
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|a| a.caused_by_attempt_id.as_ref() == Some(&review))
+            .count(),
+        0,
+        "failed nested op must yield no successor"
+    );
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == rounds::phase::PhaseEventKind::Terminal)
+        .collect();
+    assert_eq!(terminals.len(), 2);
+    assert!(terminals.iter().any(|e| e.attempt_id == fixer));
+    assert!(terminals.iter().any(|e| e.attempt_id == review));
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn allowlist_and_merge_conflicts_are_nonterminal_evidence_on_deliver() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let deliver = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("start deliver");
+
+    for cause in ["AllowlistFailed", "MergeConflicting"] {
+        rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::Evidence {
+                attempt: deliver.clone(),
+                cause: cause.into(),
+            },
+            rounds::RunEffects::none(),
+        )
+        .unwrap_or_else(|e| panic!("evidence {cause}: {e}"));
+    }
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].kind, rounds::phase::PhaseEventKind::Started);
+    assert_eq!(events[1].kind, rounds::phase::PhaseEventKind::Evidence);
+    assert_eq!(events[1].cause.as_deref(), Some("AllowlistFailed"));
+    assert_eq!(events[2].kind, rounds::phase::PhaseEventKind::Evidence);
+    assert_eq!(events[2].cause.as_deref(), Some("MergeConflicting"));
+    assert!(
+        events
+            .iter()
+            .all(|e| e.kind != rounds::phase::PhaseEventKind::Terminal)
+    );
+
+    let open = rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Deliver)
+        .unwrap()
+        .expect("deliver stays nonterminal after repairable-failure evidence");
+    assert_eq!(open.id, deliver);
+}
+
+#[test]
+fn handoff_into_open_destination_phase_is_refused() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let deliver = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start deliver");
+
+    let review = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    let refused = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: deliver.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("head_changed_repair".into()),
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        matches!(refused, Err(rounds::phase::PhaseError::NonterminalExists)),
+        "handoff into an open destination phase must be refused, got {refused:?}"
+    );
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|a| a.caused_by_attempt_id.is_none()));
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Deliver)
+            .unwrap()
+            .is_some_and(|a| a.id == deliver)
+    );
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Review)
+            .unwrap()
+            .is_some_and(|a| a.id == review)
+    );
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|e| e.kind == rounds::phase::PhaseEventKind::Started)
+    );
+}
+
+#[test]
+fn handoff_from_already_terminal_attempt_is_refused() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let review = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Review,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start review");
+
+    let fixer = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: review.clone(),
+            kind: rounds::phase::OperationKind::Fixer,
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("start fixer");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedTerminal {
+            attempt: fixer,
+            outcome: "failed".into(),
+            cause: Some("fixer_error".into()),
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("failed fixer terminals nested and parent");
+
+    let refused = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: review.clone(),
+            to_phase: rounds::phase::PhaseName::Review,
+            outcome: "rereview".into(),
+            cause: Some("misuse_after_fail".into()),
+        },
+        rounds::RunEffects::none(),
+    );
+    assert!(
+        matches!(refused, Err(rounds::phase::PhaseError::AlreadyTerminal)),
+        "handoff from an already-terminal attempt must be refused, got {refused:?}"
+    );
+
+    let attempts = rounds::phase::attempts_for_run(&db, &run_id).unwrap();
+    assert_eq!(attempts.len(), 2, "refused handoff must mint no successor");
+    assert!(attempts.iter().all(|a| a.caused_by_attempt_id.is_none()));
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    let review_terminals = events
+        .iter()
+        .filter(|e| e.attempt_id == review && e.kind == rounds::phase::PhaseEventKind::Terminal)
+        .count();
+    assert_eq!(
+        review_terminals, 1,
+        "refused handoff must not append a second terminal on from"
+    );
+}
+
+#[test]
+fn compose_abort_nested_terminal_closes_owning_deliver_and_cancels_run() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+    let db = fixture_db(home);
+    let run_id = seed_run(&db, home);
+
+    let deliver = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects {
+            status: Some("running".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .expect("start deliver");
+
+    let compose = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: deliver.clone(),
+            kind: rounds::phase::OperationKind::Compose,
+        },
+        rounds::RunEffects {
+            status: Some("parked".into()),
+            error: Some("awaiting compose".into()),
+            approved_head: None,
+            steps: vec![rounds::StepEffect {
+                step: "compose".into(),
+                status: "parked".into(),
+                error: None,
+            }],
+        },
+    )
+    .expect("start nested compose");
+
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedTerminal {
+            attempt: compose.clone(),
+            outcome: "cancelled".into(),
+            cause: Some("agent abort".into()),
+        },
+        rounds::RunEffects {
+            status: Some("cancelled".into()),
+            error: Some("agent abort".into()),
+            approved_head: None,
+            steps: vec![rounds::StepEffect {
+                step: "compose".into(),
+                status: "cancelled".into(),
+                error: Some("agent abort".into()),
+            }],
+        },
+    )
+    .expect("compose abort terminals nested and parent");
+
+    let run = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(run.status, "cancelled");
+    assert_eq!(run.error.as_deref(), Some("agent abort"));
+
+    let events = rounds::phase::events_for_run(&db, &run_id).unwrap();
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == rounds::phase::PhaseEventKind::Terminal)
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        2,
+        "compose + deliver terminals: {events:?}"
+    );
+    assert!(terminals.iter().any(|e| e.attempt_id == compose));
+    assert!(terminals.iter().any(|e| e.attempt_id == deliver));
+    assert!(
+        rounds::phase::nonterminal_attempt(&db, &run_id, rounds::phase::PhaseName::Deliver)
+            .unwrap()
+            .is_none()
+    );
+    let steps = db.step_results_for_run(&run_id).unwrap();
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.step == "compose" && s.status == "cancelled"),
+        "steps={steps:?}"
+    );
 }

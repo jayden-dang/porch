@@ -1,14 +1,18 @@
 //! Derived audit document over durable rounds, instances, and authority events.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rusqlite::{Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::db::Db;
+use crate::rounds::phase::{
+    PhaseAttemptRow, PhaseEventKind, PhaseEventRow, attempts_for_run_conn, events_for_run_conn,
+};
 use crate::rounds::{
-    AuthorityEventRecord, AuthorityMemberRecord, applicable_round_id_tx, events_for_run_conn,
+    AuthorityEventRecord, AuthorityMemberRecord, applicable_round_id_tx,
+    events_for_run_conn as authority_events_for_run_conn,
 };
 
 /// Watermark pair binding one assembled audit document.
@@ -25,14 +29,37 @@ pub struct AuditAnomaly {
     pub detail: String,
 }
 
-/// Phase projection inferred from `step_results`.
+/// Phase slice rebuilt from `phase_events` (or explicitly unavailable).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditPhase {
     pub kind: String,
+    #[serde(default)]
+    pub attempts: Vec<AuditAttempt>,
     pub steps: Vec<AuditStep>,
 }
 
-/// One `step_results` row copied into the inferred phase list.
+/// One phase attempt in the audit tree, with nested operations as children.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditAttempt {
+    pub id: String,
+    pub phase: String,
+    pub ordinal: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caused_by_id: Option<String>,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+    #[serde(default)]
+    pub children: Vec<AuditAttempt>,
+}
+
+/// One step projected from a terminal or evidence phase event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditStep {
     pub step: String,
@@ -148,7 +175,7 @@ pub fn build_audit(db: &Db, run_id: &str) -> Result<AuditDocument> {
     let instances = load_instances(&tx, run_id)?;
     let events = load_events(&tx, run_id)?;
     let related_occurrences = related_occurrences_from(&instances);
-    let steps = load_steps(&tx, run_id)?;
+    let phase = load_phase(&tx, run_id)?;
     let has_applicable = applicable_round_id_tx(&tx, run_id)?.is_some();
     let has_identity_unavailable = events.iter().any(|e| e.identity_unavailable);
     let has_legacy_findings = findings_json
@@ -179,7 +206,7 @@ pub fn build_audit(db: &Db, run_id: &str) -> Result<AuditDocument> {
     tx.commit()?;
 
     Ok(AuditDocument {
-        schema_version: 1,
+        schema_version: 2,
         run_id: run_id.to_string(),
         run_status: status,
         completeness: completeness.into(),
@@ -191,10 +218,7 @@ pub fn build_audit(db: &Db, run_id: &str) -> Result<AuditDocument> {
         instances,
         events,
         related_occurrences,
-        phase: AuditPhase {
-            kind: "step_results_inferred".into(),
-            steps,
-        },
+        phase,
         anomaly,
     })
 }
@@ -254,7 +278,7 @@ fn load_instances(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditInstanc
 }
 
 fn load_events(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditEvent>> {
-    let records = events_for_run_conn(tx, run_id)?;
+    let records = authority_events_for_run_conn(tx, run_id)?;
     Ok(records.into_iter().map(audit_event_from_record).collect())
 }
 
@@ -305,22 +329,169 @@ fn related_occurrences_from(instances: &[AuditInstance]) -> Vec<RelatedOccurrenc
         .collect()
 }
 
-fn load_steps(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditStep>> {
-    let mut stmt = tx.prepare(
-        "SELECT step, status, error FROM step_results
-         WHERE run_id = ?1
-         ORDER BY created_at, id",
-    )?;
-    let mapped = stmt.query_map([run_id], |row| {
-        Ok(AuditStep {
-            step: row.get(0)?,
-            status: row.get(1)?,
-            error: row.get(2)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in mapped {
-        out.push(row?);
+fn load_phase(tx: &Transaction<'_>, run_id: &str) -> Result<AuditPhase> {
+    let attempts = attempts_for_run_conn(tx, run_id)?;
+    let events = events_for_run_conn(tx, run_id)?;
+    if events.is_empty() {
+        return Ok(AuditPhase {
+            kind: "unavailable".into(),
+            attempts: Vec::new(),
+            steps: Vec::new(),
+        });
     }
-    Ok(out)
+
+    let mut started_at: HashMap<&str, String> = HashMap::new();
+    let mut terminal: HashMap<&str, (Option<String>, Option<String>)> = HashMap::new();
+    for event in &events {
+        let aid = event.attempt_id.as_str();
+        match event.kind {
+            PhaseEventKind::Started => {
+                started_at
+                    .entry(aid)
+                    .or_insert_with(|| event.created_at.clone());
+            }
+            PhaseEventKind::Terminal => {
+                terminal.insert(aid, (event.outcome.clone(), event.cause.clone()));
+            }
+            PhaseEventKind::Evidence => {}
+        }
+    }
+
+    let steps = steps_from_events(&attempts, &events);
+    let tree = attempt_tree(&attempts, &started_at, &terminal);
+
+    Ok(AuditPhase {
+        kind: "phase_events".into(),
+        attempts: tree,
+        steps,
+    })
+}
+
+fn attempt_tree(
+    attempts: &[PhaseAttemptRow],
+    started_at: &HashMap<&str, String>,
+    terminal: &HashMap<&str, (Option<String>, Option<String>)>,
+) -> Vec<AuditAttempt> {
+    let mut nodes: HashMap<String, AuditAttempt> = HashMap::new();
+    let mut child_ids: HashMap<String, Vec<String>> = HashMap::new();
+    let mut roots: Vec<String> = Vec::new();
+
+    for attempt in attempts {
+        let id = attempt.id.as_str();
+        let (term, cause) = terminal.get(id).cloned().unwrap_or((None, None));
+        let node = AuditAttempt {
+            id: attempt.id.to_string(),
+            phase: attempt.phase.as_str().to_string(),
+            ordinal: attempt.ordinal,
+            operation: attempt.operation_kind.map(|k| k.as_str().to_string()),
+            parent_id: attempt
+                .parent_attempt_id
+                .as_ref()
+                .map(std::string::ToString::to_string),
+            caused_by_id: attempt
+                .caused_by_attempt_id
+                .as_ref()
+                .map(std::string::ToString::to_string),
+            started_at: started_at
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| attempt.created_at.clone()),
+            terminal: term,
+            cause,
+            children: Vec::new(),
+        };
+        if let Some(parent) = attempt.parent_attempt_id.as_ref() {
+            child_ids
+                .entry(parent.to_string())
+                .or_default()
+                .push(attempt.id.to_string());
+        } else {
+            roots.push(attempt.id.to_string());
+        }
+        nodes.insert(attempt.id.to_string(), node);
+    }
+
+    roots
+        .iter()
+        .filter_map(|id| attach_children(id, &mut nodes, &child_ids))
+        .collect()
+}
+
+fn attach_children(
+    id: &str,
+    nodes: &mut HashMap<String, AuditAttempt>,
+    child_ids: &HashMap<String, Vec<String>>,
+) -> Option<AuditAttempt> {
+    let mut node = nodes.remove(id)?;
+    if let Some(kids) = child_ids.get(id) {
+        node.children = kids
+            .iter()
+            .filter_map(|cid| attach_children(cid, nodes, child_ids))
+            .collect();
+    }
+    Some(node)
+}
+
+fn steps_from_events(attempts: &[PhaseAttemptRow], events: &[PhaseEventRow]) -> Vec<AuditStep> {
+    let by_id: HashMap<&str, &PhaseAttemptRow> =
+        attempts.iter().map(|a| (a.id.as_str(), a)).collect();
+    let mut steps = Vec::new();
+    let mut terminal_ids = std::collections::HashSet::new();
+
+    for event in events {
+        let aid = event.attempt_id.as_str();
+        match event.kind {
+            PhaseEventKind::Started => {}
+            PhaseEventKind::Terminal => {
+                terminal_ids.insert(aid.to_string());
+                let Some(attempt) = by_id.get(aid) else {
+                    continue;
+                };
+                steps.push(AuditStep {
+                    step: step_name(attempt),
+                    status: event.outcome.clone().unwrap_or_default(),
+                    error: event.cause.clone(),
+                });
+            }
+            PhaseEventKind::Evidence => {
+                let Some(attempt) = by_id.get(aid) else {
+                    continue;
+                };
+                steps.push(AuditStep {
+                    step: step_name(attempt),
+                    status: "evidence".into(),
+                    error: event.cause.clone(),
+                });
+            }
+        }
+    }
+
+    // Open (nonterminal) attempts appear as a nonterminal step, in event order.
+    let mut seen_open = std::collections::HashSet::new();
+    for event in events {
+        if event.kind != PhaseEventKind::Started {
+            continue;
+        }
+        let aid = event.attempt_id.as_str();
+        if terminal_ids.contains(aid) || !seen_open.insert(aid.to_string()) {
+            continue;
+        }
+        let Some(attempt) = by_id.get(aid) else {
+            continue;
+        };
+        steps.push(AuditStep {
+            step: step_name(attempt),
+            status: "started".into(),
+            error: event.cause.clone(),
+        });
+    }
+
+    steps
+}
+
+fn step_name(attempt: &PhaseAttemptRow) -> String {
+    attempt.operation_kind.map_or_else(
+        || attempt.phase.as_str().to_string(),
+        |k| k.as_str().to_string(),
+    )
 }

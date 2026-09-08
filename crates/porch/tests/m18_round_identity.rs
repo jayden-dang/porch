@@ -1253,6 +1253,7 @@ fn reconcile_stale_uses_at_most_one_committed_write_per_round() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // seeds phase start + recovery refusal paths
 fn startup_recovers_stale_runs_and_refuses_when_recovery_fails() {
     // Still recovers stale running runs (and their open rounds).
     {
@@ -1283,7 +1284,20 @@ fn startup_recovers_stale_runs_and_refuses_when_recovery_fails() {
             .unwrap();
         let wt = run_worktree_dir(&s.home, &repo_id, &run.id);
         db.set_worktree_dir(&run.id, &wt).unwrap();
-        db.set_run_status(&run.id, "running", None).unwrap();
+        rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::Start {
+                run_id: run.id.clone(),
+                phase: rounds::phase::PhaseName::Intent,
+            },
+            rounds::RunEffects {
+                status: Some("running".into()),
+                error: None,
+                approved_head: None,
+                steps: vec![],
+            },
+        )
+        .unwrap();
         worktree_add_detach(&GitDir::new(&repo.bare_path).unwrap(), &wt, &sha).unwrap();
         let round_id = open_stale_round(&db, &run.id);
         assert!(wt.exists());

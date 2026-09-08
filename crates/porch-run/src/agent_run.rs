@@ -280,18 +280,9 @@ fn agent_status_from_snap(snap: &RunSnapshot) -> AgentRunSnapshot {
     };
     let phase = match snap.status.as_str() {
         "parked" => snap
-            .steps
-            .iter()
-            .rev()
-            .find(|s| {
-                s.status == "parked"
-                    || s.error.as_deref().is_some_and(|e| e.contains("park"))
-                    || s.step == "review"
-                    || s.step == "rebase"
-            })
-            .map(|s| s.step.clone())
-            .or_else(|| snap.steps.iter().rev().map(|s| s.step.clone()).next())
-            .unwrap_or_else(|| "review".into()),
+            .phase
+            .as_ref()
+            .map_or_else(|| "unavailable".into(), porch_gate::wire_phase_name),
         "completed" | "failed" | "cancelled" => "done".into(),
         "running" | "pending" => "pipeline".into(),
         other => other.to_string(),

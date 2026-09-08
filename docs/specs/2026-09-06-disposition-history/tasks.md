@@ -55,7 +55,8 @@ Retrieval: `cluster(DISPO)` has empty OWNS until this file exists (coverage `wit
 
 ### Task 1: Authority tables and fail-closed persist
 
-**Files:** Create `crates/porch-gate/src/rounds/authority.rs`. Modify `crates/porch-gate/src/rounds/schema.rs`, `crates/porch-gate/src/rounds/mod.rs`, `crates/porch-gate/src/db.rs`, `crates/porch-gate/src/lib.rs`. Test `crates/porch-gate/tests/m18_rounds.rs`.
+**Files:**
+Create `crates/porch-gate/src/rounds/authority.rs`. Modify `crates/porch-gate/src/rounds/schema.rs`, `crates/porch-gate/src/rounds/mod.rs`, `crates/porch-gate/src/db.rs`, `crates/porch-gate/src/lib.rs`. Test `crates/porch-gate/tests/m18_rounds.rs`.
 
 **Reuse:** rung 2 — `Transaction::new_unchecked(..., Immediate)` in `open_round` / `finalize_round`; ULID minting; `ensure_column`.
 
@@ -79,7 +80,8 @@ _Requirements: DISPO-1.1, DISPO-1.2, DISPO-1.3, DISPO-1.5, DISPO-1.7, DISPO-1.8,
 
 ### Task 2: Persist with run effects
 
-**Files:** Modify `crates/porch-gate/src/rounds/authority.rs`. Test `crates/porch-gate/tests/m18_rounds.rs`.
+**Files:**
+Modify `crates/porch-gate/src/rounds/authority.rs`. Test `crates/porch-gate/tests/m18_rounds.rs`.
 
 **Reuse:** rung 2 — extend Task 1 Immediate txn; do not call `Db::set_run_status` / `insert_step_result` / `set_review_approved_head_sha` while the txn holds the mutex.
 
@@ -101,7 +103,8 @@ _Requirements: DISPO-5.5, DISPO-7.3_
 
 ### Task 3: Review approve and skip record bulk events
 
-**Files:** Modify `crates/porch-run/src/lib.rs`. Test `crates/porch/tests/m3_review.rs`, `crates/porch/tests/m20_dispo.rs`.
+**Files:**
+Modify `crates/porch-run/src/lib.rs`. Test `crates/porch/tests/m3_review.rs`, `crates/porch/tests/m20_dispo.rs`.
 
 **Reuse:** rung 2 — `agent_respond_inner` approve/skip arms; `select_findings` unused here; `finish_certify_and_deliver` after successful persist.
 
@@ -123,7 +126,8 @@ _Requirements: DISPO-2.3, DISPO-2.4, DISPO-8.3, DISPO-8.9_
 
 ### Task 4: Fix requested before fixer spawn
 
-**Files:** Modify `crates/porch-run/src/lib.rs`. Test `crates/porch/tests/m4_fix.rs`, `crates/porch/tests/m20_dispo.rs`.
+**Files:**
+Modify `crates/porch-run/src/lib.rs`. Test `crates/porch/tests/m4_fix.rs`, `crates/porch/tests/m20_dispo.rs`.
 
 **Reuse:** rung 2 — `respond_fix`, `select_findings` (default all-blocking), empty selection usage error.
 
@@ -145,7 +149,8 @@ _Requirements: DISPO-3.2, DISPO-3.5, DISPO-3.6, DISPO-7.2_
 
 ### Task 5: Post-fix rereview and standing consent
 
-**Files:** Modify `crates/porch-run/src/lib.rs`. Test `crates/porch/tests/m4_fix.rs`, `crates/porch/tests/m20_dispo.rs`.
+**Files:**
+Modify `crates/porch-run/src/lib.rs`. Test `crates/porch/tests/m4_fix.rs`, `crates/porch/tests/m20_dispo.rs`.
 
 **Reuse:** rung 2 — `finish_rereview`, session-free `run_review_phase(..., true)`, existing `--yes` complete path.
 
@@ -168,7 +173,8 @@ _Requirements: DISPO-4.1, DISPO-4.2, DISPO-4.3, DISPO-4.4, DISPO-4.5, DISPO-4.6,
 
 ### Task 6: Review abort is atomic
 
-**Files:** Modify `crates/porch-run/src/lib.rs`. Test `crates/porch/tests/m3_review.rs`, `crates/porch/tests/m18_round_identity.rs`, `crates/porch/tests/m20_dispo.rs`.
+**Files:**
+Modify `crates/porch-run/src/lib.rs`. Test `crates/porch/tests/m3_review.rs`, `crates/porch/tests/m18_round_identity.rs`, `crates/porch/tests/m20_dispo.rs`.
 
 **Reuse:** rung 2 — Task 2 helper; `finish_remove_worktree` **after** commit; legacy `findings_json` parks.
 
@@ -190,7 +196,8 @@ _Requirements: DISPO-5.3, DISPO-5.6, DISPO-8.8_
 
 ### Task 7: Audit document builder and RPC
 
-**Files:** Create `crates/porch-gate/src/audit.rs`. Modify `crates/porch-gate/src/lib.rs`, `crates/porch-gate/src/rpc.rs`, `crates/porch-gate/src/daemon.rs`. Test `crates/porch/tests/m20_dispo.rs`.
+**Files:**
+Create `crates/porch-gate/src/audit.rs`. Modify `crates/porch-gate/src/lib.rs`, `crates/porch-gate/src/rpc.rs`, `crates/porch-gate/src/daemon.rs`. Test `crates/porch/tests/m20_dispo.rs`.
 
 **Reuse:** rung 2 — `read_history` Deferred `&Transaction` pattern; `rpc_call` / daemon method match. Do not call `&Db` readers inside the snapshot txn.
 
@@ -214,7 +221,8 @@ _Requirements: DISPO-1.4, DISPO-1.6, DISPO-2.7, DISPO-4.9, DISPO-6.1, DISPO-6.2,
 
 ### Task 8: Agent CLI and lazy TUI
 
-**Files:** Modify `crates/porch/src/main.rs`, `crates/porch/src/tui.rs`, `crates/porch-gate/porch-agent.md`. Test `crates/porch/tests/m20_dispo.rs`.
+**Files:**
+Modify `crates/porch/src/main.rs`, `crates/porch/src/tui.rs`, `crates/porch-gate/porch-agent.md`. Test `crates/porch/tests/m20_dispo.rs`.
 
 **Reuse:** rung 2 — clap `AgentCommand`; TUI subscribe still `get_run` on `State`/`StreamGap`.
 
@@ -235,7 +243,8 @@ _Requirements: DISPO-6.3, DISPO-6.13, DISPO-6.14, DISPO-8.7_
 
 ### Task 9: Park and floor guards
 
-**Files:** Test `crates/porch/tests/m17_pr_compose.rs`, `crates/porch/tests/m13_workflow.rs`, `crates/porch/tests/m18_round_identity.rs`, `crates/porch/tests/m19_floor.rs`. Modify `crates/porch-run/src/lib.rs` only if a guard fails.
+**Files:**
+Test `crates/porch/tests/m17_pr_compose.rs`, `crates/porch/tests/m13_workflow.rs`, `crates/porch/tests/m18_round_identity.rs`, `crates/porch/tests/m19_floor.rs`. Modify `crates/porch-run/src/lib.rs` only if a guard fails.
 
 **Reuse:** rung 2 — existing compose/rebase/legacy/floor tests.
 

@@ -75,16 +75,18 @@ Status stays a **compact** live snapshot (`findings[]` display handles, optional
 ```sh
 porch agent audit
 porch agent audit --run-id <ULID>
-porch audit                   # human alias; same builder / pretty JSON
+porch audit                   # human-readable phase tree
+porch audit --json            # same pretty JSON as agent audit
 porch audit --run-id <ULID>
 ```
 
 Default: latest **parked** run for the cwd repo (same resolution as `status`).
-Pretty-printed JSON from the same typed audit-document builder as daemon
-`get_audit` — rounds, finding instances, disposition/authority events with
-members, related-occurrence groups, watermark (`audit_rev` +
-`review_history_revision`), and inferred phase. Use this for reconstruction;
-keep using `status` for park decisions.
+`porch agent audit` (and `porch audit --json`) emit pretty-printed JSON from the
+same typed audit-document builder as daemon `get_audit` — rounds, finding
+instances, disposition/authority events with members, related-occurrence
+groups, watermark (`audit_rev` + `review_history_revision`), and the phase
+attempt tree. Default `porch audit` prints that phase tree as plain text.
+Use the JSON form for reconstruction; keep using `status` for park decisions.
 
 When `phase` is `"compose"`, status also includes `pr_url`, `compose_packet_path`
 (`$PORCH_HOME/runs/<run_id>/compose-packet.json`), and `allowed_actions`
@@ -129,7 +131,7 @@ porch agent respond abort
 
 `--findings` and `--yes` are only valid with `fix`. `--findings` defaults to all blocking ids. `--yes` means **one** fix round then approve remaining (standing consent; never the default). On a modern round porch appends a `review_approved` event that cites the durable `fix_requested` and fails closed if that cite (or the applicable round / reviewed HEAD) is missing or stale — it does **not** authorize from `review_approved_head_sha` alone. There is **no** default yolo on the whole gate — review auto-fix stays off (D6). Unattended agents may use `respond fix --yes` for a single round only. Do not combine `--body-file` with approve/skip/abort/fix.
 
-Stdout after respond is the same shape as `status` for the updated run. Reconstruct disposition/authority with `porch agent audit` (or `porch audit`); status stays compact.
+Stdout after respond is the same shape as `status` for the updated run. Reconstruct disposition/authority with `porch agent audit` (or `porch audit --json`); status stays compact.
 
 Phase rules (rebase/review verbs unchanged):
 

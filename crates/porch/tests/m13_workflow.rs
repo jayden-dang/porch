@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use assert_cmd::Command;
 use porch_deliver::GH_BIN_ENV;
 use porch_gate::rounds;
-use porch_gate::{Db, kill_group, repo_id_for, run_worktree_dir};
+use porch_gate::{Db, get_run, kill_group, repo_id_for, run_worktree_dir};
 use porch_git::init_bare;
 use porch_review::{HomeConfig, REVIEW_BIN_ENV, ToolsConfig, write_home_config};
 use tempfile::TempDir;
@@ -831,4 +831,22 @@ echo biome-ok
         run.pr_url.is_some(),
         "scaffold PR proves certify completed before compose park"
     );
+
+    let snap = get_run(&h.home, &run.id).unwrap();
+    assert!(
+        !snap.steps.is_empty(),
+        "compose-parked workflow snapshot must still carry steps[]"
+    );
+    assert!(
+        snap.audit_available,
+        "compact snapshot must still advertise audit_available"
+    );
+    let findings = snap.findings.as_array().expect("findings array");
+    assert!(
+        findings.is_empty() || findings.iter().all(|f| f.get("fingerprint").is_none()),
+        "findings stay compact live state: {findings:?}"
+    );
+    let raw = serde_json::to_value(&snap).unwrap();
+    assert!(raw.get("events").is_none());
+    assert!(raw.get("schema_version").is_none());
 }

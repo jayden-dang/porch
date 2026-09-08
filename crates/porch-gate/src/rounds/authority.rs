@@ -45,10 +45,7 @@ impl AuthorityKind {
         // fail-closes when live HEAD drifts from the parked tip (DISPO-2.6).
         matches!(
             self,
-            Self::ReviewApproved
-                | Self::ReviewSkipped
-                | Self::ReviewAborted
-                | Self::FixRequested
+            Self::ReviewApproved | Self::ReviewSkipped | Self::ReviewAborted | Self::FixRequested
         )
     }
 }
@@ -189,10 +186,13 @@ pub fn persist_authority(
     db: &Db,
     plan: PersistAuthorityPlan,
 ) -> std::result::Result<String, AuthorityError> {
-    persist_authority_with_run_effects(db, plan, RunEffects::none())
+    persist_authority_with_run_effects(db, plan, RunEffects::none(), None)
 }
 
 /// Append one authority event and optional run status / HEAD / step rows in one Immediate txn.
+///
+/// When `phase` is `Some`, the phase transition is applied in the same transaction before
+/// run effects (compat until authority and phase writes share one core).
 ///
 /// # Errors
 ///
@@ -206,6 +206,7 @@ pub fn persist_authority_with_run_effects(
     db: &Db,
     plan: PersistAuthorityPlan,
     effects: RunEffects,
+    phase: Option<super::phase::PhaseTransition>,
 ) -> std::result::Result<String, AuthorityError> {
     if plan.identity_unavailable {
         if plan.kind != AuthorityKind::ReviewAborted {
@@ -300,6 +301,11 @@ pub fn persist_authority_with_run_effects(
         }
     }
 
+    if let Some(phase) = phase {
+        super::phase::apply_phase_transition_tx(&tx, phase)
+            .map_err(|e| AuthorityError::Storage(crate::Error::Other(e.to_string())))?;
+    }
+
     apply_run_effects_tx(&tx, &run_id, effects)?;
 
     tx.execute(
@@ -312,11 +318,12 @@ pub fn persist_authority_with_run_effects(
     Ok(event_id)
 }
 
-fn apply_run_effects_tx(
+/// Co-write run status / approved HEAD / `step_results` on an open Immediate txn.
+pub(crate) fn apply_run_effects_tx(
     tx: &Transaction<'_>,
     run_id: &str,
     effects: RunEffects,
-) -> std::result::Result<(), AuthorityError> {
+) -> Result<()> {
     let RunEffects {
         status,
         error,
@@ -327,15 +334,13 @@ fn apply_run_effects_tx(
         tx.execute(
             "UPDATE runs SET status = ?1, error = ?2 WHERE id = ?3",
             rusqlite::params![status, error, run_id],
-        )
-        .map_err(crate::Error::from)?;
+        )?;
     }
     if let Some(head) = approved_head.as_deref() {
         tx.execute(
             "UPDATE runs SET review_approved_head_sha = ?1 WHERE id = ?2",
             rusqlite::params![head, run_id],
-        )
-        .map_err(crate::Error::from)?;
+        )?;
     }
     for step in steps {
         let id = Ulid::new().to_string();
@@ -343,8 +348,7 @@ fn apply_run_effects_tx(
             "INSERT INTO step_results (id, run_id, step, status, error, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![id, run_id, step.step, step.status, step.error, now_secs()],
-        )
-        .map_err(crate::Error::from)?;
+        )?;
     }
     Ok(())
 }

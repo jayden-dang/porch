@@ -21,8 +21,8 @@ mod skill;
 
 pub use admit::admit_push;
 pub use audit::{
-    AuditAnomaly, AuditDocument, AuditEvent, AuditEventMember, AuditInstance, AuditPhase,
-    AuditRound, AuditStep, AuditWatermark, RelatedOccurrenceGroup, build_audit,
+    AuditAnomaly, AuditAttempt, AuditDocument, AuditEvent, AuditEventMember, AuditInstance,
+    AuditPhase, AuditRound, AuditStep, AuditWatermark, RelatedOccurrenceGroup, build_audit,
 };
 pub use daemon::{ensure_daemon, run_daemon, wait_for_health};
 pub use db::{Db, RepoRow, RunRow, StepResultRow, UncertifiedPipelineRange};
@@ -45,10 +45,11 @@ pub use proc::{
 };
 pub use rpc::start_run as rpc_start_run;
 pub use rpc::{
-    AssuranceRecord, AuditIdentity, FINDING_HUNK_MAX_BYTES, LegacyFindingDto, RunSnapshot,
-    StatusFindingDto, StepSnapshot, UnavailableAudit, clear_rounds_for_run, compact_run_row,
-    get_audit, get_finding_hunk, get_run, health_check, list_runs, operator_failure_report,
-    resolve_run_assurance, round_for_decision, subscribe_events,
+    AssuranceRecord, AuditIdentity, FINDING_HUNK_MAX_BYTES, LegacyFindingDto, PhaseView,
+    RunSnapshot, StatusFindingDto, StepSnapshot, UnavailableAudit, clear_rounds_for_run,
+    compact_run_row, get_audit, get_finding_hunk, get_run, health_check, list_runs,
+    operator_failure_report, phase_view_for_run, resolve_run_assurance, round_for_decision,
+    subscribe_events, wire_phase_name,
 };
 pub use service::{
     ServicePaths, ServiceStatus, daemon_service_suffix, install_service, render_launchd_plist,
