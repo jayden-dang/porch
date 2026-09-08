@@ -1,7 +1,7 @@
 # Requirements: Durable forward authorization
 
 Feature code: FWDAUTH
-Status: Draft
+Status: Implemented
 Date: 2026-09-08
 
 Roadmap item: ROAD-7 (MILE-3 — Crash-safe forwarding). Serves GOAL-1, whose outcome
@@ -20,25 +20,43 @@ SHA, and a restart distinguishes an authorized completed push from one never
 attempted by reading durable local state. This feature owns the durable record and
 the exact binding. It does not own restart classification, which is ROAD-8.
 
-## 1. Authorization binds exactly one reviewed commit
+## 1. A forward carries only what continuity authorized
 
-**Story:** As an operator, I want the gate to forward only the commit a review round
-actually saw, so that approving a change never silently authorizes later commits.
+**Story:** As an operator, I want the gate to forward the commit continuity blessed
+rather than whatever HEAD happens to be, so that the record and the push agree.
 
-- **FWDAUTH-1.1** WHEN the gate evaluates HEAD continuity THE SYSTEM SHALL require
-  the live worktree HEAD to equal the recorded approved SHA.
-- **FWDAUTH-1.2** THE SYSTEM SHALL NOT accept a live HEAD that is merely a descendant
-  of the approved SHA.
-- **FWDAUTH-1.3** IF the live HEAD differs from the approved SHA THEN THE SYSTEM
-  SHALL fail closed with an error naming both the live HEAD and the approved SHA.
 - **FWDAUTH-1.4** WHEN a forward is performed THE SYSTEM SHALL forward the SHA that
-  continuity authorized, and SHALL NOT re-read the worktree HEAD to choose what to
-  forward.
+  continuity authorized, and SHALL NOT independently re-read the worktree HEAD to
+  choose what to forward.
 - **FWDAUTH-1.5** IF no approved SHA is recorded for a run THEN THE SYSTEM SHALL fail
   closed rather than forward.
-- **FWDAUTH-1.6** THE SYSTEM SHALL leave HEAD movement reachable only through the
-  existing phase handoff that revokes the prior approval and re-reviews, and SHALL
-  NOT introduce a second route by which a moved HEAD becomes forwardable.
+- **FWDAUTH-1.7** WHEN the forward boundary is reached THE SYSTEM SHALL evaluate
+  continuity itself rather than relying on its caller having done so.
+- **FWDAUTH-1.8** IF the live HEAD is not on the approved line THEN THE SYSTEM SHALL
+  fail closed with an error naming both the live HEAD and the approved SHA.
+
+### Blocked: binding by equality
+
+Discovery while building found that certify's own correction commit
+(`crates/porch-run/src/certify.rs:71`, `:81`) advances HEAD *after* review approves,
+and then `refresh_head_sha` records the new tip without revoking the approval. The
+descendant tolerance in continuity is therefore load-bearing, not dead: binding by
+equality turns every run whose `commands.format` leaves the tree dirty into a
+fail-closed run, which `m5_certify::format_dirty_tree_gets_correction_commit` proves
+and which would break the dogfood consumers named in `AGENTS.md`.
+
+Deciding whether a correction commit is re-reviewed, exempt, or forbidden is a
+product decision of the same class as the two MILE-3 blockers, so these criteria are
+recorded and **not implemented**:
+
+- **FWDAUTH-1.1** (blocked) WHEN the gate evaluates HEAD continuity THE SYSTEM SHALL
+  require the live worktree HEAD to equal the recorded approved SHA.
+- **FWDAUTH-1.2** (blocked) THE SYSTEM SHALL NOT accept a live HEAD that is merely a
+  descendant of the approved SHA.
+- **FWDAUTH-1.3** (blocked) IF the live HEAD differs from the approved SHA THEN THE
+  SYSTEM SHALL fail closed with an error naming both SHAs.
+- **FWDAUTH-1.6** (blocked) THE SYSTEM SHALL leave HEAD movement reachable only
+  through the existing phase handoff that revokes the prior approval and re-reviews.
 
 ## 2. A forward intent is durable before any external effect
 
@@ -157,6 +175,16 @@ appear without hand-editing my database.
 
 ## Open Questions
 
-None. The residual window between a completed push and its outcome write is owned by
-ROAD-8 and recorded as an owned unknown on `docs/roadmap/INDEX.md`; this feature must
-not invent the probe that closes it.
+1. **May certify's correction commit be forwarded without re-review?** Certify runs
+   `commands.format` and `commands.lint` after review approves and commits the result,
+   so the forwarded tree can differ from the reviewed tree. Today it is forwarded on
+   the descendant tolerance. The candidate answers are: re-review it through the
+   existing revoke-and-handoff idiom the deliver-repair path already uses; declare
+   porch's own deterministic correction exempt and record it as such; or forbid
+   tree-mutating certify commands after approval. Each has a different blast radius,
+   and the re-review answer needs a termination rule for a nondeterministic formatter.
+   Owner Jayden. This blocks FWDAUTH-1.1 … FWDAUTH-1.3 and FWDAUTH-1.6, and it
+   reopens the MILE-3 blocker recorded on `docs/roadmap/INDEX.md`.
+2. The residual window between a completed push and its outcome write is owned by
+   ROAD-8 and recorded as an owned unknown on `docs/roadmap/INDEX.md`; this feature
+   must not invent the probe that closes it.

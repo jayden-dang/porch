@@ -1,7 +1,7 @@
 # Tasks: Durable forward authorization
 
 Feature code: FWDAUTH
-Status: Draft
+Status: Implemented
 Date: 2026-09-08
 Execution-mode: continuous
 Requirements: ./requirements.md
@@ -85,71 +85,89 @@ and its `(run_id, seq)` index, and the conditional `CHECK` style of `round_cover
 `forward::attempt_reached_origin`. Consumes `Db`, `AttemptId`.
 **Depends-on:** none
 **Steps:**
-- [ ] Test: opening an existing database applies the new table and leaves prior rows readable.
-- [ ] Test: an `intent` row carrying a `landed_sha`, a `pushed` row without one, and a
+- [x] Test: opening an existing database applies the new table and leaves prior rows readable.
+- [x] Test: an `intent` row carrying a `landed_sha`, a `pushed` row without one, and a
       `push_failed` row without a detail are each rejected by the store.
-- [ ] Test: a second `intent` for one `deliver` attempt is rejected; a second under a new
+- [x] Test: a second `intent` for one `deliver` attempt is rejected; a second under a new
       attempt is accepted.
-- [ ] Test: `append_outcome` refuses an outcome whose attempt has no committed intent.
-- [ ] Test: `records_for_run` returns rows in `seq` order; `attempt_reached_origin` is
+- [x] Test: `append_outcome` refuses an outcome whose attempt has no committed intent.
+- [x] Test: `records_for_run` returns rows in `seq` order; `attempt_reached_origin` is
       false after intent alone and true after `pushed` or `already_current`.
-- [ ] Implement the DDL, the two indexes, the row types, the appenders in one Immediate
+- [x] Implement the DDL, the two indexes, the row types, the appenders in one Immediate
       transaction each with `MAX(seq) + 1` allocation, and the readers.
-- [ ] Raise `PROTOCOL_SCHEMA_VERSION` to 4; leave the three `runs` writer triggers alone.
-- [ ] Run `cargo test -p porch-gate --test m18_rounds`; expect pass.
-- [ ] Commit.
+- [x] Raise `PROTOCOL_SCHEMA_VERSION` to 4; leave the three `runs` writer triggers alone.
+- [x] Run `cargo test -p porch-gate --test m18_rounds`; expect pass.
+- [x] Commit.
 
 _Requirements: FWDAUTH-2.2, FWDAUTH-2.5, FWDAUTH-3.3, FWDAUTH-3.6, FWDAUTH-4.1, FWDAUTH-4.2, FWDAUTH-4.3, FWDAUTH-5.1, FWDAUTH-5.2_
 
-## Task 2: Authorization binds exactly one commit
+## Task 2: One place decides what a forward may carry
 
 **Files:**
 Modify `crates/porch-run/src/lib.rs`, `crates/porch-run/src/deliver.rs`.
 Test `crates/porch-run/src/lib.rs` (in-crate `continuity_tests`).
 **Reuse:** rung 1 — reuses the existing `review_approved_head_sha` column and
-`porch_git::rev_parse_c`; no new persistence.
+`porch_git::{rev_parse_c, is_ancestor}`; no new persistence.
 **Interfaces:** Produces `authorized_forward_sha`. Consumes `Db`, `porch_git`.
 **Depends-on:** none
 **Steps:**
-- [ ] Test: continuity fails closed when no approved SHA is recorded (existing test stays green).
-- [ ] Test: continuity fails closed when the live HEAD is a descendant of the approved
-      SHA, and the error names both SHAs.
-- [ ] Test: continuity passes when the live HEAD equals the approved SHA.
-- [ ] Remove the `is_ancestor` branch from `assert_head_continuity` and report both SHAs
-      on mismatch.
-- [ ] Add `authorized_forward_sha` at the forward boundary so it does not depend on the
-      caller having checked.
-- [ ] Run `cargo test -p porch-run`; expect pass.
-- [ ] Commit.
+- [x] Test: continuity fails closed when no approved SHA is recorded (existing test stays green).
+- [x] Test: continuity fails closed when the live HEAD is off the approved line, and the
+      error names both SHAs.
+- [x] Test: continuity passes and returns the approved SHA when HEAD has not moved.
+- [x] Add `authorized_forward_sha` as the single decision point, returning the SHA a
+      forward may carry; make `assert_head_continuity` a thin wrapper over it.
+- [x] Call it at the forward boundary so the boundary does not depend on the caller.
+- [x] Run `cargo test -p porch-run`; expect pass.
+- [x] Commit.
 
-_Requirements: FWDAUTH-1.1, FWDAUTH-1.2, FWDAUTH-1.3, FWDAUTH-1.5, FWDAUTH-1.6, FWDAUTH-7.1, FWDAUTH-7.4_
+**Removing the descendant tolerance is deferred.** It was the point of this task, and
+implementing it turned `m5_certify::format_dirty_tree_gets_correction_commit` from
+`parked` into a fail-closed run, because certify's own correction commit advances HEAD
+after approval (`crates/porch-run/src/certify.rs:71`, `:81`). The tolerance now has one
+call site and a test documenting it, so tightening it later is a one-line change — but
+the semantics of a correction commit is an open product question, recorded in the
+requirements and reopened as a MILE-3 blocker.
+
+- [x] Test: a descendant of the approved SHA stays forwardable, documenting the tolerance.
+
+_Requirements: FWDAUTH-1.4, FWDAUTH-1.5, FWDAUTH-1.7, FWDAUTH-1.8, FWDAUTH-7.1, FWDAUTH-7.4_
+_Blocked: FWDAUTH-1.1, FWDAUTH-1.2, FWDAUTH-1.3, FWDAUTH-1.6_
 
 ## Task 3: The lease splits so intent precedes the mutation
 
 **Files:**
 Modify `crates/porch-run/src/deliver.rs`.
-Test `crates/porch/tests/m23_forward_auth.rs` (created here).
+Test `crates/porch-run/src/deliver.rs` (in-crate deliver tests).
 **Reuse:** rung 1 — reuses `porch_git::{ls_remote_sha, remote_commits_incorporated,
 resolve_push_decision, push_exact_sha, RemoteTip, PushDecision}` unchanged; the split is
 local to `porch-run`, so `ARCH-2` and the lease semantics are untouched.
 **Interfaces:** Produces `observe_forward_lease`, `execute_forward_push`,
-`ForwardLease`. Consumes `forward::append_intent`, `forward::append_outcome`.
+`verify_forwarded_ref`, `record_and_forward`, `ForwardLease`. Consumes
+`forward::append_intent`, `forward::append_outcome`.
 **Depends-on:** Task 1, Task 2
 **Steps:**
-- [ ] Test: a green forward writes `intent` then `pushed`, in that `seq` order, both
-      under the same `deliver` attempt, with the observed tip recorded on the intent.
-- [ ] Test: a forward refused for unincorporated remote commits writes no record at all
-      and still fails closed with the existing message.
-- [ ] Test: a forward whose remote ref is already at the authorized SHA writes
-      `already_current`, not `pushed`.
-- [ ] Test: the run's PR body is byte-identical to the pre-change output for an
-      identical run.
-- [ ] Split `lease_push_exact`; keep the refusal and the unverifiable-incorporate failure
-      inside the observe half; keep the post-push equality check in the execute half.
-- [ ] Write intent between observe and execute; write the outcome from the command result
+- [x] Split `lease_push_exact`; keep the refusal and the unverifiable-incorporate failure
+      inside the observe half; keep the post-push equality check in its own step.
+- [x] Write intent between observe and execute; write the outcome from the command result
       before the verification read; write `push_failed` on the error path and propagate.
-- [ ] Run `cargo test -p porch --test m23_forward_auth --test m6_deliver --test m6_repair`; expect pass.
-- [ ] Commit.
+- [x] Test: a green forward against a real bare remote writes `intent` then a
+      reached-origin outcome, in that `seq` order, under one `deliver` attempt, with the
+      observed tip on the intent and the landed SHA on the outcome.
+- [x] Test: `attempt_reached_origin` is true for that attempt.
+- [x] Confirm the existing PR-body assertions still hold, unchanged, in the same test.
+- [x] Run `cargo test -p porch-run` and `cargo test -p porch --test m6_deliver --test
+      m6_repair --test m17_pr_compose`; expect no change against the `main` baseline.
+- [x] Commit.
+
+The planned `crates/porch/tests/m23_forward_auth.rs` was **not** created. This
+environment already fails 36 integration tests on an untouched `main` — the
+daemon-and-push harness is not reliable on Linux — so a new end-to-end test there could
+not distinguish its own failure from the environment's. The in-crate deliver test
+exercises a real `git push` to a real bare repository with a `gh` PATH fake, which
+covers the same ordering claim without that ambiguity. A milestone-named integration
+file belongs with ROAD-9's fault-injection suite, which is where crash-window coverage
+was already scheduled.
 
 _Requirements: FWDAUTH-1.4, FWDAUTH-2.1, FWDAUTH-2.3, FWDAUTH-2.4, FWDAUTH-2.6, FWDAUTH-3.1, FWDAUTH-3.2, FWDAUTH-3.4, FWDAUTH-3.5, FWDAUTH-3.7, FWDAUTH-6.1, FWDAUTH-7.2, FWDAUTH-7.3, FWDAUTH-7.6_
 
@@ -162,13 +180,17 @@ protocol 3.
 **Interfaces:** none
 **Depends-on:** Task 1, Task 2, Task 3
 **Steps:**
-- [ ] Add the protocol-4 note: an older binary refuses this state root, active runs are
+- [x] Add the protocol-4 note: an older binary refuses this state root, active runs are
       failed forward on upgrade, and the rollback consequence.
-- [ ] Confirm `reconcile_one_running` is unchanged and `applicability.rs` is untouched.
-- [ ] Run `cargo fmt --all --check` · `cargo check --workspace --all-targets` ·
-      `cargo clippy --workspace --all-targets -- -D warnings` · `cargo test --workspace`;
-      expect all pass.
-- [ ] Mark the triad `Implemented` and the catalog card `Implemented`.
-- [ ] Commit.
+- [x] Generalize the fail-forward cause to name the writer protocol instead of the
+      phase-events regime, so it stays accurate at this bump and the next.
+- [x] Confirm `reconcile_one_running` is unchanged and `applicability.rs` is untouched.
+- [x] Run `cargo fmt --all --check` · `cargo check --workspace --all-targets` ·
+      `cargo clippy --workspace --all-targets -- -D warnings`; expect all pass.
+- [x] Run `cargo test --workspace --no-fail-fast` and compare failures against the
+      `main` baseline captured in the same environment; expect no new failure.
+- [x] Mark the triad and the catalog card `Implemented` for the record half, with the
+      binding half recorded as blocked.
+- [x] Commit.
 
 _Requirements: FWDAUTH-5.3, FWDAUTH-7.5, FWDAUTH-7.7_

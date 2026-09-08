@@ -2981,8 +2981,8 @@ fn assert_legacy_runs_terminalized(db: &Db) {
         parked
             .error
             .as_deref()
-            .is_some_and(|e| { e.contains("upgraded") && e.contains("phase-events") }),
-        "legacy active runs must name the phase-events upgrade, got {:?}",
+            .is_some_and(|e| { e.contains("upgraded") && e.contains("writer protocol") }),
+        "legacy active runs must name the protocol upgrade, got {:?}",
         parked.error
     );
     assert!(parked.review_approved_head_sha.is_none());

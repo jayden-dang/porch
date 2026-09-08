@@ -65,12 +65,12 @@ gate that died mid-forward discovers what actually happened instead of repeating
 - **ROAD-8** restart reconciliation of ambiguous external effects — Surfaces: `crates/porch-run/src/deliver.rs`, `crates/porch-gate/src/daemon.rs`
 - **ROAD-9** fault-injection suite across the forward boundary — Surfaces: `crates/porch/tests/`
 **Depends-on:** MILE-2
-**Commitment:** Committed 2026-09-08
+**Commitment:** Committed 2026-09-08 — ROAD-7's durable forward record shipped; one blocker below is open again and gates the reviewed-input binding half
 **Closed:** None
 **Deferred:** None
 **Blockers:**
 - ~~Restart reconciliation behaviour when the branch was pushed but PR creation or local completion persistence did not finish~~ — resolved 2026-09-08 in ROAD-7 discovery: the forward boundary persists an intent record before the push and an outcome record after it, so a restart reads durable local state instead of inferring from `pr_url` alone and can distinguish an authorized, completed push from one never attempted. The residual window between push completion and the outcome write stays owned by ROAD-8, which owns discovery; ROAD-7 does not probe `origin`.
-- ~~Whether an approval may remain valid after HEAD advances past the reviewed SHA, and under which copy conditions~~ — resolved 2026-09-08 in ROAD-7 discovery: it may not. Authorization binds the reviewed SHA exactly, the forward carries that SHA rather than a re-read HEAD, and drift fails closed naming both SHAs. There are no copy conditions; HEAD movement reaches a forward only through the existing phase handoff that revokes the old approval and re-reviews.
+- **Open (reopened 2026-09-08).** Whether an approval may remain valid after HEAD advances past the reviewed SHA — owner Jayden. The intended answer was "it may not; binding is exact", and ROAD-7 built the forward to carry exactly the SHA continuity authorized. Implementing the equality rule then found that certify's own correction commit advances HEAD after approval without revoking it (`crates/porch-run/src/certify.rs:71`, `:81`), so equality fail-closes every run whose formatter rewrites the tree and breaks the dogfood consumers. The real question underneath is narrower than first framed: **may porch's own certify correction commit be forwarded without re-review?** Candidates and their trade-offs are in the Open Questions of `docs/specs/2026-09-08-forward-authorization/requirements.md`. Resolve through feature discovery/design, not here.
 
 ## MILE-4 — Escape without the daemon
 

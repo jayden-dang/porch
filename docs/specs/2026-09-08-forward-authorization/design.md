@@ -1,7 +1,7 @@
 # Design: Durable forward authorization
 
 Feature code: FWDAUTH
-Status: Draft
+Status: Implemented
 Date: 2026-09-08
 Requirements: ./requirements.md
 
@@ -24,15 +24,22 @@ accepts the live HEAD *or any descendant of it* (`:1881`). The forward pushes th
 re-read HEAD, not the approved SHA, so that ancestor branch is a path on which
 commits no **Review round** ever saw reach `origin` under an older approval.
 
-A reference search shows the ancestor branch is **dead tolerance**, which is what
-makes tightening it affordable rather than a behavior break. Every writer of the
-approved SHA binds the *live* HEAD at the moment it writes: a findings-free review
-auto-binds (`lib.rs:641`), operator approve binds (`:2317`), the `--yes` path binds
-(`:3077`), and a deliver repair that moves HEAD explicitly revokes the binding to
-`None` (`:1638`) and hands off to a fresh review before any further forward. So on
-every green path the approved SHA already equals HEAD at the continuity check. No test
-exercises the descendant branch on purpose — the only continuity unit tests cover a
-missing approved SHA and the documented empty-diff no-op (`lib.rs:3556`-`3599`).
+A reference search suggested the ancestor branch was **dead tolerance**. Every writer
+of the approved SHA binds the *live* HEAD at the moment it writes: a findings-free
+review auto-binds (`lib.rs:641`), operator approve binds (`:2317`), the `--yes` path
+binds (`:3077`), and a deliver repair that moves HEAD explicitly revokes the binding to
+`None` (`:1638`) and hands off to a fresh review before any further forward.
+
+**That search was wrong, and building the change proved it.** Certify itself moves HEAD
+after approval: `maybe_correction_commit` commits a dirty tree left by `commands.format`
+or `commands.lint` and calls `refresh_head_sha`, without revoking the approval
+(`crates/porch-run/src/certify.rs:71`, `:81`, `:283`). The next continuity check —
+`execute_deliver_step` at `lib.rs:1516` — then passes only via the descendant branch.
+Binding by equality makes `m5_certify::format_dirty_tree_gets_correction_commit` fail
+closed instead of parking, and it would do that to every repo whose formatter rewrites
+the tree. The tolerance is load-bearing, so the equality half of this design is
+**deferred** and recorded as an Open Question; what remains is the durable record and a
+forward that carries exactly the SHA continuity blessed.
 
 Two facts shape the storage decision. First, `porch-gate`'s `rounds/` module already
 owns three append-only evidence logs with the same spine — `authority_events`
@@ -94,10 +101,12 @@ Optional system docs (`docs/security/`, `docs/ops/`, `docs/standards/`,
    `assert_head_continuity` call sites (`lib.rs:1490`, `:1516`, `:1694`, `:3194`,
    `:3214`). Callers keep their checks; the boundary stops depending on them.
 
-6. **`assert_head_continuity` becomes exact equality.** The ancestor branch is removed
-   rather than left unused, because a tolerance that no path needs is a tolerance the
-   next contributor will rely on. This also tightens the certify boundary, which is
-   inert for the reason in Context: HEAD already equals the approved SHA there.
+6. **`assert_head_continuity` keeps the ancestor branch, for now.** The intent was to
+   remove it; certify's correction commit needs it. Instead the rule is expressed once,
+   in `authorized_forward_sha`, which returns the SHA a forward may carry and fails
+   closed when no approval is recorded or when HEAD is off the approved line.
+   `assert_head_continuity` becomes a thin wrapper over it, so when the correction-commit
+   question is answered there is exactly one place to tighten.
 
 7. **The scaffold keeps reading the re-read HEAD.** `assemble_scaffold` and
    `write_compose_packet` are PRCMP-owned and their hidden attestation must stay
@@ -297,9 +306,14 @@ ROAD-8 — this design does not close it and must not pretend to.
 
 ## Risks
 
-- An undiscovered path where HEAD legitimately advances after approve now fails closed
-  instead of forwarding. Accepted in the close package; the mitigation is that the
-  refusal names both SHAs, so the path identifies itself.
+- The accepted risk in the close package — "an undiscovered path where HEAD legitimately
+  advances after approve now fails closed" — **materialized** as certify's correction
+  commit. The mitigation worked as designed: the refusal named both SHAs and the path
+  identified itself through an existing test rather than through a user's broken run.
+  The consequence is the deferral above, not a shipped regression.
+- Until that question is answered, a forwarded tree can still differ from the reviewed
+  tree by porch's own correction commit. This feature does not make that worse; it now
+  records the forwarded SHA durably, which is what makes the gap auditable.
 - The protocol bump kills active runs on upgrade, as every prior bump has. Documented in
   `docs/usage.md` per `FWDAUTH-5.3`.
 

@@ -1866,29 +1866,31 @@ fn maybe_deliver_repair_commit(wt: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// The one commit a review round approved, or a closed failure.
+/// The SHA a forward may carry, or a closed failure.
 ///
-/// Authorization binds by equality: a descendant of the approved SHA carries
-/// commits no round reviewed, and the only route by which a moved HEAD becomes
-/// forwardable is the phase handoff that revokes this binding and re-reviews.
-pub(crate) fn authorized_forward_sha(db: &Db, run_id: &str, head: &str) -> Result<String> {
+/// A recorded approval is mandatory. Continuity still tolerates a live HEAD
+/// that descends from the approved SHA because certify's own correction commit
+/// advances HEAD after review approves; binding by equality is blocked on
+/// deciding whether that commit is re-reviewed first. See the Open Questions of
+/// `docs/specs/2026-09-08-forward-authorization/requirements.md`.
+pub(crate) fn authorized_forward_sha(db: &Db, run_id: &str, wt: &Path) -> Result<String> {
     let run = db
         .run_by_id(run_id)?
         .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
     let approved = run
         .review_approved_head_sha
         .ok_or_else(|| RunError::Msg("HEAD continuity: review_approved_head_sha missing".into()))?;
-    if head == approved {
-        return Ok(approved);
+    let head = porch_git::rev_parse_c(wt, "HEAD")?;
+    if head == approved || porch_git::is_ancestor(wt, &approved, &head)? {
+        return Ok(head);
     }
     Err(RunError::Msg(format!(
-        "HEAD continuity: live HEAD {head} does not equal approved {approved}"
+        "HEAD continuity: live HEAD {head} is not a descendant of approved {approved}"
     )))
 }
 
 fn assert_head_continuity(db: &Db, run_id: &str, wt: &Path) -> Result<()> {
-    let head = porch_git::rev_parse_c(wt, "HEAD")?;
-    authorized_forward_sha(db, run_id, &head).map(|_| ())
+    authorized_forward_sha(db, run_id, wt).map(|_| ())
 }
 
 fn persist_uncertified_after_fix(
@@ -3597,7 +3599,7 @@ mod continuity_tests {
     }
 
     #[test]
-    fn head_continuity_refuses_a_descendant_of_the_approved_sha() {
+    fn head_continuity_refuses_a_head_off_the_approved_line() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -3619,17 +3621,34 @@ mod continuity_tests {
         db.set_review_approved_head_sha(&run.id, Some(&approved))
             .unwrap();
 
-        assert_head_continuity(&db, &run.id, &work)
-            .expect("an unmoved HEAD equals the approved sha");
+        assert_eq!(
+            authorized_forward_sha(&db, &run.id, &work).unwrap(),
+            approved,
+            "an unmoved HEAD forwards the approved sha"
+        );
 
+        // Certify's correction commit advances HEAD after review approves, so
+        // continuity tolerates a descendant and the forward carries it.
         std::fs::write(work.join("README"), "x\ny\n").unwrap();
         git(&work, &["add", "README"]);
-        git(&work, &["commit", "-m", "unreviewed"]);
-        let moved = porch_git::rev_parse_c(&work, "HEAD").unwrap();
+        git(&work, &["commit", "-m", "correction"]);
+        let descendant = porch_git::rev_parse_c(&work, "HEAD").unwrap();
+        assert_eq!(
+            authorized_forward_sha(&db, &run.id, &work).unwrap(),
+            descendant,
+            "a descendant of the approved sha stays forwardable today"
+        );
+
+        // A HEAD off the approved line is refused, naming both SHAs.
+        git(&work, &["checkout", "-q", "--orphan", "unrelated"]);
+        std::fs::write(work.join("README"), "elsewhere\n").unwrap();
+        git(&work, &["add", "README"]);
+        git(&work, &["commit", "-m", "unrelated"]);
+        let off_line = porch_git::rev_parse_c(&work, "HEAD").unwrap();
 
         let err = assert_head_continuity(&db, &run.id, &work).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains(&moved) && msg.contains(&approved), "{msg}");
+        assert!(msg.contains(&off_line) && msg.contains(&approved), "{msg}");
     }
 
     #[test]
