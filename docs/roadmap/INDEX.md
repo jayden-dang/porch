@@ -1,13 +1,13 @@
 # Roadmap: Porch
 
 Status: Approved
-Date: 2026-08-30
+Date: 2026-09-08
 
 | ID | Milestone | Outcome | Depends-on | Commitment |
 |---|---|---|---|---|
 | MILE-1 | Inner gate | A developer pushes to `porch` and gets an independently reviewed, certified branch forwarded to `origin` with a PR opened. | none | Committed |
-| MILE-2 | Auditable assurance record | An operator can trace any assurance outcome to the evidence behind it. | MILE-1 | Planned |
-| MILE-3 | Crash-safe forwarding | A gate that dies mid-forward never leaves an unauthorized or duplicated push. | MILE-2 | Planned |
+| MILE-2 | Auditable assurance record | An operator can trace any assurance outcome to the evidence behind it. | MILE-1 | Closed |
+| MILE-3 | Crash-safe forwarding | A gate that dies mid-forward never leaves an unauthorized or duplicated push. | MILE-2 | Committed |
 | MILE-4 | Escape without the daemon | An operator gets their checkout back when porch cannot reconcile itself. | MILE-3 | Planned |
 | MILE-5 | One porch binary | One installed command runs assurance with the deterministic floor always on. | MILE-2 | Planned |
 | MILE-7 | Dogfood baseline | A reader can look up porch's measured effectiveness on mailgate and klynt. | MILE-2, MILE-5 | Planned |
@@ -42,9 +42,17 @@ and phase events.
 - **ROAD-4** per-finding disposition history that survives a review round — Surfaces: `crates/porch-gate/src/db.rs`, `crates/porch-run/src/lib.rs`
 - **ROAD-5** phase start and end events, surfaced rather than only stored — Surfaces: `crates/porch-gate/src/db.rs`, `crates/porch-gate/src/rpc.rs`, `crates/porch/src/main.rs`
 **Depends-on:** MILE-1
-**Commitment:** Planned
-**Closed:** None
-**Deferred:** None
+**Commitment:** Closed 2026-09-08
+**Closed:** ROAD-22 (FLOOR), ROAD-6 (ROUND), ROAD-4 (DISPO), ROAD-5 (PHASE). The
+GOAL-2 join over producer identity and per-path coverage shipped as feature TRACE,
+which deliberately carries no `ROAD-N`.
+**Deferred:** Three audit-document slices TRACE placed out of scope stay unscheduled
+and hold no `ROAD-N`; they are recorded here so the gap is visible rather than lost:
+projecting `round_required_producers` (FLOOR's authorization proof) onto the audit
+document, TUI rendering of the producer and coverage slices, and an inventory-digest
+or `content_blobs` read path. The milestone outcome — reviewed range, producer and
+version, per-path coverage, findings, disposition and authority events, phase events
+— is met without them.
 **Blockers:** None
 
 ## MILE-3 — Crash-safe forwarding
@@ -57,12 +65,12 @@ gate that died mid-forward discovers what actually happened instead of repeating
 - **ROAD-8** restart reconciliation of ambiguous external effects — Surfaces: `crates/porch-run/src/deliver.rs`, `crates/porch-gate/src/daemon.rs`
 - **ROAD-9** fault-injection suite across the forward boundary — Surfaces: `crates/porch/tests/`
 **Depends-on:** MILE-2
-**Commitment:** Planned
+**Commitment:** Committed 2026-09-08
 **Closed:** None
 **Deferred:** None
 **Blockers:**
-- Restart reconciliation behaviour when the branch was pushed but PR creation or local completion persistence did not finish — owner Jayden; due before this milestone is approved for implementation; resolved through feature discovery/design, not here.
-- Whether an approval may remain valid after HEAD advances past the reviewed SHA, and under which copy conditions — owner Jayden; same due point and route.
+- ~~Restart reconciliation behaviour when the branch was pushed but PR creation or local completion persistence did not finish~~ — resolved 2026-09-08 in ROAD-7 discovery: the forward boundary persists an intent record before the push and an outcome record after it, so a restart reads durable local state instead of inferring from `pr_url` alone and can distinguish an authorized, completed push from one never attempted. The residual window between push completion and the outcome write stays owned by ROAD-8, which owns discovery; ROAD-7 does not probe `origin`.
+- ~~Whether an approval may remain valid after HEAD advances past the reviewed SHA, and under which copy conditions~~ — resolved 2026-09-08 in ROAD-7 discovery: it may not. Authorization binds the reviewed SHA exactly, the forward carries that SHA rather than a re-read HEAD, and drift fails closed naming both SHAs. There are no copy conditions; HEAD movement reaches a forward only through the existing phase handoff that revokes the old approval and re-reviews.
 
 ## MILE-4 — Escape without the daemon
 
