@@ -1,12 +1,18 @@
 //! Audit document projection of producer invocations and per-path coverage.
 
+use std::path::Path;
+use std::time::Duration;
+
+use assert_cmd::Command;
 use porch_gate::rounds::{
     self, AssuranceCompletion, ContextApplication, ContextApplicationState, ContextSource,
     CoverageState, ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal,
     OpenRoundPlan, PROTOCOL_SCHEMA_VERSION, ProducerInvocation, RoundBindings,
     RoundCoverageProposal, capture_context_element, context_applicability_digest, sha256_hex,
 };
-use porch_gate::{AuditDocument, Db, build_audit};
+use porch_gate::{
+    AuditDocument, Db, build_audit, kill_group, spawn_detached_with_env, wait_for_health,
+};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -580,4 +586,120 @@ fn instance_json_omits_provenance_candidate_key_and_confidence() {
     assert!(wire.get("confidence_kind").is_none());
     assert_eq!(wire["producer_invocation_id"], producer);
     assert_eq!(wire["consequence"], "panic risk");
+}
+
+fn kill_daemon(home: &Path) {
+    if let Ok(pid) = std::fs::read_to_string(home.join("daemon.pid")) {
+        if let Ok(pid) = pid.trim().parse::<u32>() {
+            kill_group(pid);
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+fn start_daemon_on_home(home: &Path) {
+    let bin = assert_cmd::cargo::cargo_bin("porch");
+    spawn_detached_with_env(&bin, home, &[]).unwrap();
+    wait_for_health(home, Duration::from_secs(5)).unwrap();
+}
+
+fn seed_parked_deliver_with_selected_coverage(home: &Path) -> String {
+    let (db, run_id) = seed_pending_run(home);
+    let round = open_round_with_producers(
+        &db,
+        &run_id,
+        vec![ProducerInvocation {
+            descriptor_json: projectable_descriptor(),
+            descriptor_equivalence_digest: "equiv-cli".into(),
+        }],
+    );
+    let producer = producer_id(&db, &round);
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+    let mut proposal = sample_complete_proposal(&producer);
+    proposal.coverage = vec![
+        RoundCoverageProposal {
+            producer_invocation_id: producer.clone(),
+            path: "src/lib.rs".into(),
+            state: CoverageState::Selected,
+            reason: None,
+            authority: None,
+            completion_evidence: None,
+        },
+        RoundCoverageProposal {
+            producer_invocation_id: producer,
+            path: "a.rs".into(),
+            state: CoverageState::Completed,
+            reason: None,
+            authority: None,
+            completion_evidence: Some("reviewed".into()),
+        },
+    ];
+    assert_eq!(
+        rounds::finalize_round(&db, &round, &proposal, rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+    let deliver = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.clone(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects {
+            status: Some("parked".into()),
+            error: None,
+            approved_head: None,
+            steps: vec![],
+        },
+    )
+    .unwrap();
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::NestedStart {
+            parent: deliver,
+            kind: rounds::phase::OperationKind::Compose,
+        },
+        rounds::RunEffects::none(),
+    )
+    .unwrap();
+    drop(db);
+    run_id
+}
+
+#[test]
+fn porch_audit_prints_producers_then_coverage_then_phase_tree() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let run_id = seed_parked_deliver_with_selected_coverage(home);
+    start_daemon_on_home(home);
+
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .current_dir(home)
+        .env("PORCH_HOME", home)
+        .args(["audit", "--run-id", &run_id])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "producers:",
+            "  r1 s0 adapter=porch_json_cli engine=quality reported=unavailable:not_reported observed=artifact_sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "coverage:",
+            "  round 1 selected=1 completed=1 failed=0 waived=0",
+            "    selected src/lib.rs",
+            "deliver #1 started",
+            "  compose #1 started",
+        ],
+        "human audit must print producers, then coverage with selected path, then the phase tree: {text:?}"
+    );
+
+    kill_daemon(home);
 }

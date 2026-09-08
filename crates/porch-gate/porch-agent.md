@@ -75,7 +75,7 @@ Status stays a **compact** live snapshot (`findings[]` display handles, optional
 ```sh
 porch agent audit
 porch agent audit --run-id <ULID>
-porch audit                   # human-readable phase tree
+porch audit                   # producers, coverage, phase tree
 porch audit --json            # same pretty JSON as agent audit
 porch audit --run-id <ULID>
 ```
@@ -83,10 +83,14 @@ porch audit --run-id <ULID>
 Default: latest **parked** run for the cwd repo (same resolution as `status`).
 `porch agent audit` (and `porch audit --json`) emit pretty-printed JSON from the
 same typed audit-document builder as daemon `get_audit` — rounds, finding
-instances, disposition/authority events with members, related-occurrence
-groups, watermark (`audit_rev` + `review_history_revision`), and the phase
-attempt tree. Default `porch audit` prints that phase tree as plain text.
-Use the JSON form for reconstruction; keep using `status` for park decisions.
+instances, producer invocations, per-path coverage, disposition/authority
+events with members, related-occurrence groups, watermark (`audit_rev` +
+`review_history_revision`), and the phase attempt tree. The document's
+`schema_version` is 3; that counter is independent of
+`PROTOCOL_SCHEMA_VERSION` (also 3). Default `porch audit` prints producers,
+then per-round coverage counts with non-completed paths, then the phase tree
+as plain text. Use the JSON form for reconstruction; keep using `status` for
+park decisions.
 
 When `phase` is `"compose"`, status also includes `pr_url`, `compose_packet_path`
 (`$PORCH_HOME/runs/<run_id>/compose-packet.json`), and `allowed_actions`

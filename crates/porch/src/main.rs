@@ -103,7 +103,7 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// Print the human-readable phase tree for a run (`--json` for the audit document).
+    /// Print producers, coverage, and the phase tree for a run (`--json` for the audit document).
     Audit {
         /// Run id (ULID). Defaults to latest parked run for the cwd repo.
         #[arg(long)]
@@ -358,6 +358,106 @@ fn render_phase_tree(doc: &AuditDocument) -> String {
     out
 }
 
+fn round_ordinal(doc: &AuditDocument, round_id: &str) -> i64 {
+    doc.rounds
+        .iter()
+        .find(|round| round.id == round_id)
+        .map_or(0, |round| round.ordinal)
+}
+
+fn render_producer_choice(value: &serde_json::Value) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    if let Some(reason) = value.get("unavailable").and_then(serde_json::Value::as_str) {
+        return format!("unavailable:{reason}");
+    }
+    if let Some(sha) = value
+        .get("artifact_sha256")
+        .and_then(serde_json::Value::as_str)
+    {
+        return format!("artifact_sha256:{sha}");
+    }
+    String::new()
+}
+
+fn render_evidence_blocks(doc: &AuditDocument) -> String {
+    let mut out = String::from("producers:\n");
+    for producer in &doc.producers {
+        let ordinal = round_ordinal(doc, &producer.round_id);
+        let adapter =
+            serde_json::to_value(&producer.adapter_kind).unwrap_or(serde_json::Value::Null);
+        let engine =
+            serde_json::to_value(&producer.declared_engine_kind).unwrap_or(serde_json::Value::Null);
+        let observed = serde_json::to_value(&producer.observed_version_identity)
+            .unwrap_or(serde_json::Value::Null);
+        out.push_str("  r");
+        out.push_str(&ordinal.to_string());
+        out.push_str(" s");
+        out.push_str(&producer.slot.to_string());
+        out.push_str(" adapter=");
+        out.push_str(&render_producer_choice(&adapter));
+        out.push_str(" engine=");
+        out.push_str(&render_producer_choice(&engine));
+        out.push_str(" reported=unavailable:");
+        out.push_str(&producer.reported_version.unavailable);
+        out.push_str(" observed=");
+        out.push_str(&render_producer_choice(&observed));
+        out.push('\n');
+    }
+    out.push_str("coverage:\n");
+    let mut index = 0;
+    while index < doc.coverage.len() {
+        let round_id = doc.coverage[index].round_id.clone();
+        let ordinal = round_ordinal(doc, &round_id);
+        let start = index;
+        let mut selected = 0;
+        let mut completed = 0;
+        let mut failed = 0;
+        let mut waived = 0;
+        while index < doc.coverage.len() && doc.coverage[index].round_id == round_id {
+            match doc.coverage[index].state.as_str() {
+                "selected" => selected += 1,
+                "completed" => completed += 1,
+                "failed" => failed += 1,
+                "waived" => waived += 1,
+                _ => {}
+            }
+            index += 1;
+        }
+        out.push_str("  round ");
+        out.push_str(&ordinal.to_string());
+        out.push_str(" selected=");
+        out.push_str(&selected.to_string());
+        out.push_str(" completed=");
+        out.push_str(&completed.to_string());
+        out.push_str(" failed=");
+        out.push_str(&failed.to_string());
+        out.push_str(" waived=");
+        out.push_str(&waived.to_string());
+        out.push('\n');
+        for row in &doc.coverage[start..index] {
+            if !matches!(row.state.as_str(), "selected" | "failed" | "waived") {
+                continue;
+            }
+            out.push_str("    ");
+            out.push_str(&row.state);
+            out.push(' ');
+            out.push_str(&row.path);
+            if let Some(reason) = &row.reason {
+                out.push_str(" reason=");
+                out.push_str(reason);
+            }
+            if let Some(authority) = &row.authority {
+                out.push_str(" authority=");
+                out.push_str(authority);
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn render_phase_attempt(out: &mut String, attempt: &AuditAttempt, depth: usize) {
     for _ in 0..depth {
         out.push_str("  ");
@@ -396,7 +496,11 @@ fn run_human_audit(home: &Path, run_id: Option<&str>, work_tree: &Path) -> ExitC
     };
     match get_audit(home, &resolved) {
         Ok(doc) => {
-            print!("{}", render_phase_tree(&doc));
+            print!(
+                "{}{}",
+                render_evidence_blocks(&doc),
+                render_phase_tree(&doc)
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {

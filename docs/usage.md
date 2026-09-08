@@ -185,7 +185,7 @@ Compose `skip` ≠ review `skip`: it accepts the scaffold and **continues** deli
 ```sh
 porch agent status
 porch agent audit                 # pretty audit-document JSON
-porch audit [--run-id]            # human-readable phase tree
+porch audit [--run-id]            # producers, coverage, and phase tree
 porch audit --json [--run-id]     # same JSON as agent audit
 # review park
 porch agent respond approve
@@ -212,7 +212,7 @@ Stdout is JSON (JSONL with `agent run --wait`). Exit `0` ok/parked/completed, `1
 | `fix` | review / rebase | Native fixer, then **session-free** rereview (or rebase retry). Modern review fix appends `fix_requested` **before** the fixer spawns |
 | `--body-file` [+ `--title`] | compose | Merge Agent prose into porch-managed PR regions; complete deliver |
 
-Status / `get_run` stay a **compact** live snapshot (findings, optional `audit_available`). Reconstruct disposition/authority from `porch agent audit` or `porch audit --json` (same typed audit document as daemon `get_audit` / TUI `h`). Default `porch audit` prints the phase tree as plain text.
+Status / `get_run` stay a **compact** live snapshot (findings, optional `audit_available`). Reconstruct disposition/authority from `porch agent audit` or `porch audit --json` (same typed audit document as daemon `get_audit` / TUI `h`). Default `porch audit` prints producers, then per-round coverage counts with non-completed paths, then the phase tree as plain text. Audit `schema_version` 3 is independent of `PROTOCOL_SCHEMA_VERSION` (also 3).
 
 Read the packet at `compose_packet_path` before writing `--body-file`. Empty or theater-shaped bodies (gate Review/Certify/Pipeline boards) are rejected; the run stays parked. Do not combine `--body-file` with approve/skip/abort/fix.
 

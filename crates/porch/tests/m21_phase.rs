@@ -1613,7 +1613,12 @@ fn porch_audit_prints_phase_tree_with_nested_operations() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
         lines,
-        vec!["deliver #1 started", "  compose #1 started"],
+        vec![
+            "producers:",
+            "coverage:",
+            "deliver #1 started",
+            "  compose #1 started"
+        ],
         "human audit must print phase/ordinal/outcome with nested ops indented: {text:?}"
     );
 
@@ -1688,7 +1693,7 @@ fn porch_audit_tree_is_unambiguous_without_colour() {
     );
     assert_eq!(
         unavail.lines().collect::<Vec<_>>(),
-        vec!["phase: unavailable"],
+        vec!["producers:", "coverage:", "phase: unavailable"],
         "unavailability must be plain text: {unavail:?}"
     );
     kill_daemon(&home2);
