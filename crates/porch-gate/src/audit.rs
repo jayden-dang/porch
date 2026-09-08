@@ -164,6 +164,21 @@ pub struct AuditProducer {
     pub observed_version_identity: AuditObservedIdentity,
 }
 
+/// Per-path coverage row on the audit document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditCoverage {
+    pub round_id: String,
+    pub producer_invocation_id: String,
+    pub path: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_evidence: Option<String>,
+}
+
 /// Derived audit document as-of a durable watermark.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditDocument {
@@ -181,6 +196,8 @@ pub struct AuditDocument {
     pub anomaly: Option<AuditAnomaly>,
     #[serde(default)]
     pub producers: Vec<AuditProducer>,
+    #[serde(default)]
+    pub coverage: Vec<AuditCoverage>,
 }
 
 /// Build a derived audit document for `run_id` from one Deferred `SQLite` snapshot.
@@ -214,6 +231,7 @@ pub fn build_audit(db: &Db, run_id: &str) -> Result<AuditDocument> {
     let related_occurrences = related_occurrences_from(&instances);
     let phase = load_phase(&tx, run_id)?;
     let producers = load_producers(&tx, run_id)?;
+    let coverage = load_coverage(&tx, run_id)?;
     let has_applicable = applicable_round_id_tx(&tx, run_id)?.is_some();
     let has_identity_unavailable = events.iter().any(|e| e.identity_unavailable);
     let has_legacy_findings = findings_json
@@ -259,6 +277,7 @@ pub fn build_audit(db: &Db, run_id: &str) -> Result<AuditDocument> {
         phase,
         anomaly,
         producers,
+        coverage,
     })
 }
 
@@ -330,6 +349,33 @@ fn project_descriptor(descriptor_json: &str) -> ProducerDescriptorView {
             },
         }
     })
+}
+
+fn load_coverage(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditCoverage>> {
+    let mut stmt = tx.prepare(
+        "SELECT r.ordinal, p.round_id, p.producer_invocation_id, p.path, p.state,
+                p.reason, p.authority, p.completion_evidence
+         FROM round_coverage p
+         INNER JOIN review_rounds r ON r.id = p.round_id
+         WHERE r.run_id = ?1
+         ORDER BY r.ordinal, p.producer_invocation_id, path",
+    )?;
+    let mapped = stmt.query_map([run_id], |row| {
+        Ok(AuditCoverage {
+            round_id: row.get(1)?,
+            producer_invocation_id: row.get(2)?,
+            path: row.get(3)?,
+            state: row.get(4)?,
+            reason: row.get(5)?,
+            authority: row.get(6)?,
+            completion_evidence: row.get(7)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in mapped {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn load_rounds(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditRound>> {

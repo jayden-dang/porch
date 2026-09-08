@@ -1,9 +1,10 @@
-//! Audit document projection of producer invocations.
+//! Audit document projection of producer invocations and per-path coverage.
 
 use porch_gate::rounds::{
-    self, ContextApplication, ContextApplicationState, ContextSource, OpenRoundPlan,
-    ProducerInvocation, RoundBindings, capture_context_element, context_applicability_digest,
-    sha256_hex,
+    self, AssuranceCompletion, ContextApplication, ContextApplicationState, ContextSource,
+    CoverageState, ExecutionState, FinalizeOutcome, FinalizeProposal, FindingInstanceProposal,
+    OpenRoundPlan, ProducerInvocation, RoundBindings, RoundCoverageProposal,
+    capture_context_element, context_applicability_digest, sha256_hex,
 };
 use porch_gate::{AuditDocument, Db, build_audit};
 use serde_json::json;
@@ -72,6 +73,47 @@ fn open_round_with_producers(
         context_applications,
     };
     rounds::open_round(db, &plan, &bindings).unwrap()
+}
+
+fn producer_id(db: &Db, round_id: &rounds::RoundId) -> String {
+    rounds::producers_for_round(db, round_id).unwrap()[0]
+        .id
+        .clone()
+}
+
+fn sample_complete_proposal(producer_invocation_id: &str) -> FinalizeProposal {
+    FinalizeProposal {
+        execution: ExecutionState::Finished,
+        assurance_completion: AssuranceCompletion::Complete,
+        completion_reason: None,
+        coverage: vec![RoundCoverageProposal {
+            producer_invocation_id: producer_invocation_id.into(),
+            path: "a.rs".into(),
+            state: CoverageState::Completed,
+            reason: None,
+            authority: None,
+            completion_evidence: Some("reviewed".into()),
+        }],
+        producer_durations: Vec::new(),
+        review_duration_ms: None,
+        instances: vec![FindingInstanceProposal {
+            producer_invocation_id: producer_invocation_id.into(),
+            fingerprint: "fp-one".into(),
+            fingerprint_version: 1,
+            candidate_key: "ck-one".into(),
+            criterion_id: "rust/unwrap-in-lib".into(),
+            evidence: "unwrap here".into(),
+            consequence: "panic risk".into(),
+            action: "must-fix".into(),
+            severity: "error".into(),
+            provenance_json: r#"{"producer_key":"rust/unwrap-in-lib"}"#.into(),
+            confidence_value: None,
+            confidence_kind: None,
+            path: "a.rs".into(),
+            anchor_kind: "symbol".into(),
+            anchor_value: "foo".into(),
+        }],
+    }
 }
 
 #[test]
@@ -241,6 +283,7 @@ fn v2_audit_json_without_producers_or_later_scalars_deserializes() {
         "phase": { "kind": "unavailable", "steps": [] }
     });
     assert!(v2.get("producers").is_none());
+    assert!(v2.get("coverage").is_none());
     assert!(v2["rounds"][0].get("trusted_config_sha").is_none());
     assert!(v2["rounds"][0].get("protocol_schema_version").is_none());
     assert!(v2["instances"][0].get("producer_invocation_id").is_none());
@@ -250,6 +293,180 @@ fn v2_audit_json_without_producers_or_later_scalars_deserializes() {
     assert_eq!(doc.schema_version, 2);
     assert_eq!(doc.run_id, "run-v2");
     assert!(doc.producers.is_empty());
+    assert!(doc.coverage.is_empty());
     assert_eq!(doc.rounds.len(), 1);
     assert_eq!(doc.instances.len(), 1);
+}
+
+#[test]
+fn audit_lists_selected_and_completed_coverage_ordered_by_ordinal_invocation_then_path() {
+    let tmp = TempDir::new().unwrap();
+    let (db, run_id) = seed_pending_run(tmp.path());
+
+    let first = open_round_with_producers(
+        &db,
+        &run_id,
+        vec![ProducerInvocation {
+            descriptor_json: projectable_descriptor(),
+            descriptor_equivalence_digest: "equiv-round-1".into(),
+        }],
+    );
+    let first_producer = producer_id(&db, &first);
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+    let mut first_proposal = sample_complete_proposal(&first_producer);
+    first_proposal.coverage = vec![
+        RoundCoverageProposal {
+            producer_invocation_id: first_producer.clone(),
+            path: "z.rs".into(),
+            state: CoverageState::Selected,
+            reason: None,
+            authority: None,
+            completion_evidence: None,
+        },
+        RoundCoverageProposal {
+            producer_invocation_id: first_producer.clone(),
+            path: "a.rs".into(),
+            state: CoverageState::Completed,
+            reason: None,
+            authority: None,
+            completion_evidence: Some("reviewed".into()),
+        },
+    ];
+    assert_eq!(
+        rounds::finalize_round(&db, &first, &first_proposal, rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+
+    let second = open_round_with_producers(
+        &db,
+        &run_id,
+        vec![ProducerInvocation {
+            descriptor_json: projectable_descriptor(),
+            descriptor_equivalence_digest: "equiv-round-2".into(),
+        }],
+    );
+    let second_producer = producer_id(&db, &second);
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+    let mut second_proposal = sample_complete_proposal(&second_producer);
+    second_proposal.coverage = vec![RoundCoverageProposal {
+        producer_invocation_id: second_producer.clone(),
+        path: "a.rs".into(),
+        state: CoverageState::Completed,
+        reason: None,
+        authority: None,
+        completion_evidence: Some("reviewed".into()),
+    }];
+    assert_eq!(
+        rounds::finalize_round(&db, &second, &second_proposal, rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+
+    let doc = build_audit(&db, &run_id).unwrap();
+    assert_eq!(doc.schema_version, 3);
+    assert_eq!(doc.coverage.len(), 3);
+
+    assert_eq!(doc.coverage[0].round_id, first.as_str());
+    assert_eq!(doc.coverage[0].producer_invocation_id, first_producer);
+    assert_eq!(doc.coverage[0].path, "a.rs");
+    assert_eq!(doc.coverage[0].state, "completed");
+    assert_eq!(
+        doc.coverage[0].completion_evidence.as_deref(),
+        Some("reviewed")
+    );
+
+    assert_eq!(doc.coverage[1].round_id, first.as_str());
+    assert_eq!(doc.coverage[1].producer_invocation_id, first_producer);
+    assert_eq!(doc.coverage[1].path, "z.rs");
+    assert_eq!(doc.coverage[1].state, "selected");
+    assert_eq!(doc.coverage[1].completion_evidence, None);
+
+    assert_eq!(doc.coverage[2].round_id, second.as_str());
+    assert_eq!(doc.coverage[2].producer_invocation_id, second_producer);
+    assert_eq!(doc.coverage[2].path, "a.rs");
+    assert_eq!(doc.coverage[2].state, "completed");
+
+    let order_keys: Vec<(i64, String, String)> = doc
+        .coverage
+        .iter()
+        .map(|row| {
+            let ordinal = doc
+                .rounds
+                .iter()
+                .find(|r| r.id == row.round_id)
+                .expect("coverage round")
+                .ordinal;
+            (
+                ordinal,
+                row.producer_invocation_id.clone(),
+                row.path.clone(),
+            )
+        })
+        .collect();
+    let mut sorted = order_keys.clone();
+    sorted.sort();
+    assert_eq!(order_keys, sorted);
+}
+
+#[test]
+fn waived_and_failed_coverage_keep_stored_reason_and_authority() {
+    let tmp = TempDir::new().unwrap();
+    let (db, run_id) = seed_pending_run(tmp.path());
+    let round = open_round_with_producers(
+        &db,
+        &run_id,
+        vec![ProducerInvocation {
+            descriptor_json: projectable_descriptor(),
+            descriptor_equivalence_digest: "equiv-waive".into(),
+        }],
+    );
+    let producer = producer_id(&db, &round);
+    let (rev, _) = rounds::read_history(&db, &run_id).unwrap();
+    let mut proposal = sample_complete_proposal(&producer);
+    proposal.coverage = vec![
+        RoundCoverageProposal {
+            producer_invocation_id: producer.clone(),
+            path: "skip.rs".into(),
+            state: CoverageState::Waived,
+            reason: Some("generated".into()),
+            authority: Some("operator".into()),
+            completion_evidence: None,
+        },
+        RoundCoverageProposal {
+            producer_invocation_id: producer.clone(),
+            path: "bad.rs".into(),
+            state: CoverageState::Failed,
+            reason: Some("timeout".into()),
+            authority: None,
+            completion_evidence: None,
+        },
+    ];
+    assert_eq!(
+        rounds::finalize_round(&db, &round, &proposal, rev).unwrap(),
+        FinalizeOutcome::Finalized
+    );
+
+    let doc = build_audit(&db, &run_id).unwrap();
+    assert_eq!(doc.coverage.len(), 2);
+
+    let failed = doc
+        .coverage
+        .iter()
+        .find(|row| row.path == "bad.rs")
+        .expect("failed path");
+    assert_eq!(failed.round_id, round.as_str());
+    assert_eq!(failed.producer_invocation_id, producer);
+    assert_eq!(failed.state, "failed");
+    assert_eq!(failed.reason.as_deref(), Some("timeout"));
+    assert_eq!(failed.authority, None);
+
+    let waived = doc
+        .coverage
+        .iter()
+        .find(|row| row.path == "skip.rs")
+        .expect("waived path");
+    assert_eq!(waived.round_id, round.as_str());
+    assert_eq!(waived.producer_invocation_id, producer);
+    assert_eq!(waived.state, "waived");
+    assert_eq!(waived.reason.as_deref(), Some("generated"));
+    assert_eq!(waived.authority.as_deref(), Some("operator"));
 }
