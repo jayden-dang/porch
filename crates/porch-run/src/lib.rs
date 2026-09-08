@@ -1866,24 +1866,29 @@ fn maybe_deliver_repair_commit(wt: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn assert_head_continuity(db: &Db, run_id: &str, wt: &Path) -> Result<()> {
+/// The one commit a review round approved, or a closed failure.
+///
+/// Authorization binds by equality: a descendant of the approved SHA carries
+/// commits no round reviewed, and the only route by which a moved HEAD becomes
+/// forwardable is the phase handoff that revokes this binding and re-reviews.
+pub(crate) fn authorized_forward_sha(db: &Db, run_id: &str, head: &str) -> Result<String> {
     let run = db
         .run_by_id(run_id)?
         .ok_or_else(|| RunError::Msg(format!("unknown run {run_id}")))?;
     let approved = run
         .review_approved_head_sha
-        .as_deref()
         .ok_or_else(|| RunError::Msg("HEAD continuity: review_approved_head_sha missing".into()))?;
-    let head = porch_git::rev_parse_c(wt, "HEAD")?;
     if head == approved {
-        return Ok(());
-    }
-    if porch_git::is_ancestor(wt, approved, &head)? {
-        return Ok(());
+        return Ok(approved);
     }
     Err(RunError::Msg(format!(
-        "HEAD continuity: live HEAD {head} is not a descendant of approved {approved}"
+        "HEAD continuity: live HEAD {head} does not equal approved {approved}"
     )))
+}
+
+fn assert_head_continuity(db: &Db, run_id: &str, wt: &Path) -> Result<()> {
+    let head = porch_git::rev_parse_c(wt, "HEAD")?;
+    authorized_forward_sha(db, run_id, &head).map(|_| ())
 }
 
 fn persist_uncertified_after_fix(
@@ -3589,6 +3594,42 @@ mod continuity_tests {
             err.to_string().contains("review_approved_head_sha missing"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn head_continuity_refuses_a_descendant_of_the_approved_sha() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let db = Db::open(&home.join("state.sqlite")).unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init"]);
+        git(&work, &["config", "user.email", "porch@example.com"]);
+        git(&work, &["config", "user.name", "Porch"]);
+        std::fs::write(work.join("README"), "x\n").unwrap();
+        git(&work, &["add", "README"]);
+        git(&work, &["commit", "-m", "reviewed"]);
+        let approved = porch_git::rev_parse_c(&work, "HEAD").unwrap();
+
+        db.upsert_repo("r-desc", &work, &work, "main").unwrap();
+        let run = db
+            .insert_run("r-desc", "feat", &approved, None, None)
+            .unwrap();
+        db.set_review_approved_head_sha(&run.id, Some(&approved))
+            .unwrap();
+
+        assert_head_continuity(&db, &run.id, &work)
+            .expect("an unmoved HEAD equals the approved sha");
+
+        std::fs::write(work.join("README"), "x\ny\n").unwrap();
+        git(&work, &["add", "README"]);
+        git(&work, &["commit", "-m", "unreviewed"]);
+        let moved = porch_git::rev_parse_c(&work, "HEAD").unwrap();
+
+        let err = assert_head_continuity(&db, &run.id, &work).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(&moved) && msg.contains(&approved), "{msg}");
     }
 
     #[test]
