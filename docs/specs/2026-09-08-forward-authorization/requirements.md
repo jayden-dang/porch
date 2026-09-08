@@ -81,6 +81,9 @@ attempted.
   outcome record says.
 - **FWDAUTH-3.6** WHEN a run enters `deliver` more than once THE SYSTEM SHALL record
   each forward attempt separately under its own `deliver` phase attempt.
+- **FWDAUTH-3.7** WHEN the lease observation finds the target ref already at the
+  authorized SHA THE SYSTEM SHALL append a forward-outcome record naming that landed
+  SHA in a form distinguishable from a record of porch's own mutating push.
 
 ## 4. The record is a reconciliation input
 
