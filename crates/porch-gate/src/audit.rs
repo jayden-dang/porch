@@ -129,6 +129,41 @@ pub struct RelatedOccurrenceGroup {
     pub instance_ids: Vec<String>,
 }
 
+/// String or `{ unavailable }` text field on an audit producer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AuditText {
+    Text(String),
+    Unavailable { unavailable: String },
+}
+
+/// Reported-version object; always unavailable, never a substitute string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditReportedVersion {
+    pub unavailable: String,
+}
+
+/// Observed producer identity: artifact SHA-256 or unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AuditObservedIdentity {
+    ArtifactSha256 { artifact_sha256: String },
+    Unavailable { unavailable: String },
+}
+
+/// Producer invocation on the audit document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditProducer {
+    pub round_id: String,
+    pub id: String,
+    pub slot: i64,
+    pub descriptor_equivalence_digest: String,
+    pub adapter_kind: AuditText,
+    pub declared_engine_kind: AuditText,
+    pub reported_version: AuditReportedVersion,
+    pub observed_version_identity: AuditObservedIdentity,
+}
+
 /// Derived audit document as-of a durable watermark.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditDocument {
@@ -144,6 +179,8 @@ pub struct AuditDocument {
     pub phase: AuditPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anomaly: Option<AuditAnomaly>,
+    #[serde(default)]
+    pub producers: Vec<AuditProducer>,
 }
 
 /// Build a derived audit document for `run_id` from one Deferred `SQLite` snapshot.
@@ -176,6 +213,7 @@ pub fn build_audit(db: &Db, run_id: &str) -> Result<AuditDocument> {
     let events = load_events(&tx, run_id)?;
     let related_occurrences = related_occurrences_from(&instances);
     let phase = load_phase(&tx, run_id)?;
+    let producers = load_producers(&tx, run_id)?;
     let has_applicable = applicable_round_id_tx(&tx, run_id)?.is_some();
     let has_identity_unavailable = events.iter().any(|e| e.identity_unavailable);
     let has_legacy_findings = findings_json
@@ -200,13 +238,13 @@ pub fn build_audit(db: &Db, run_id: &str) -> Result<AuditDocument> {
                 .into(),
         })
     } else {
-        None
+        unreadable_producer_anomaly(&producers)
     };
 
     tx.commit()?;
 
     Ok(AuditDocument {
-        schema_version: 2,
+        schema_version: 3,
         run_id: run_id.to_string(),
         run_status: status,
         completeness: completeness.into(),
@@ -220,6 +258,77 @@ pub fn build_audit(db: &Db, run_id: &str) -> Result<AuditDocument> {
         related_occurrences,
         phase,
         anomaly,
+        producers,
+    })
+}
+
+#[derive(Deserialize)]
+struct ProducerDescriptorView {
+    adapter_kind: AuditText,
+    declared_engine_kind: AuditText,
+    reported_version: AuditReportedVersion,
+    observed_version_identity: AuditObservedIdentity,
+}
+
+fn load_producers(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditProducer>> {
+    let mut stmt = tx.prepare(
+        "SELECT r.ordinal, p.round_id, p.id, p.slot, p.descriptor_json,
+                p.descriptor_equivalence_digest
+         FROM round_producers p
+         INNER JOIN review_rounds r ON r.id = p.round_id
+         WHERE r.run_id = ?1
+         ORDER BY r.ordinal, p.slot, p.id",
+    )?;
+    let mapped = stmt.query_map([run_id], |row| {
+        let descriptor_json: String = row.get(4)?;
+        let view = project_descriptor(&descriptor_json);
+        Ok(AuditProducer {
+            round_id: row.get(1)?,
+            id: row.get(2)?,
+            slot: row.get(3)?,
+            descriptor_equivalence_digest: row.get(5)?,
+            adapter_kind: view.adapter_kind,
+            declared_engine_kind: view.declared_engine_kind,
+            reported_version: view.reported_version,
+            observed_version_identity: view.observed_version_identity,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in mapped {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn unreadable_producer_anomaly(producers: &[AuditProducer]) -> Option<AuditAnomaly> {
+    producers
+        .iter()
+        .find_map(|producer| match &producer.adapter_kind {
+            AuditText::Unavailable { unavailable } => Some(AuditAnomaly {
+                code: "unreadable_producer_descriptor".into(),
+                detail: unavailable.clone(),
+            }),
+            AuditText::Text(_) => None,
+        })
+}
+
+fn project_descriptor(descriptor_json: &str) -> ProducerDescriptorView {
+    serde_json::from_str(descriptor_json).unwrap_or_else(|err| {
+        let reason = err.to_string();
+        ProducerDescriptorView {
+            adapter_kind: AuditText::Unavailable {
+                unavailable: reason.clone(),
+            },
+            declared_engine_kind: AuditText::Unavailable {
+                unavailable: reason.clone(),
+            },
+            reported_version: AuditReportedVersion {
+                unavailable: reason.clone(),
+            },
+            observed_version_identity: AuditObservedIdentity::Unavailable {
+                unavailable: reason,
+            },
+        }
     })
 }
 

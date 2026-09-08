@@ -1337,7 +1337,7 @@ fn audit_phase_tree_names_event_source_and_nests_operations() {
     let (db, run_id) = seed_deliver_with_open_compose(tmp.path());
 
     let doc = build_audit(&db, &run_id).unwrap();
-    assert_eq!(doc.schema_version, 2);
+    assert_eq!(doc.schema_version, 3);
     assert_eq!(doc.phase.kind, "phase_events");
     assert_eq!(
         doc.phase.attempts.len(),
@@ -1384,7 +1384,7 @@ fn audit_phase_without_events_is_explicitly_unavailable() {
     drop(raw);
 
     let doc = build_audit(&db, &run.id).unwrap();
-    assert_eq!(doc.schema_version, 2);
+    assert_eq!(doc.schema_version, 3);
     assert_eq!(doc.phase.kind, "unavailable");
     assert!(
         doc.phase.attempts.is_empty(),

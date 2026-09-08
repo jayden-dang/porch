@@ -1438,7 +1438,7 @@ fn audit_snapshot_includes_events_instances_and_related_occurrences() {
     assert_eq!(second_instances[0].fingerprint_version, first_fp_ver);
 
     let doc = build_audit(&db, &run.id).unwrap();
-    assert_eq!(doc.schema_version, 2);
+    assert_eq!(doc.schema_version, 3);
     assert_eq!(doc.run_id, run.id);
     assert!(
         doc.rounds.len() >= 2,

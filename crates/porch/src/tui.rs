@@ -1372,7 +1372,7 @@ mod tests {
             .as_ref()
             .expect("history open loads audit");
         assert_eq!(loaded.run_id, run.id);
-        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.schema_version, 3);
 
         apply_gap_and_snapshot(&mut app, get_run(&home, &run.id).unwrap());
         assert_eq!(
