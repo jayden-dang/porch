@@ -7,10 +7,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use porch_gate::{
-    AuditAttempt, AuditDocument, EjectOptions, InitOptions, admit_push, eject, ensure_daemon,
-    get_audit, get_run, git_dir_from_env, health_check, init, install_service, list_runs,
-    notify_push, porch_home, repo_id_for, run_daemon, service_status, start_service, stop_daemon,
-    uninstall_service,
+    AuditAttempt, AuditDocument, AuditObservedIdentity, AuditText, EjectOptions, InitOptions,
+    admit_push, eject, ensure_daemon, get_audit, get_run, git_dir_from_env, health_check, init,
+    install_service, list_runs, notify_push, porch_home, repo_id_for, run_daemon, service_status,
+    start_service, stop_daemon, uninstall_service,
 };
 use porch_run::{
     AgentCliResult, AgentResponse, AgentRunOpts, PipelineExecutor, agent_respond, agent_run,
@@ -358,58 +358,57 @@ fn render_phase_tree(doc: &AuditDocument) -> String {
     out
 }
 
-fn round_ordinal(doc: &AuditDocument, round_id: &str) -> i64 {
-    doc.rounds
-        .iter()
-        .find(|round| round.id == round_id)
-        .map_or(0, |round| round.ordinal)
+fn render_audit_text(value: &AuditText) -> String {
+    match value {
+        AuditText::Text(text) => text.clone(),
+        AuditText::Unavailable { unavailable } => format!("unavailable:{unavailable}"),
+    }
 }
 
-fn render_producer_choice(value: &serde_json::Value) -> String {
-    if let Some(text) = value.as_str() {
-        return text.to_string();
+fn render_observed_identity(value: &AuditObservedIdentity) -> String {
+    match value {
+        AuditObservedIdentity::ArtifactSha256 { artifact_sha256 } => {
+            format!("artifact_sha256:{artifact_sha256}")
+        }
+        AuditObservedIdentity::Unavailable { unavailable } => {
+            format!("unavailable:{unavailable}")
+        }
     }
-    if let Some(reason) = value.get("unavailable").and_then(serde_json::Value::as_str) {
-        return format!("unavailable:{reason}");
-    }
-    if let Some(sha) = value
-        .get("artifact_sha256")
-        .and_then(serde_json::Value::as_str)
-    {
-        return format!("artifact_sha256:{sha}");
-    }
-    String::new()
 }
 
 fn render_evidence_blocks(doc: &AuditDocument) -> String {
+    let ordinals: std::collections::HashMap<&str, i64> = doc
+        .rounds
+        .iter()
+        .map(|round| (round.id.as_str(), round.ordinal))
+        .collect();
     let mut out = String::from("producers:\n");
     for producer in &doc.producers {
-        let ordinal = round_ordinal(doc, &producer.round_id);
-        let adapter =
-            serde_json::to_value(&producer.adapter_kind).unwrap_or(serde_json::Value::Null);
-        let engine =
-            serde_json::to_value(&producer.declared_engine_kind).unwrap_or(serde_json::Value::Null);
-        let observed = serde_json::to_value(&producer.observed_version_identity)
-            .unwrap_or(serde_json::Value::Null);
+        let ordinal = ordinals
+            .get(producer.round_id.as_str())
+            .copied()
+            .unwrap_or(0);
         out.push_str("  r");
         out.push_str(&ordinal.to_string());
         out.push_str(" s");
         out.push_str(&producer.slot.to_string());
         out.push_str(" adapter=");
-        out.push_str(&render_producer_choice(&adapter));
+        out.push_str(&render_audit_text(&producer.adapter_kind));
         out.push_str(" engine=");
-        out.push_str(&render_producer_choice(&engine));
+        out.push_str(&render_audit_text(&producer.declared_engine_kind));
         out.push_str(" reported=unavailable:");
         out.push_str(&producer.reported_version.unavailable);
         out.push_str(" observed=");
-        out.push_str(&render_producer_choice(&observed));
+        out.push_str(&render_observed_identity(
+            &producer.observed_version_identity,
+        ));
         out.push('\n');
     }
     out.push_str("coverage:\n");
     let mut index = 0;
     while index < doc.coverage.len() {
-        let round_id = doc.coverage[index].round_id.clone();
-        let ordinal = round_ordinal(doc, &round_id);
+        let round_id = doc.coverage[index].round_id.as_str();
+        let ordinal = ordinals.get(round_id).copied().unwrap_or(0);
         let start = index;
         let mut selected = 0;
         let mut completed = 0;

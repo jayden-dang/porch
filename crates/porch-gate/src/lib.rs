@@ -22,8 +22,8 @@ mod skill;
 pub use admit::admit_push;
 pub use audit::{
     AuditAnomaly, AuditAttempt, AuditCoverage, AuditDocument, AuditEvent, AuditEventMember,
-    AuditInstance, AuditPhase, AuditProducer, AuditRound, AuditStep, AuditWatermark,
-    RelatedOccurrenceGroup, build_audit,
+    AuditInstance, AuditObservedIdentity, AuditPhase, AuditProducer, AuditReportedVersion,
+    AuditRound, AuditStep, AuditText, AuditWatermark, RelatedOccurrenceGroup, build_audit,
 };
 pub use daemon::{ensure_daemon, run_daemon, wait_for_health};
 pub use db::{Db, RepoRow, RunRow, StepResultRow, UncertifiedPipelineRange};

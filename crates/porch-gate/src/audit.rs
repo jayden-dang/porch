@@ -151,7 +151,6 @@ pub struct AuditReportedVersion {
     pub unavailable: String,
 }
 
-/// Observed producer identity: artifact SHA-256 or unavailable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AuditObservedIdentity {
@@ -159,7 +158,6 @@ pub enum AuditObservedIdentity {
     Unavailable { unavailable: String },
 }
 
-/// Producer invocation on the audit document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditProducer {
     pub round_id: String,
@@ -172,7 +170,6 @@ pub struct AuditProducer {
     pub observed_version_identity: AuditObservedIdentity,
 }
 
-/// Per-path coverage row on the audit document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditCoverage {
     pub round_id: String,
@@ -300,7 +297,7 @@ struct ProducerDescriptorView {
 
 fn load_producers(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditProducer>> {
     let mut stmt = tx.prepare(
-        "SELECT r.ordinal, p.round_id, p.id, p.slot, p.descriptor_json,
+        "SELECT p.round_id, p.id, p.slot, p.descriptor_json,
                 p.descriptor_equivalence_digest
          FROM round_producers p
          INNER JOIN review_rounds r ON r.id = p.round_id
@@ -308,13 +305,13 @@ fn load_producers(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditProduce
          ORDER BY r.ordinal, p.slot, p.id",
     )?;
     let mapped = stmt.query_map([run_id], |row| {
-        let descriptor_json: String = row.get(4)?;
+        let descriptor_json: String = row.get(3)?;
         let view = project_descriptor(&descriptor_json);
         Ok(AuditProducer {
-            round_id: row.get(1)?,
-            id: row.get(2)?,
-            slot: row.get(3)?,
-            descriptor_equivalence_digest: row.get(5)?,
+            round_id: row.get(0)?,
+            id: row.get(1)?,
+            slot: row.get(2)?,
+            descriptor_equivalence_digest: row.get(4)?,
             adapter_kind: view.adapter_kind,
             declared_engine_kind: view.declared_engine_kind,
             reported_version: view.reported_version,
@@ -344,11 +341,12 @@ fn unresolved_producer_anomaly(
     instances: &[AuditInstance],
     producers: &[AuditProducer],
 ) -> Option<AuditAnomaly> {
+    let known: std::collections::HashSet<&str> = producers
+        .iter()
+        .map(|producer| producer.id.as_str())
+        .collect();
     instances.iter().find_map(|instance| {
-        if producers
-            .iter()
-            .any(|producer| producer.id == instance.producer_invocation_id)
-        {
+        if known.contains(instance.producer_invocation_id.as_str()) {
             None
         } else {
             Some(AuditAnomaly {
@@ -381,7 +379,7 @@ fn project_descriptor(descriptor_json: &str) -> ProducerDescriptorView {
 
 fn load_coverage(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditCoverage>> {
     let mut stmt = tx.prepare(
-        "SELECT r.ordinal, p.round_id, p.producer_invocation_id, p.path, p.state,
+        "SELECT p.round_id, p.producer_invocation_id, p.path, p.state,
                 p.reason, p.authority, p.completion_evidence
          FROM round_coverage p
          INNER JOIN review_rounds r ON r.id = p.round_id
@@ -390,13 +388,13 @@ fn load_coverage(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditCoverage
     )?;
     let mapped = stmt.query_map([run_id], |row| {
         Ok(AuditCoverage {
-            round_id: row.get(1)?,
-            producer_invocation_id: row.get(2)?,
-            path: row.get(3)?,
-            state: row.get(4)?,
-            reason: row.get(5)?,
-            authority: row.get(6)?,
-            completion_evidence: row.get(7)?,
+            round_id: row.get(0)?,
+            producer_invocation_id: row.get(1)?,
+            path: row.get(2)?,
+            state: row.get(3)?,
+            reason: row.get(4)?,
+            authority: row.get(5)?,
+            completion_evidence: row.get(6)?,
         })
     })?;
     let mut out = Vec::new();
