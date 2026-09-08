@@ -209,6 +209,40 @@ CREATE TABLE IF NOT EXISTS phase_events (
 );
 CREATE INDEX IF NOT EXISTS phase_events_run
     ON phase_events(run_id, seq);
+
+CREATE TABLE IF NOT EXISTS forward_records (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    deliver_attempt_id TEXT NOT NULL REFERENCES phase_attempts(id),
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('intent','pushed','already_current','push_failed')),
+    ref_name TEXT NOT NULL,
+    authorized_sha TEXT NOT NULL,
+    remote_state TEXT CHECK (remote_state IN ('absent','present')),
+    observed_remote_tip TEXT,
+    landed_sha TEXT,
+    detail TEXT,
+    created_at TEXT NOT NULL,
+    CHECK (
+        kind <> 'intent'
+        OR (
+            remote_state IS NOT NULL
+            AND ((remote_state = 'present') = (observed_remote_tip IS NOT NULL))
+            AND landed_sha IS NULL
+        )
+    ),
+    CHECK (
+        kind = 'intent'
+        OR (remote_state IS NULL AND observed_remote_tip IS NULL)
+    ),
+    CHECK (kind NOT IN ('pushed','already_current') OR landed_sha IS NOT NULL),
+    CHECK (kind <> 'push_failed' OR detail IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS forward_records_run
+    ON forward_records(run_id, seq);
+CREATE UNIQUE INDEX IF NOT EXISTS forward_records_attempt_intent
+    ON forward_records(deliver_attempt_id)
+    WHERE kind = 'intent';
 ";
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
