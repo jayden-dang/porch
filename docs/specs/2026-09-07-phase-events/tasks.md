@@ -1,7 +1,7 @@
 # Tasks: Phase-event history
 
 Feature code: PHASE
-Status: In-progress
+Status: Implemented
 Date: 2026-09-07
 Execution-mode: continuous
 Requirements: ./requirements.md
@@ -81,12 +81,12 @@ its `authority_events_run` index in `rounds/schema.rs`
 `phase::attempts_for_run`, `phase::events_for_run`, `phase::nonterminal_attempt`. Consumes `Db`.
 **Depends-on:** none
 **Steps:**
-- [ ] Test: opening an existing database applies the new tables and leaves prior rows readable.
-- [ ] Test: two nonterminal attempts of one canonical phase on one run are rejected by the store.
-- [ ] Implement the two `CREATE TABLE IF NOT EXISTS` statements, the `UNIQUE` constraint, and
+- [x] Test: opening an existing database applies the new tables and leaves prior rows readable.
+- [x] Test: two nonterminal attempts of one canonical phase on one run are rejected by the store.
+- [x] Implement the two `CREATE TABLE IF NOT EXISTS` statements, the `UNIQUE` constraint, and
       the `phase_events_run` index on `(run_id, seq)`; add row types and the three readers.
-- [ ] Run `cargo test -p porch-gate --test m18_rounds`; expect pass.
-- [ ] Commit.
+- [x] Run `cargo test -p porch-gate --test m18_rounds`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-1.1, PHASE-1.2, PHASE-1.3, PHASE-1.4, PHASE-1.11, PHASE-2.9_
 
@@ -101,15 +101,15 @@ Test `crates/porch-gate/tests/m18_rounds.rs`.
 `PhaseTransition::{Start, Terminal, Evidence}`, `PhaseError`. Consumes `RunEffects`, `Db`.
 **Depends-on:** Task 1
 **Steps:**
-- [ ] Test: a `Start` transition commits the attempt, the `started` event, and the run status
+- [x] Test: a `Start` transition commits the attempt, the `started` event, and the run status
       together; the status is visible only when the event is.
-- [ ] Test: a transition whose status write fails leaves no attempt row and no event.
-- [ ] Test: a `Terminal` transition appends a new row and never mutates the `started` row.
-- [ ] Implement the seam over one `TransactionBehavior::Immediate` transaction, applying
+- [x] Test: a transition whose status write fails leaves no attempt row and no event.
+- [x] Test: a `Terminal` transition appends a new row and never mutates the `started` row.
+- [x] Implement the seam over one `TransactionBehavior::Immediate` transaction, applying
       `RunEffects` and bumping `runs.audit_rev` in the same commit.
-- [ ] Narrow `Db::set_run_status` and `Db::insert_step_result` to `pub(crate)`.
-- [ ] Run `cargo test -p porch-gate --test m18_rounds`; expect pass.
-- [ ] Commit.
+- [x] Narrow `Db::set_run_status` and `Db::insert_step_result` to `pub(crate)`.
+- [x] Run `cargo test -p porch-gate --test m18_rounds`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-1.5, PHASE-1.6, PHASE-1.8, PHASE-1.9, PHASE-1.10, PHASE-7.8_
 
@@ -122,14 +122,14 @@ Modify `crates/porch-gate/src/rounds/phase.rs`. Test `crates/porch-gate/tests/m1
 `AttemptId`.
 **Depends-on:** Task 2
 **Steps:**
-- [ ] Test: a nested start under a terminated parent is refused.
-- [ ] Test: a handoff writes the old terminal and the new `started` at consecutive `seq` values
+- [x] Test: a nested start under a terminated parent is refused.
+- [x] Test: a handoff writes the old terminal and the new `started` at consecutive `seq` values
       and sets `caused_by_attempt_id`.
-- [ ] Test: a canonical phase name is refused as a nested `operation_kind`.
-- [ ] Test: a review attempt yields at most one successor; a failed nested op yields none.
-- [ ] Implement the three variants with their validation.
-- [ ] Run `cargo test -p porch-gate --test m18_rounds`; expect pass.
-- [ ] Commit.
+- [x] Test: a canonical phase name is refused as a nested `operation_kind`.
+- [x] Test: a review attempt yields at most one successor; a failed nested op yields none.
+- [x] Implement the three variants with their validation.
+- [x] Run `cargo test -p porch-gate --test m18_rounds`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-2.1, PHASE-2.2, PHASE-2.3, PHASE-2.4, PHASE-2.5, PHASE-2.6, PHASE-2.7, PHASE-2.8_
 
@@ -144,17 +144,17 @@ Test `crates/porch/tests/m21_phase.rs`, `crates/porch/tests/m6_deliver.rs`.
 **Interfaces:** Consumes `phase::persist_phase_transition`. Produces no new public names.
 **Depends-on:** Task 3
 **Steps:**
-- [ ] Test: parking for compose, cancelling on agent abort, completing delivery, and
+- [x] Test: parking for compose, cancelling on agent abort, completing delivery, and
       superseding by a new push each leave a matching phase event beside the status.
-- [ ] Route `set_status` and `record_step` through the seam; add an optional phase transition
+- [x] Route `set_status` and `record_step` through the seam; add an optional phase transition
       to `persist_authority_with_run_effects`.
-- [ ] Move the six bypassing status writes and six bypassing step writes onto the seam:
+- [x] Move the six bypassing status writes and six bypassing step writes onto the seam:
       `deliver.rs` awaiting-compose park, agent-abort cancel, and both completions;
       `daemon.rs` supersede; `lib.rs` park; and the six `deliver.rs` compose/deliver step rows.
-- [ ] Migrate direct-writer test helpers to the seam or a `#[cfg(test)]` constructor so the
+- [x] Migrate direct-writer test helpers to the seam or a `#[cfg(test)]` constructor so the
       narrowed visibility from Task 2 compiles.
-- [ ] Run `cargo test --workspace`; expect pass.
-- [ ] Commit.
+- [x] Run `cargo test --workspace`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-1.8, PHASE-1.9_
 
@@ -167,13 +167,13 @@ Test `crates/porch/tests/m21_phase.rs`.
 **Interfaces:** Produces `phase::reconcile_interrupted(db)`. Consumes the seam.
 **Depends-on:** Task 4
 **Steps:**
-- [ ] Test: a run killed mid-phase has, after restart, exactly one nonterminal attempt per
+- [x] Test: a run killed mid-phase has, after restart, exactly one nonterminal attempt per
       canonical phase and a `runs.status` consistent with the log.
-- [ ] Test: the interrupted terminal is appended in the same transaction as the sweep's status
+- [x] Test: the interrupted terminal is appended in the same transaction as the sweep's status
       change.
-- [ ] Implement `reconcile_interrupted` and call it from the startup sweep.
-- [ ] Run `cargo test --workspace`; expect pass.
-- [ ] Commit.
+- [x] Implement `reconcile_interrupted` and call it from the startup sweep.
+- [x] Run `cargo test --workspace`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-1.7, PHASE-8.3_
 
@@ -189,14 +189,14 @@ Test `crates/porch/tests/m21_phase.rs`.
 `phase::nonterminal_attempt`.
 **Depends-on:** Task 5
 **Steps:**
-- [ ] Test: a parked run reports its phase from the log, and a parked run with no nonterminal
+- [x] Test: a parked run reports its phase from the log, and a parked run with no nonterminal
       attempt reports unavailable rather than `review`.
-- [ ] Test: the agent status JSON keeps its shape while its phase value now comes from the
+- [x] Test: the agent status JSON keeps its shape while its phase value now comes from the
       snapshot field.
-- [ ] Fill `RunSnapshot.phase` server-side; rewrite `parked_phase`, `agent_status_from_snap`,
+- [x] Fill `RunSnapshot.phase` server-side; rewrite `parked_phase`, `agent_status_from_snap`,
       and `compose_parked` to read it; delete the `"review"` fallback and the step-string scans.
-- [ ] Run `cargo test --workspace`; expect pass.
-- [ ] Commit.
+- [x] Run `cargo test --workspace`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-3.1, PHASE-3.2, PHASE-3.3, PHASE-3.4, PHASE-3.5, PHASE-7.9, PHASE-7.12, PHASE-7.15_
 
@@ -211,15 +211,15 @@ Modify `crates/porch-gate/src/rounds/phase.rs`, `crates/porch-run/src/lib.rs`,
 **Interfaces:** Produces `phase::repair_attempts_started(db, run_id)`. Consumes the phase store.
 **Depends-on:** Task 6
 **Steps:**
-- [ ] Test: a run that has started the budgeted number of nested repairs is refused another and
+- [x] Test: a run that has started the budgeted number of nested repairs is refused another and
       terminals with an explicit budget-exhausted cause.
-- [ ] Test: a kill between counting a repair and finishing it never yields more than the budget
+- [x] Test: a kill between counting a repair and finishing it never yields more than the budget
       of started repairs after restart.
-- [ ] Implement the count; switch the budget check to it; delete
+- [x] Implement the count; switch the budget check to it; delete
       `Db::increment_deliver_repair_attempts` and stop writing the column.
-- [ ] Retarget `m6_repair` assertions from `run.deliver_repair_attempts` to the derived count.
-- [ ] Run `cargo test --workspace`; expect pass.
-- [ ] Commit.
+- [x] Retarget `m6_repair` assertions from `run.deliver_repair_attempts` to the derived count.
+- [x] Run `cargo test --workspace`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-4.1, PHASE-4.2, PHASE-4.3, PHASE-4.4, PHASE-8.4_
 
@@ -234,16 +234,16 @@ Modify `crates/porch-gate/src/audit.rs`. Test `crates/porch/tests/m21_phase.rs`,
 `phase::attempts_for_run`, `phase::events_for_run`.
 **Depends-on:** Task 7
 **Steps:**
-- [ ] Test: a run with attempts yields `kind` naming the event source and a nested tree; a run
+- [x] Test: a run with attempts yields `kind` naming the event source and a nested tree; a run
       with no phase rows yields an explicitly unavailable slice.
-- [ ] Test: `steps` inside the slice is rebuilt from phase events and still matches what the
+- [x] Test: `steps` inside the slice is rebuilt from phase events and still matches what the
       run recorded.
-- [ ] Test: a document built while the run is active is labelled partial as-of its watermark.
-- [ ] Test: building a document for a run holding 200 phase events stays under 100 ms and the
+- [x] Test: a document built while the run is active is labelled partial as-of its watermark.
+- [x] Test: building a document for a run holding 200 phase events stays under 100 ms and the
       query plan is index-backed.
-- [ ] Implement the slice inside the existing single-snapshot build; bump `schema_version`.
-- [ ] Run `cargo test --workspace`; expect pass.
-- [ ] Commit.
+- [x] Implement the slice inside the existing single-snapshot build; bump `schema_version`.
+- [x] Run `cargo test --workspace`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-5.1, PHASE-5.6, PHASE-5.7, PHASE-6.4, PHASE-7.5, PHASE-7.6, PHASE-8.1_
 
@@ -258,14 +258,14 @@ Test `crates/porch/tests/m21_phase.rs`.
 `porch audit`. Consumes `AuditDocument`.
 **Depends-on:** Task 8
 **Steps:**
-- [ ] Test: `porch audit` prints each top-level attempt with phase, ordinal, and outcome, and
+- [x] Test: `porch audit` prints each top-level attempt with phase, ordinal, and outcome, and
       each nested operation indented beneath its parent.
-- [ ] Test: outcome, nesting, and unavailability stay unambiguous with colour disabled.
-- [ ] Test: `porch audit --json` and `porch agent audit` emit identical bytes.
-- [ ] Split the shared match arm; implement the renderer as a pure function of the document.
-- [ ] Correct both docs: `porch audit` is no longer a JSON alias.
-- [ ] Run `cargo test --workspace`; expect pass.
-- [ ] Commit.
+- [x] Test: outcome, nesting, and unavailability stay unambiguous with colour disabled.
+- [x] Test: `porch audit --json` and `porch agent audit` emit identical bytes.
+- [x] Split the shared match arm; implement the renderer as a pure function of the document.
+- [x] Correct both docs: `porch audit` is no longer a JSON alias.
+- [x] Run `cargo test --workspace`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-5.2, PHASE-5.3, PHASE-5.4, PHASE-5.5, PHASE-7.13, PHASE-8.5_
 
@@ -279,16 +279,16 @@ Test `crates/porch/tests/m21_phase.rs`, `crates/porch-gate/tests/m18_rounds.rs`.
 **Interfaces:** Consumes `PROTOCOL_SCHEMA_VERSION`. Produces no new public names.
 **Depends-on:** Task 9
 **Steps:**
-- [ ] Test: upgrading a state root terminals every `pending` / `running` / `parked` run with an
+- [x] Test: upgrading a state root terminals every `pending` / `running` / `parked` run with an
       explicit cause in `runs.error`, and writes no phase rows for pre-existing runs.
-- [ ] Test: the upgrade's own fail-forward status writes complete on both a fresh root and an
+- [x] Test: the upgrade's own fail-forward status writes complete on both a fresh root and an
       already-fenced one, without the trigger it installs aborting them.
-- [ ] Test: an under-protocol writer is aborted by the database when updating `runs.status`.
-- [ ] Raise the protocol constant; order the transaction as protocol → fail-forward writes →
+- [x] Test: an under-protocol writer is aborted by the database when updating `runs.status`.
+- [x] Raise the protocol constant; order the transaction as protocol → fail-forward writes →
       create the status trigger → commit, using the existing protocol-only predicate.
-- [ ] Add the upgrade subsection to `docs/usage.md` in the protocol-2 shape.
-- [ ] Run `cargo test --workspace`; expect pass.
-- [ ] Commit.
+- [x] Add the upgrade subsection to `docs/usage.md` in the protocol-2 shape.
+- [x] Run `cargo test --workspace`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-6.1, PHASE-6.2, PHASE-6.3, PHASE-6.5, PHASE-6.6, PHASE-6.7, PHASE-7.1, PHASE-7.2, PHASE-7.3, PHASE-7.4, PHASE-8.2_
 
@@ -304,12 +304,12 @@ changed, and this task proves it
 Produces nothing.
 **Depends-on:** Task 10
 **Steps:**
-- [ ] Test: an identical run produces byte-identical PR attestation content before and after
+- [x] Test: an identical run produces byte-identical PR attestation content before and after
       this feature, with the parked compose row still excluded post-compose.
-- [ ] Test: the run snapshot still carries `steps[]`, findings, and `audit_available` as compact
+- [x] Test: the run snapshot still carries `steps[]`, findings, and `audit_available` as compact
       live state, without the full audit contract.
-- [ ] Test: the history panel still fetches lazily on open and never on the subscribe path.
-- [ ] Run `cargo test --workspace`; expect pass.
-- [ ] Commit.
+- [x] Test: the history panel still fetches lazily on open and never on the subscribe path.
+- [x] Run `cargo test --workspace`; expect pass.
+- [x] Commit.
 
 _Requirements: PHASE-7.7, PHASE-7.10, PHASE-7.11, PHASE-7.14_
