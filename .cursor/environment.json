@@ -1,0 +1,26 @@
+{
+  // Cloud Agent dev environment for porch (Rust workspace CLI + daemon).
+  // Base image is Cursor's default, which already ships the Rust toolchain
+  // (rustup honors rust-toolchain.toml -> stable), git, and sqlite3, so no
+  // custom Dockerfile is required.
+  "name": "porch",
+
+  // Warm the dependency cache and compile every workspace target (libs, the
+  // `porch`/`porch-quality` bins, and all mN_* integration-test binaries) so a
+  // booted agent can build, run, and test without a cold first compile.
+  "install": "cargo fetch --locked && cargo build --workspace --all-targets --locked",
+
+  // Applied on every boot (after Cursor's managed git setup) so the daemon
+  // integration tests run reliably:
+  //   - init.defaultBranch=main: porch-git init_bare() runs `git init --bare`
+  //     without --initial-branch, so bare origins used by the mN_* fixtures
+  //     seed `main`; without this the bare HEAD is `master` (nonexistent),
+  //     clones check out nothing, and the review pipeline hits spurious rebase
+  //     conflicts.
+  //   - commit.gpgsign=false: the SSH commit-signing helper injected into the
+  //     managed git config is slow and flaky when the porch daemon makes its
+  //     many worktree commits under parallel test load. Disabling signing for
+  //     this build/test environment makes `cargo test --workspace` reliable and
+  //     ~3x faster.
+  "start": "git config --global init.defaultBranch main && git config --global commit.gpgsign false"
+}
