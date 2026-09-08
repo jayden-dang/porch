@@ -71,8 +71,10 @@ consult is a no-op and no `TB-N` / `THR-N` / `CMP-N` / `SLO-N` is cited anywhere
    (`authority_events_run`, `rounds/schema.rs:167`). No new persistence idiom is invented.
 2. **Phase attempts are rows, not a derived view.** A separate `phase_attempts` table holds
    attempt identity and ordinal; `phase_events` references it. Deriving attempts from events
-   alone would make the "at most one nonterminal attempt per phase" rule (PHASE-1.6) a scan
-   rather than a uniqueness constraint the database enforces.
+   alone would make the "at most one nonterminal attempt per phase" rule (PHASE-1.6) a
+   repeated scan of the event log; the seam instead refuses a second open attempt via
+   `nonterminal_attempt` before insert. The partial `UNIQUE (run_id, phase, ordinal)` index
+   only rejects duplicate ordinals for top-level rows.
 3. **The transition seam owns the status write.** `phase::persist_phase_transition(db, plan,
    RunEffects)` is the only supported way to change `runs.status` or insert a `step_results`
    row from `porch-run`. `Db::set_run_status` and `Db::insert_step_result` become
@@ -185,8 +187,9 @@ Any failure returns before commit, so PHASE-1.10 is the transaction's own semant
 than compensating logic. `Handoff` performs PHASE-2.4's four writes in order and assigns
 consecutive `seq` values, satisfying PHASE-2.5. `NestedStart` rejects a parent that already
 has a terminal event (PHASE-2.3) and refuses a canonical phase name as `operation_kind`
-(PHASE-2.2). `Start` refuses when a nonterminal attempt for that phase exists (PHASE-1.6),
-which the `UNIQUE` index also enforces underneath.
+(PHASE-2.2). `Start` (and `Handoff` into an open destination) refuse when a nonterminal
+attempt for that phase already exists (PHASE-1.6) — enforced in the seam, not by the
+partial `UNIQUE (run_id, phase, ordinal)` index, which only rejects duplicate ordinals.
 
 ### C. Crash recovery
 
