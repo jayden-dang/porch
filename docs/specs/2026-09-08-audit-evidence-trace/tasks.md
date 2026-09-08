@@ -3,11 +3,11 @@
 > **For agentic workers:** after plan approval, pick one execute skill —
 > `build-in-waves` (continuous dependency-aware scheduler), `build-by-story` (human-gated story review
 > units), or `build-inline` (controller implements, no implementer subagents).
-> The chosen skill writes `Execution-mode:`. Steps use checkbox (`- [ ]`) syntax
+> The chosen skill writes `Execution-mode:`. Steps use checkbox (`- [x]`) syntax
 > for tracking.
 
 Feature code: TRACE
-Status: In-progress
+Status: Implemented
 Date: 2026-09-08
 Execution-mode: continuous
 Max-concurrency: auto
@@ -62,12 +62,12 @@ Create `crates/porch/tests/m22_audit_trace.rs`. Modify `crates/porch-gate/src/au
 - Produces: `AuditProducer { round_id, id, slot, descriptor_equivalence_digest, adapter_kind: AuditText, declared_engine_kind: AuditText, reported_version: AuditReportedVersion, observed_version_identity: AuditObservedIdentity }`. `AuditText` is untagged `String` or `{ unavailable: String }`. `AuditReportedVersion` is `{ unavailable: String }`. `AuditObservedIdentity` is `{ artifact_sha256: String }` or `{ unavailable: String }` (not `AuditText`). `AuditDocument.producers` + `schema_version: 3`; `#[serde(default)]` on `producers` and later scalars; `fn load_producers(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditProducer>>` with the design SQL; gate-local DTO (not `porch_review::ProducerDescriptor`); anomaly `unreadable_producer_descriptor` only when `anomaly` is `None`; `lib.rs` re-exports `AuditProducer`.
 **Depends-on:** none
 **Steps:**
-- [ ] Test: `open_round` with a projectable descriptor (`adapter_kind` `porch_json_cli`, `declared_engine_kind` `quality`, `reported_version` `{ "unavailable": "not_reported" }`, `observed_version_identity` `{ "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }`) then `build_audit` includes that producer (observed as `artifact_sha256`), `schema_version == 3`, and `producers` ordered by ordinal then slot then id.
-- [ ] Test: stub `{"adapter_kind":"porch_json_cli"}` still returns the document, still projects row columns, marks descriptor-derived fields unavailable with the parse reason, and sets `anomaly.code == "unreadable_producer_descriptor"` when no prior anomaly exists. Do not park the run.
-- [ ] Test: serde of a v2 document missing `producers` and the four new scalars succeeds (`#[serde(default)]`).
-- [ ] Implement types, `load_producers`, `schema_version` 3, re-export; bump the three `schema_version` asserts listed in Files (including `tui.rs` line 1375). Leave `audit_fetch_count` asserts unchanged.
-- [ ] Run `cargo test -p porch --test m22_audit_trace --test m20_dispo --test m21_phase`; expect pass. Run `cargo test -p porch --bin porch -- history_view_fetches_audit_once_on_open_not_on_snapshot`; expect pass. Run `cargo test -p porch --test m19_floor --test m18_round_identity` without editing those files; expect pass (authorization coverage reads stay on `applicability.rs`).
-- [ ] Commit `feat(audit): project producer invocations onto the audit document`.
+- [x] Test: `open_round` with a projectable descriptor (`adapter_kind` `porch_json_cli`, `declared_engine_kind` `quality`, `reported_version` `{ "unavailable": "not_reported" }`, `observed_version_identity` `{ "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }`) then `build_audit` includes that producer (observed as `artifact_sha256`), `schema_version == 3`, and `producers` ordered by ordinal then slot then id.
+- [x] Test: stub `{"adapter_kind":"porch_json_cli"}` still returns the document, still projects row columns, marks descriptor-derived fields unavailable with the parse reason, and sets `anomaly.code == "unreadable_producer_descriptor"` when no prior anomaly exists. Do not park the run.
+- [x] Test: serde of a v2 document missing `producers` and the four new scalars succeeds (`#[serde(default)]`).
+- [x] Implement types, `load_producers`, `schema_version` 3, re-export; bump the three `schema_version` asserts listed in Files (including `tui.rs` line 1375). Leave `audit_fetch_count` asserts unchanged.
+- [x] Run `cargo test -p porch --test m22_audit_trace --test m20_dispo --test m21_phase`; expect pass. Run `cargo test -p porch --bin porch -- history_view_fetches_audit_once_on_open_not_on_snapshot`; expect pass. Run `cargo test -p porch --test m19_floor --test m18_round_identity` without editing those files; expect pass (authorization coverage reads stay on `applicability.rs`).
+- [x] Commit `feat(audit): project producer invocations onto the audit document`.
 
 _Requirements: TRACE-1.1, TRACE-1.2, TRACE-1.3, TRACE-1.4, TRACE-1.5, TRACE-1.6, TRACE-6.1, TRACE-6.2, TRACE-6.3, TRACE-6.5, TRACE-7.1, TRACE-8.1, TRACE-8.6, TRACE-8.7, TRACE-8.8, TRACE-8.9_
 
@@ -83,11 +83,11 @@ Modify `crates/porch-gate/src/audit.rs`, `crates/porch-gate/src/lib.rs`. Test `c
 - Produces: `AuditCoverage { round_id, producer_invocation_id, path, state, reason, authority, completion_evidence }`; `AuditDocument.coverage` with `#[serde(default)]`; `fn load_coverage(tx: &Transaction<'_>, run_id: &str) -> Result<Vec<AuditCoverage>>` sibling join `ORDER BY r.ordinal, p.producer_invocation_id, path`; states stored as `selected` / `completed` / `failed` / `waived`.
 **Depends-on:** Task 1
 **Steps:**
-- [ ] Test: finalize one selected path and one completed path; `build_audit` lists both with stored states and orders by ordinal, invocation id, path.
-- [ ] Test: a waived path keeps its stored `reason` and `authority`; a failed path keeps its `reason`.
-- [ ] Implement `AuditCoverage`, `load_coverage`, re-export.
-- [ ] Run `cargo test -p porch --test m22_audit_trace`; expect pass.
-- [ ] Commit `feat(audit): project per-path coverage onto the audit document`.
+- [x] Test: finalize one selected path and one completed path; `build_audit` lists both with stored states and orders by ordinal, invocation id, path.
+- [x] Test: a waived path keeps its stored `reason` and `authority`; a failed path keeps its `reason`.
+- [x] Implement `AuditCoverage`, `load_coverage`, re-export.
+- [x] Run `cargo test -p porch --test m22_audit_trace`; expect pass.
+- [x] Commit `feat(audit): project per-path coverage onto the audit document`.
 
 _Requirements: TRACE-2.1, TRACE-2.2, TRACE-2.3, TRACE-2.4_
 
@@ -103,12 +103,12 @@ Modify `crates/porch-gate/src/audit.rs`. Test `crates/porch/tests/m22_audit_trac
 - Produces: `AuditInstance.producer_invocation_id: String` and `consequence: String` (`#[serde(default)]`); `AuditRound.trusted_config_sha: String` and `protocol_schema_version: i64` (`#[serde(default)]`); anomaly `unresolved_producer_invocation` if a finalized instance id is missing from `producers[]` and `anomaly` is `None`. Do not add `provenance_json`, `candidate_key`, `confidence_*`, `inventory_digest`, context, durations, or required-producer rows.
 **Depends-on:** Task 1, Task 2
 **Steps:**
-- [ ] Test: a finalized instance's `producer_invocation_id` equals some `producers[].id` on the same document; `consequence` matches the stored row.
-- [ ] Test: each round carries the bindings' `trusted_config_sha` and `protocol_schema_version`; JSON omits inventory/context/duration/required-set keys.
-- [ ] Test: instance JSON omits `provenance_json`, `candidate_key`, `confidence_value`, `confidence_kind`.
-- [ ] Add the four columns to the two SELECTs; wire the anomaly miss.
-- [ ] Run `cargo test -p porch --test m22_audit_trace`; expect pass.
-- [ ] Commit `feat(audit): expose finding producer keys and round pins`.
+- [x] Test: a finalized instance's `producer_invocation_id` equals some `producers[].id` on the same document; `consequence` matches the stored row.
+- [x] Test: each round carries the bindings' `trusted_config_sha` and `protocol_schema_version`; JSON omits inventory/context/duration/required-set keys.
+- [x] Test: instance JSON omits `provenance_json`, `candidate_key`, `confidence_value`, `confidence_kind`.
+- [x] Add the four columns to the two SELECTs; wire the anomaly miss.
+- [x] Run `cargo test -p porch --test m22_audit_trace`; expect pass.
+- [x] Commit `feat(audit): expose finding producer keys and round pins`.
 
 _Requirements: TRACE-3.1, TRACE-3.2, TRACE-3.3, TRACE-3.4, TRACE-4.1, TRACE-4.2, TRACE-4.3, TRACE-8.2, TRACE-8.3_
 
@@ -128,11 +128,11 @@ Modify `crates/porch/src/main.rs`, `crates/porch-gate/porch-agent.md`, `docs/usa
 - Docs **replace** (one verb): `porch-agent.md` (~76–80) and the audit paragraph; `docs/usage.md` (~187–189) plus a sentence that audit `schema_version` 3 is independent of `PROTOCOL_SCHEMA_VERSION` (also 3). `porch-agent.md` is `include_str!` in `skill.rs`.
 **Depends-on:** Task 1, Task 2
 **Steps:**
-- [ ] Test: with daemon up, default `porch audit` prints the producers block, then coverage counts with a selected path enumerated, then the existing phase tree; no new flag (`Audit { run_id, json }` stays).
-- [ ] Test: `porch audit --json` stdout bytes equal `porch agent audit` for the same run (existing `m21_phase.rs` `porch_audit_json_matches_agent_audit_bytes` stays).
-- [ ] Implement `render_evidence_blocks`; prepend the two empty headers on `m21_phase.rs` default-stdout pins without loosening tree lines.
-- [ ] Replace the two-counter note in `docs/usage.md` and `porch-agent.md`.
-- [ ] Run `cargo test -p porch --test m22_audit_trace --test m21_phase`; expect pass.
-- [ ] Commit `feat(audit): render producers and coverage on porch audit`.
+- [x] Test: with daemon up, default `porch audit` prints the producers block, then coverage counts with a selected path enumerated, then the existing phase tree; no new flag (`Audit { run_id, json }` stays).
+- [x] Test: `porch audit --json` stdout bytes equal `porch agent audit` for the same run (existing `m21_phase.rs` `porch_audit_json_matches_agent_audit_bytes` stays).
+- [x] Implement `render_evidence_blocks`; prepend the two empty headers on `m21_phase.rs` default-stdout pins without loosening tree lines.
+- [x] Replace the two-counter note in `docs/usage.md` and `porch-agent.md`.
+- [x] Run `cargo test -p porch --test m22_audit_trace --test m21_phase`; expect pass.
+- [x] Commit `feat(audit): render producers and coverage on porch audit`.
 
 _Requirements: TRACE-5.1, TRACE-5.2, TRACE-5.3, TRACE-5.4, TRACE-6.4, TRACE-8.4, TRACE-8.5_

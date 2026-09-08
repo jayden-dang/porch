@@ -1,7 +1,7 @@
 # Design: Audit evidence trace
 
 Feature code: TRACE
-Status: In-progress
+Status: Implemented
 Date: 2026-09-08
 Requirements: ./requirements.md
 

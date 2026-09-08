@@ -1,7 +1,7 @@
 # Requirements: Audit evidence trace
 
 Feature code: TRACE
-Status: In-progress
+Status: Implemented
 Date: 2026-09-08
 
 Roadmap item: — (GOAL-2 join; no unbound ROAD under MILE-2; do not invent a slot).
