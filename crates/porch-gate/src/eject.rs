@@ -18,12 +18,27 @@ pub struct EjectOptions<'a> {
     pub purge: bool,
 }
 
+/// What eject did to this repo's gate state under `$PORCH_HOME`.
+///
+/// Named so that the operator is never told state was removed when it was not
+/// (`ESCAPE-4.1`, `ESCAPE-4.3`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateState {
+    /// Deliberately kept: eject without `--purge`.
+    Preserved,
+    /// This repo's bare, worktrees, run artifacts, and rows are gone.
+    Purged,
+    /// Detach succeeded, but gate state could not be removed. Carries the reason.
+    LeftBehind(String),
+}
+
 /// Result of a successful eject.
 #[derive(Debug, Clone)]
 pub struct EjectResult {
     pub repo_id: String,
     pub bare_path: PathBuf,
     pub purged: bool,
+    pub gate_state: GateState,
 }
 
 /// Remove the `porch` remote and neutralize bare hooks.
@@ -32,47 +47,90 @@ pub struct EjectResult {
 /// With `purge`: deletes **this** repo's bare, worktrees, per-run artifacts, and
 /// DB rows only — other repos under the same home are untouched.
 ///
+/// Detach never opens the database (`ESCAPE-2.1`). `Db::open` migrates, raises
+/// `min_writer_protocol`, and refuses a binary older than the state root, so
+/// requiring it here made the escape hatch inherit every failure of the state the
+/// operator is escaping. The bare path is derived from the home layout instead of
+/// read from the row (`ESCAPE-2.2`), and a database that cannot be opened downgrades
+/// purge to a reported `LeftBehind` rather than failing the detach (`ESCAPE-2.3`).
+///
 /// # Errors
 ///
-/// Returns an error when the work tree is not a porch-initialized clone, git
-/// remote removal fails hard, or purge cleanup cannot open the database.
+/// Returns an error only when this checkout cannot be identified as a porch clone
+/// at all — no `porch.repo-id` and no `porch` remote to derive one from.
 pub fn eject(opts: EjectOptions<'_>) -> Result<EjectResult> {
     let work = opts.work_tree.canonicalize()?;
     let porch_home = opts
         .porch_home
         .canonicalize()
         .unwrap_or_else(|_| opts.porch_home.to_path_buf());
-    let repo_id = existing_repo_id(&work)?.ok_or_else(|| {
-        crate::Error::Other(format!(
-            "not initialized (no porch.repo-id); run `porch init` first ({})",
-            work.display()
-        ))
-    })?;
+    let repo_id = resolve_repo_id(&work)?;
+    let bare_path = crate::home::repos_dir(&porch_home).join(format!("{repo_id}.git"));
 
-    let db = Db::open(&db_path(&porch_home))?;
-    let repo = db.repo_by_id(&repo_id)?.ok_or_else(|| {
-        crate::Error::Other(format!(
-            "repo {repo_id} not in porch database under {}",
-            porch_home.display()
-        ))
-    })?;
-    let bare_path = repo.bare_path.clone();
-
-    // Remote removal is best-effort when already gone.
+    // Remote removal is best-effort when already gone, which is what makes a
+    // retry after an interrupted eject succeed rather than report "not
+    // initialized" (`ESCAPE-2.5`).
     let _ = porch_git::run_c(&work, &["remote", "remove", "porch"]);
     let _ = porch_git::run_c(&work, &["config", "--unset", "porch.repo-id"]);
 
     neutralize_bare_hooks(&bare_path);
 
-    if opts.purge {
-        purge_repo_state(&db, &porch_home, &repo_id, &bare_path)?;
-    }
+    let gate_state = if opts.purge {
+        purge_or_report(&porch_home, &repo_id, &bare_path)
+    } else {
+        GateState::Preserved
+    };
 
     Ok(EjectResult {
         repo_id,
         bare_path,
-        purged: opts.purge,
+        purged: gate_state == GateState::Purged,
+        gate_state,
     })
+}
+
+/// This repo's porch id, from `porch.repo-id` or from the `porch` remote's path.
+///
+/// An eject interrupted after the config unset leaves the remote in place. Falling
+/// back to the remote is what lets the operator retry instead of hand-editing git
+/// config to get past "not initialized" (`ESCAPE-2.4`).
+fn resolve_repo_id(work: &Path) -> Result<String> {
+    if let Some(id) = existing_repo_id(work)? {
+        return Ok(id);
+    }
+    if let Some(id) = repo_id_from_remote(work) {
+        return Ok(id);
+    }
+    Err(crate::Error::Other(format!(
+        "not a porch clone: no porch.repo-id and no `porch` remote ({})",
+        work.display()
+    )))
+}
+
+/// Recover the repo id from the `porch` remote URL: `.../repos/<repo_id>.git`.
+fn repo_id_from_remote(work: &Path) -> Option<String> {
+    let out = porch_git::run_c(work, &["remote", "get-url", "porch"]).ok()?;
+    let url = porch_git::stdout_trim(&out);
+    let name = Path::new(&url).file_name()?.to_str()?;
+    let id = name.strip_suffix(".git")?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Purge this repo's gate state, or say why it was left behind.
+///
+/// Detach has already happened by this point and must not be undone, so every
+/// failure here is reported rather than propagated (`ESCAPE-2.3`).
+fn purge_or_report(porch_home: &Path, repo_id: &str, bare_path: &Path) -> GateState {
+    let db = match Db::open(&db_path(porch_home)) {
+        Ok(db) => db,
+        Err(e) => {
+            return GateState::LeftBehind(format!("porch database could not be opened: {e}"));
+        }
+    };
+    match purge_repo_state(&db, porch_home, repo_id, bare_path) {
+        Ok(()) => GateState::Purged,
+        Err(e) => GateState::LeftBehind(format!("gate state could not be removed: {e}")),
+    }
 }
 
 fn neutralize_bare_hooks(bare: &Path) {
@@ -85,8 +143,16 @@ fn neutralize_bare_hooks(bare: &Path) {
     }
 }
 
+/// Delete this repo's rows, then its files.
+///
+/// The row deletion is transactional and is the only step that can fail, so it runs
+/// before anything is destroyed on disk: a purge that cannot complete leaves the
+/// bare, the worktrees, and the run artifacts intact (`ESCAPE-3.3`, `ESCAPE-3.4`).
 fn purge_repo_state(db: &Db, home: &Path, repo_id: &str, bare: &Path) -> Result<()> {
     let runs = db.runs_for_repo(repo_id)?;
+
+    db.delete_repo(repo_id)?;
+
     for run in &runs {
         if let Some(wt) = run.worktree_dir.as_ref() {
             if let Ok(g) = GitDir::new(bare) {
@@ -94,15 +160,11 @@ fn purge_repo_state(db: &Db, home: &Path, repo_id: &str, bare: &Path) -> Result<
             }
             let _ = std::fs::remove_dir_all(wt);
         }
-        let art = run_artifact_dir(home, &run.id);
-        let _ = std::fs::remove_dir_all(art);
+        let _ = std::fs::remove_dir_all(run_artifact_dir(home, &run.id));
     }
 
     let wt_root = worktrees_dir(home).join(repo_id);
     let _ = std::fs::remove_dir_all(&wt_root);
-
-    // Commit row deletion before removing porch-owned refs / the bare.
-    db.delete_repo(repo_id)?;
 
     if let Ok(g) = GitDir::new(bare) {
         let _ = crate::rounds::retention::sweep_unreferenced(&g, db);

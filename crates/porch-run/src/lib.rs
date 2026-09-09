@@ -2004,16 +2004,7 @@ fn remove_run_worktree(bare: &GitDir, wt: &Path) {
 ///
 /// Fail closed: if pinning unpublished pipeline commits fails, keep the worktree.
 fn finish_remove_worktree(bare: &GitDir, run: &RunRow, wt: &Path) {
-    if let Err(e) = sync::pin_recovery_if_needed(bare, run, wt) {
-        tracing::error!(
-            run_id = %run.id,
-            error = %e,
-            worktree = %wt.display(),
-            "recovery pin failed — keeping worktree (fail closed)"
-        );
-        return;
-    }
-    remove_run_worktree(bare, wt);
+    porch_gate::finish_remove_worktree(bare, run, wt);
 }
 
 fn recover_stale_running(home: &Path) -> Result<()> {
