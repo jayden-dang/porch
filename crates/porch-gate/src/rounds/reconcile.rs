@@ -173,12 +173,20 @@ pub struct VerdictRow {
     pub created_at: String,
 }
 
-/// The `deliver` attempts that have a forward record and no verdict.
+/// The `deliver` attempts that were interrupted mid-forward and have no verdict.
 ///
 /// Selected from the record's own shape rather than from `runs.status`. A
 /// writer-protocol upgrade terminalizes every active run inside `Db::open`,
 /// before recovery runs, so status-based selection would be silently disarmed by
-/// the next bump.
+/// the next bump — and it writes no phase event, so an attempt interrupted
+/// mid-forward and then caught by an upgrade still presents as open here.
+///
+/// "Interrupted" is the absence of a `terminal` phase event on the attempt. Every
+/// path that concludes on its own writes one, `fail_run_with_phase` included, so
+/// an attempt that reached a terminal event reported its own error and must not be
+/// classified: a post-push verification failure holds an intent and a `pushed`
+/// record while porch has *proven* `origin` does not carry the SHA, and
+/// classifying it would tell the operator the opposite.
 ///
 /// # Errors
 ///
@@ -199,6 +207,10 @@ pub fn attempts_awaiting_verdict(db: &Db) -> Result<Vec<AwaitingVerdict>> {
            AND NOT EXISTS (
                SELECT 1 FROM forward_reconciliations r
                WHERE r.deliver_attempt_id = f.deliver_attempt_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM phase_events e
+               WHERE e.attempt_id = f.deliver_attempt_id AND e.kind = 'terminal'
            )
          ORDER BY f.seq, f.id",
     )?;

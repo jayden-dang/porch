@@ -998,14 +998,51 @@ pub(crate) fn reconcile_interrupted_with_error(db: &Db, error: &str) -> Result<u
         .collect::<Result<_>>()?;
 
     let mut closed = 0usize;
-    for (run_id, pr_url) in stale {
+    for (run_id, pr_url) in &stale {
         let mine: Vec<&ResolvedVerdict> = resolved
             .iter()
-            .filter(|r| r.pending.run_id == run_id)
+            .filter(|r| &r.pending.run_id == run_id)
             .collect();
-        closed += reconcile_one_running(db, &run_id, pr_url.as_deref(), error, &mine)?;
+        closed += reconcile_one_running(db, run_id, pr_url.as_deref(), error, &mine)?;
+    }
+
+    // A conclusion is owed to every interrupted forward, not only to one whose
+    // run is still `running`. A writer-protocol upgrade terminalizes active runs
+    // inside `Db::open`, before recovery runs, so gating the write on run status
+    // would disarm reconciliation for exactly the runs it exists to classify —
+    // and, because nothing was ever written, would re-derive their verdicts on
+    // every restart forever, each costing a local git read before the socket
+    // binds. The run itself is left alone: it has a terminal outcome already, and
+    // this is evidence about a past forward rather than a reclassification.
+    for r in resolved
+        .iter()
+        .filter(|r| !stale.iter().any(|(id, _)| id == &r.pending.run_id))
+    {
+        append_verdict_for_terminal_run(db, r)?;
     }
     Ok(closed)
+}
+
+/// Append one conclusion for a run that already reached a terminal outcome.
+///
+/// Writes the conclusion record and nothing else — not `runs.status`, not
+/// `runs.error`, not any phase event (`RECON-4.1`).
+fn append_verdict_for_terminal_run(db: &Db, resolved: &ResolvedVerdict) -> Result<()> {
+    let conn = db.conn();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+    reconcile::append_verdict_tx(
+        &tx,
+        &resolved.pending,
+        resolved.verdict,
+        resolved.evidence,
+        resolved.tracking.as_deref(),
+    )?;
+    tx.execute(
+        "UPDATE runs SET audit_rev = audit_rev + 1 WHERE id = ?1",
+        [&resolved.pending.run_id],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// A verdict resolved outside the reconciliation transaction, awaiting its

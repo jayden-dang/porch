@@ -5575,6 +5575,149 @@ fn verdict_selection_does_not_depend_on_run_status() {
     );
     assert_eq!(pending[0].branch, "feat");
     assert_eq!(pending[0].bare_path, home.path().join("bare.git"));
+
+    // Selection is only half of it. Asserting selection alone passed while the
+    // write was still filtered through `status = 'running'`, so the protection
+    // RECON-3.6 describes was not in force and this test did not notice.
+    rounds::phase::reconcile_interrupted(&db).unwrap();
+    let verdicts = rounds::reconcile::verdicts_for_run(&db, &run_id).unwrap();
+    assert_eq!(
+        verdicts.len(),
+        1,
+        "a conclusion is persisted for an interrupted forward whose run is no longer running: \
+         {verdicts:?}"
+    );
+    assert_eq!(verdicts[0].verdict, rounds::Verdict::Indeterminate);
+    assert_eq!(verdicts[0].deliver_attempt_id, attempt);
+
+    let run = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(
+        run.status, "failed",
+        "appending a conclusion does not reclassify a terminal run"
+    );
+    assert_eq!(
+        run.error.as_deref(),
+        Some("already terminal"),
+        "appending a conclusion does not rewrite a terminal run's error"
+    );
+}
+
+/// A `deliver` attempt that concluded on its own path gets no conclusion.
+///
+/// The dangerous case is a post-push verification failure: intent plus `pushed`
+/// while porch has proven `origin` does not carry the SHA. Classifying it would
+/// return reached-origin and tell the operator the branch is on the remote.
+#[test]
+fn a_terminalized_deliver_attempt_gets_no_verdict() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let attempt = seed_deliver_attempt(&db, &run_id);
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Absent,
+        },
+    )
+    .unwrap();
+    rounds::forward::append_outcome(
+        &db,
+        &rounds::ForwardOutcome {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            kind: rounds::ForwardKind::Pushed,
+            landed_sha: Some("aaa"),
+            detail: None,
+        },
+    )
+    .unwrap();
+    // What every path that reports its own error does, `fail_run_with_phase`
+    // included: terminalize the open attempt.
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Terminal {
+            attempt: attempt.clone(),
+            outcome: "failed".into(),
+            cause: Some("forwarded ref verification failed".into()),
+        },
+        rounds::RunEffects::none(),
+    )
+    .unwrap();
+    set_run_status_raw(
+        home.path(),
+        &run_id,
+        "failed",
+        Some("forwarded ref verification failed"),
+    );
+
+    let pending = rounds::reconcile::attempts_awaiting_verdict(&db).unwrap();
+    assert!(
+        pending.is_empty(),
+        "an attempt that reported its own error is not interrupted: {pending:?}"
+    );
+    rounds::phase::reconcile_interrupted(&db).unwrap();
+    assert!(
+        rounds::reconcile::verdicts_for_run(&db, &run_id)
+            .unwrap()
+            .is_empty(),
+        "no conclusion is derived for a run that failed closed on its own path"
+    );
+}
+
+/// Reconciliation leaves nothing awaiting a conclusion.
+///
+/// Without this the startup path's work grows with the state root's whole
+/// forward history rather than with the current restart, because every attempt
+/// that never received a row is re-selected — and re-`rev-parse`d — on every
+/// daemon start, before the socket binds.
+#[test]
+fn reconciliation_leaves_no_attempt_awaiting_a_verdict() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    for status in ["running", "failed", "completed"] {
+        let run_id = seed_run(&db, home.path());
+        let attempt = seed_deliver_attempt(&db, &run_id);
+        rounds::forward::append_intent(
+            &db,
+            &rounds::ForwardIntent {
+                run_id: &run_id,
+                deliver_attempt_id: &attempt,
+                ref_name: "refs/heads/feat",
+                authorized_sha: "aaa",
+                observed: rounds::ObservedRemote::Absent,
+            },
+        )
+        .unwrap();
+        set_run_status_raw(home.path(), &run_id, status, None);
+    }
+    assert_eq!(
+        rounds::reconcile::attempts_awaiting_verdict(&db)
+            .unwrap()
+            .len(),
+        3
+    );
+
+    rounds::phase::reconcile_interrupted(&db).unwrap();
+    assert!(
+        rounds::reconcile::attempts_awaiting_verdict(&db)
+            .unwrap()
+            .is_empty(),
+        "every interrupted forward received its conclusion in one pass"
+    );
+
+    // And a second pass is a no-op rather than a second row.
+    rounds::phase::reconcile_interrupted(&db).unwrap();
+    assert!(
+        rounds::reconcile::attempts_awaiting_verdict(&db)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

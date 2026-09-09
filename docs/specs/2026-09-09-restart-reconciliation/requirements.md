@@ -96,6 +96,14 @@ so that a later forward can consult it instead of re-deriving it.
   presence of forward records without a conclusion, and SHALL NOT select them from
   `runs.status`, so that a future writer-protocol upgrade — which terminalizes active
   runs inside `Db::open`, before recovery runs — cannot silently disarm reconciliation.
+  **Corrected by ROAD-9.** As shipped, this held for selection and was defeated for
+  persistence: the write was filtered through a `status = 'running'` list, so no
+  conclusion was ever stored for a run the upgrade had already terminalized, and the
+  guard test asserted only that the attempt was *selected*. `FAULT-5.1`-`5.6` fix what is
+  written and add the assertion that would have caught it. Interruption is now read from
+  the absence of a `terminal` phase event on the attempt rather than from run status,
+  which also keeps a run that failed closed on its own path from being classified — see
+  this file's **Out of scope** note on post-push verification failure.
 - **RECON-3.7** WHEN a conclusion already exists for a `deliver` attempt THE SYSTEM
   SHALL NOT write a second one for the same evidence, so that repeated restarts are
   idempotent.
@@ -152,7 +160,10 @@ action, so that I do not improvise on a shared remote and open a duplicate pull 
 ## Non-functional
 
 - **RECON-7.1** Reconciliation SHALL add at most one local git read per undetermined
-  `deliver` attempt, and no remote read.
+  `deliver` attempt, and no remote read. **Corrected by ROAD-9.** As shipped this held
+  per attempt and was blown in aggregate: because `RECON-3.6`'s write never landed, the
+  same attempts were re-selected and re-read on every daemon start, before the socket
+  binds, forever. `FAULT-5.5` bounds the read set to the current restart.
 - **RECON-7.2** Reconciliation SHALL hold the state root's write lock for one
   `TransactionBehavior::Immediate` transaction per run, as it does today.
 - **RECON-7.3** Tests SHALL NOT invoke `gh` or any network.
