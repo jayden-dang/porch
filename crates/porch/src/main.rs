@@ -642,13 +642,18 @@ fn run_daemon_command(command: &DaemonCommand) -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&st)?);
             } else {
                 println!(
-                    "running={} pid={:?} socket_healthy={} service={} exists={}",
+                    "condition={} running={} pid={:?} socket_healthy={} service={} exists={}",
+                    st.condition.label(),
                     st.running,
                     st.pid,
                     st.socket_healthy,
                     st.service_file.display(),
                     st.service_file_exists
                 );
+                if !st.condition.is_ready() {
+                    println!("daemon: {}", st.condition.summary());
+                    println!("{}", st.condition.remedy());
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -671,7 +676,9 @@ fn is_git_work_tree(work: &Path) -> bool {
 
 fn ensure_daemon_for_cwd(home: &Path) -> Result<()> {
     let bin = env::current_exe().context("current_exe")?;
-    ensure_daemon(&bin, home).context("ensure daemon (try: porch daemon start)")
+    // No remedy hint here: each condition carries its own, and a blanket
+    // "try: porch daemon start" contradicts the right advice for a wedged daemon.
+    ensure_daemon(&bin, home).context("ensure daemon")
 }
 
 fn run_init(yes: bool, skip_setup: bool, intent: Option<&str>) -> Result<ExitCode> {

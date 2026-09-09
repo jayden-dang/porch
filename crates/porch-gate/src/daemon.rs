@@ -41,14 +41,32 @@ pub fn run_daemon(home: &Path, executor: &Arc<dyn RunExecutor>) -> Result<()> {
     std::fs::create_dir_all(home)?;
     std::fs::create_dir_all(logs_dir(home))?;
     let lock_file = File::create(lock_path(home))?;
-    lock_file
-        .try_lock_exclusive()
-        .map_err(|e| crate::Error::Other(format!("daemon already running: {e}")))?;
+    // `fs4`'s `try_lock_exclusive` reports contention as `Ok(false)`, not as an error.
+    // Discarding that bool made this guard admit every caller, so two daemons could
+    // serve one state root — both writing the same database and both running
+    // `kick_pending` (`DFAULT-6.1`).
+    let acquired = lock_file.try_lock_exclusive().map_err(|e| {
+        crate::Error::Other(format!("daemon lock {}: {e}", lock_path(home).display()))
+    })?;
+    if !acquired {
+        return Err(crate::Error::Other(format!(
+            "daemon already running (lock held on {})",
+            lock_path(home).display()
+        )));
+    }
     let db = Arc::new(Db::open(&db_path(home))?);
+    // Both barriers below refuse before the socket is bound, so a refusal leaves the
+    // same absence a dead daemon leaves. Record why, durably, or the operator's first
+    // retry is also the moment the diagnosis is lost (`DFAULT-2.1`).
     if let Err(e) = crate::rounds::reconcile_stale(&db) {
-        return Err(crate::Error::Other(format!("reconcile stale rounds: {e}")));
+        let cause = e.to_string();
+        crate::condition::record_refusal(home, crate::condition::BARRIER_RECONCILE_STALE, &cause);
+        return Err(crate::Error::Other(format!(
+            "reconcile stale rounds: {cause}"
+        )));
     }
     if let Err(e) = executor.recover_stale(home) {
+        crate::condition::record_refusal(home, crate::condition::BARRIER_RECOVER_STALE, &e);
         return Err(crate::Error::Other(format!("recover stale runs: {e}")));
     }
     let hub = Arc::new(EventHub::new());
@@ -61,6 +79,8 @@ pub fn run_daemon(home: &Path, executor: &Arc<dyn RunExecutor>) -> Result<()> {
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
     std::fs::write(pid_path(home), std::process::id().to_string())?;
+    // Past both barriers and serving, so any recorded refusal is history (`DFAULT-2.3`).
+    crate::condition::clear_refusal(home);
     tracing::info!(path = %sock.display(), "daemon listening");
 
     let home_buf = home.to_path_buf();
@@ -346,6 +366,12 @@ fn start_run(
 
 /// Poll until the daemon answers health, or `timeout` elapses.
 ///
+/// Bounded by `timeout` plus at most one health deadline: a probe already in flight
+/// when the budget expires still has to return, and it now does (`DFAULT-1.6`). Before
+/// the RPC client had a deadline this function could not honour its own argument at
+/// all — a daemon stopped after `bind` accepts the connection and never replies, so the
+/// elapsed check below was never reached.
+///
 /// # Errors
 ///
 /// Returns [`crate::Error::Other`] when the daemon never becomes healthy.
@@ -368,8 +394,20 @@ pub fn wait_for_health(home: &Path, timeout: Duration) -> Result<()> {
 ///
 /// Returns an error if the daemon cannot be spawned or does not become healthy.
 pub fn ensure_daemon(porch_bin: &Path, home: &Path) -> Result<()> {
-    if rpc::health_check(home).ok() == Some(true) {
+    let condition = crate::condition::daemon_condition(home);
+    if condition.is_ready() {
         return Ok(());
+    }
+    // A wedged daemon still holds the lock, so spawning over it cannot succeed — and
+    // before the single-instance guard was fixed it succeeded far too well. Refuse with
+    // the condition instead of burning the health budget on a spawn that must fail
+    // (`DFAULT-6.2`).
+    if let crate::condition::DaemonCondition::NotAnswering { .. } = &condition {
+        return Err(crate::Error::Other(format!(
+            "{} — {}",
+            condition.summary(),
+            condition.remedy()
+        )));
     }
     let porch_env = crate::collect_porch_env();
     let extra: Vec<(&str, &std::ffi::OsStr)> = porch_env
@@ -377,7 +415,18 @@ pub fn ensure_daemon(porch_bin: &Path, home: &Path) -> Result<()> {
         .map(|(k, v)| (k.as_str(), v.as_os_str()))
         .collect();
     crate::spawn_detached_with_env(porch_bin, home, &extra)?;
-    wait_for_health(home, Duration::from_secs(5))
+    if wait_for_health(home, Duration::from_secs(5)).is_ok() {
+        return Ok(());
+    }
+    // The spawn did not take. Report whatever the daemon left behind — a recorded
+    // refusal names the barrier, which is otherwise only in a log the next spawn
+    // truncates.
+    let after = crate::condition::daemon_condition(home);
+    Err(crate::Error::Other(format!(
+        "daemon did not become healthy: {} — {}",
+        after.summary(),
+        after.remedy()
+    )))
 }
 
 #[cfg(test)]

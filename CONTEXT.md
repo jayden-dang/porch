@@ -423,6 +423,19 @@ guarantee of **GOAL-4**. Eject reports which of three states it left: gate state
 preserved, purged, or left behind with a reason.
 _Avoid_: "uninstall" — that is the daemon-service verb (`porch daemon uninstall`).
 
+**Daemon condition**:
+Which of four states porch's daemon is in, as reported by `porch doctor` and
+`porch daemon status`: `ready` (answering), `unreachable` (no socket — dead or
+never started), `refusing` (starts, fails a startup barrier, exits before
+serving), `not-answering` (the socket accepts and nothing comes back — wedged).
+Resolved without starting a daemon and without opening the state database, so it
+is answerable in every state it describes. Each condition carries a remedy naming
+a command. A refusal's cause is durable in `$PORCH_HOME/daemon.refusal.json` and
+survives retries.
+_Avoid_: "daemon down", "daemon unhealthy" — they collapse three conditions with
+three different remedies. `socket_healthy` is a narrower fact and cannot name
+`not-answering` on its own.
+
 **Trusted SHA**:
 The default-branch commit that code-executing config is loaded from. Never the
 pushed SHA. Fetch failure fails closed.

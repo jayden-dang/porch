@@ -1089,6 +1089,33 @@ fn run_gh_allow_nonzero(
     run_gh_inner(bin, timeout, work_tree, args, None, true)
 }
 
+/// Total budget for retrying a spawn blocked by a concurrent writer.
+const ETXTBSY_RETRY: Duration = Duration::from_millis(500);
+
+/// Spawn, retrying briefly while the binary is still open for writing elsewhere.
+///
+/// `ETXTBSY` means some process holds a write handle to the file being `exec`'d —
+/// `gh` mid-upgrade, say. It is transient by nature, so a short retry is more useful
+/// to the operator than failing a deliver.
+///
+/// It also removes a race in this crate's own tests, which write a fake `gh` and
+/// exec it immediately: a concurrent test thread that forks in that window inherits
+/// the writable descriptor, and its child holds it until its own `exec` clears it.
+fn spawn_retrying_etxtbsy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let deadline = Instant::now() + ETXTBSY_RETRY;
+    loop {
+        match cmd.spawn() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn run_gh_inner(
     bin: &str,
     timeout: Duration,
@@ -1113,7 +1140,7 @@ fn run_gh_inner(
         cmd.process_group(0);
     }
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::BinNotFound {
                 bin: bin.to_string(),

@@ -252,6 +252,28 @@ porch daemon stop           # refuses if runs are active unless --force
 porch daemon uninstall
 ```
 
+`porch daemon status` and `porch doctor` both report which of four conditions the
+daemon is in. Neither starts a daemon, so asking does not change the answer, and
+neither can hang: every RPC has a deadline.
+
+| `condition` | Means | What to do |
+|---|---|---|
+| `ready` | answering | nothing |
+| `unreachable` | no socket — dead, or never started | `porch daemon start` |
+| `refusing` | it starts, hits a startup barrier, and exits before serving | the reported cause names the barrier; fix it, then `porch daemon start` |
+| `not-answering` | the socket accepts and nothing comes back — wedged | `porch daemon stop --force`, then `porch daemon start` |
+
+A refusal is recorded in `$PORCH_HOME/daemon.refusal.json` and survives your retries.
+It is cleared as soon as a daemon serves. Before it existed the cause went only to
+`logs/daemon.log`, which every start truncates, so retrying three times destroyed the
+diagnosis three times.
+
+`PORCH_RPC_TIMEOUT_MS` widens or narrows every RPC deadline. Raise it on a loaded
+machine if a healthy gate is reported as `not-answering`.
+
+Whatever the condition, `porch eject` still detaches and `porch agent status` /
+`respond` / `sync` still answer — they read the state database directly.
+
 ## N. Leave a clone
 
 ```sh
@@ -298,6 +320,10 @@ porch agent sync                    # if local branch lags pipeline
 | Symptom | What to try |
 |---|---|
 | `porch: command not found` | `export PATH="$HOME/.cargo/bin:$PATH"` then `porch doctor` |
+| a porch command does not come back | It should not any more — every daemon RPC has a deadline. Report it. `porch doctor` names the condition; `porch eject` detaches regardless |
+| `condition=not-answering` | Wedged daemon: `porch daemon stop --force && porch daemon start`. If a *healthy* gate reports this under load, raise `PORCH_RPC_TIMEOUT_MS` |
+| `condition=refusing` | Read the cause in the same output, or `$PORCH_HOME/daemon.refusal.json`. It survives retries |
+| `daemon already running` on start | One daemon per `$PORCH_HOME`, so the previous one has not exited. `porch daemon status` shows which pid holds it |
 | doctor warns floor | Install so `porch-quality` sits next to `porch` (`cargo install porch --locked`); restart the daemon |
 | doctor warns review | `porch setup --yes` (judgment: `agent` / `claude`/`codex`; `quality` is floor-only and still needs the sibling) |
 | certify `biome: not found` | Put biome on `PATH`; `porch daemon stop --force && porch daemon start` so the daemon inherits it |
