@@ -336,20 +336,28 @@ pub fn verdicts_for_run(db: &Db, run_id: &str) -> Result<Vec<VerdictRow>> {
 /// States the remedy, not only the diagnosis: without it the build ships a
 /// better status word and the same stuck operator. Never asserts that a pull
 /// request is absent — that is not knowable from local evidence.
+///
+/// The remedy names `porch rerun` beside the re-push because an operator whose
+/// gate died mid-forward usually has nothing left to push: their branch already
+/// matches the gate ref, so `git push porch` reports everything up to date and
+/// the advice to re-push does nothing. ROAD-9's fault injection found that by
+/// following it.
 #[must_use]
 pub fn operator_note(verdict: Verdict, ref_name: &str) -> Option<String> {
     match verdict {
         Verdict::NotAttempted => None,
         Verdict::ReachedOrigin => Some(format!(
             "{ref_name} carries the authorized commit on origin; pull request state is \
-             unrecorded. Re-push to continue: porch adopts an existing pull request for \
-             this branch rather than opening a second one."
+             unrecorded. Re-push to continue, or `porch rerun` if the branch has not moved \
+             since: porch adopts an existing pull request for this branch rather than \
+             opening a second one."
         )),
         Verdict::Indeterminate => Some(format!(
             "porch invoked the push for {ref_name} and did not record its result, so \
-             whether it reached origin is undetermined. Re-push to continue: the push is \
-             safe to repeat and porch adopts an existing pull request for this branch \
-             rather than opening a second one."
+             whether it reached origin is undetermined. Re-push to continue, or \
+             `porch rerun` if the branch has not moved since: the push is safe to repeat \
+             and porch adopts an existing pull request for this branch rather than \
+             opening a second one."
         )),
     }
 }

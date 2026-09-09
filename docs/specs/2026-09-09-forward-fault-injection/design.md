@@ -173,7 +173,7 @@ kill instead of by an absent fixture.
 `pre-receive` that exits 1. Asserts the `push_failed` record, that `origin` is unchanged,
 and that porch's error reports its own command's failure rather than the remote's state.
 
-**`repush_after_reached_origin_adopts_the_pull_request`** — continues the first scenario:
+**`retry_after_reached_origin_adopts_the_pull_request`** — continues the first scenario:
 re-push the branch, then assert exactly one `pr create` across both runs on the
 append-only `gh-argv.log`, that the retry's forward record is `already_current` under a
 **new** `deliver` attempt, and that `origin` did not move (`FAULT-3.1`-`3.3`).

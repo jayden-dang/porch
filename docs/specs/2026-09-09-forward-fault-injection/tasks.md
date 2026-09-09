@@ -54,7 +54,7 @@ Waves are ordered by dependency. Each wave ends green on
 - [x] **4.2** `killed_before_the_push_reconciles_to_indeterminate`. *(FAULT-2.5)*
 - [x] **4.3** `killed_before_intent_leaves_no_conclusion`. *(FAULT-2.6)*
 - [x] **4.4** `refused_push_records_failure_and_leaves_origin_unchanged`. *(FAULT-2.7)*
-- [x] **4.5** `repush_after_reached_origin_adopts_the_pull_request`.
+- [x] **4.5** `retry_after_reached_origin_adopts_the_pull_request`.
   *(FAULT-3.1, FAULT-3.2, FAULT-3.3)*
 - [x] **4.6** `two_restarts_leave_one_conclusion`. *(FAULT-3.4)*
 
