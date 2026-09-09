@@ -73,33 +73,42 @@
 
 - `m25_daemon_fault.rs`: 10 passed, ~4.9s, stable across three consecutive runs at
   default parallelism and once single-threaded.
-- Full sweep: 44 targets green.
+- Full sweep: 45 targets, all green, no failures — including the two flakes Wave 7
+  closed, which had failed the sweeps before it.
 - Before/after on the wedged daemon, same fixture: every diagnostic command went from
   "no output at 12s" to answering, `porch daemon status` in 2.0s with
   `condition=not-answering`.
 
-## Two pre-existing flakes met along the way
+## Wave 7 — the two pre-existing flakes, closed
 
 Both were measured rather than labelled, because while a flake stands, every "the
 suite is green apart from a known flake" claim is unfalsifiable — the point
-`ESCAPE`'s tasks file makes about the one it fixed.
+`ESCAPE`'s tasks file makes about the one it fixed. Both then failed a full sweep
+often enough to be worth closing here rather than carrying (**F.9**, **F.10**).
 
-- **`m6_repair`** failed the first full sweep with `gh CLI timed out after 10s`, and
-  reproduced 1 in 4 under 2x CPU oversubscription. It sets a 10s budget for its
-  shell-script `gh` fake where `m23` sets 20s, and its `gh` fake blocks on
-  cross-thread coordination, so the budget has to exceed coordination latency under
-  load. After the `kill_group` wait it passed 6 in 6 under the same load. Whether the
-  remaining margin is enough on a slower machine is untested; raising `m6_repair`'s
-  fake-tool budgets to `m23`'s 20s is the obvious follow-up (**F.9**).
-- **`porch-agent`'s `tests::success_parses_summary`** failed the second full sweep
-  with `ExecutableFileBusy`. It writes `fake-fixer` and immediately execs it, and a
-  concurrent test thread in the same binary can fork while that file is still open
-  for writing, so the exec gets `ETXTBSY`. Rate on this branch: 1 failure in 60 runs
-  under 3x oversubscription; on `main`, 0 in 20. The crate depends only on `serde`,
-  `serde_json`, `thiserror`, and `nix` — nothing this wave touches — so its test
-  binary is identical on both branches and the difference is sampling noise. Not
-  fixed here because the fix belongs at the spawn site in another slice's product
-  code, not in a test helper (**F.10**).
+- [x] **`m6_repair`** failed with `gh CLI timed out after 10s`. First read as a budget
+      too tight for load, and the follow-up was written as "raise it to `m23`'s 20s".
+      That was the wrong shape. Two of its tests deliberately hold `gh pr create` open
+      while a helper thread diverges `origin/main`, so `pr view` sees `CONFLICTING`
+      against a live tip — and the hold's own budget was 10s, exactly equal to
+      `PORCH_GH_TIMEOUT_SECS`. Which of the two fired first was arbitrary, so under
+      load porch's subprocess timeout adjudicated the fixture's own handshake and the
+      test reported a timeout in place of the rebase verdict it asserts. Fixed by
+      ordering the three budgets instead of tying them: the hold covers a saturated
+      box, the product timeout sits above it, and the helper waits for `pr create` as
+      long as its caller waits for a terminal status, since the run must clear review,
+      certify, rebase and the lease push first. Under 2x oversubscription the file now
+      runs 18-28s against a budget that used to expire at 10s, and passed 3 in 3.
+- [x] **`ETXTBSY` on exec** hit `porch-agent`'s `tests::success_parses_summary` and
+      `porch-deliver`'s `tests::edit_pr_title_invokes_gh_pr_edit_title`. Each writes a
+      fake tool and execs it in the next statement, and a concurrent test thread in
+      the same binary can fork while that file is still open for writing, so the exec
+      gets `ETXTBSY`. Fixed at the spawn site in both slices, as this file already
+      argued it should be: a bounded retry, because a write handle held elsewhere on a
+      binary being `exec`'d is transient by construction — a tool mid-install, or a
+      forked sibling that has not reached its own `exec`. That serves an operator
+      better than failing a fixer or a deliver, and it removes the test race as a
+      consequence rather than by special-casing tests.
 
 An hour was also lost to a self-inflicted version of `F.8`: `GIT_CONFIG_GLOBAL=/dev/null`
 exported into the working shell while measuring the cost of ambient commit signing,
@@ -111,8 +120,6 @@ on ambient git identity (**F.11**).
 
 ## Follow-ups, not in this wave
 
-- **F.9** Raise `m6_repair`'s fake-tool timeouts to match `m23`'s.
-- **F.10** `ETXTBSY` on execing a just-written fake binary in `porch-agent`'s tests.
 - **F.11** The deliver-repair rebase relies on ambient git identity while certify
   supplies its own. Inconsistent, and a real fragility for a tool whose whole job
   happens in a disposable worktree.
