@@ -1049,11 +1049,15 @@ fn install_status_writer_trigger(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn fail_forward_active_runs_for_phase_upgrade(conn: &Connection) -> Result<()> {
+/// Terminalize runs that a protocol bump leaves mid-flight.
+///
+/// The message names the fence rather than the feature that raised it, so it
+/// stays true across bumps instead of naming whichever regime came first.
+fn fail_forward_active_runs_for_protocol_upgrade(conn: &Connection) -> Result<()> {
     conn.execute(
         "UPDATE runs
          SET status = 'failed',
-             error = 'state root upgraded to the phase-events regime; start a fresh run',
+             error = 'state root upgraded to a newer porch writer protocol; start a fresh run',
              review_approved_head_sha = NULL
          WHERE status IN ('pending', 'running', 'parked')",
         [],
@@ -1089,7 +1093,7 @@ fn install_writer_fence(conn: &Connection) -> Result<()> {
             [crate::rounds::PROTOCOL_SCHEMA_VERSION],
         )?;
         // Status trigger must be created after fail-forward writes in this transaction.
-        fail_forward_active_runs_for_phase_upgrade(&tx)?;
+        fail_forward_active_runs_for_protocol_upgrade(&tx)?;
         install_status_writer_trigger(&tx)?;
         tx.commit()?;
         return Ok(());
@@ -1105,7 +1109,7 @@ fn install_writer_fence(conn: &Connection) -> Result<()> {
             "UPDATE porch_state_meta SET min_writer_protocol = ?1 WHERE id = 1",
             [crate::rounds::PROTOCOL_SCHEMA_VERSION],
         )?;
-        fail_forward_active_runs_for_phase_upgrade(&tx)?;
+        fail_forward_active_runs_for_protocol_upgrade(&tx)?;
         install_status_writer_trigger(&tx)?;
         tx.commit()?;
         return Ok(());

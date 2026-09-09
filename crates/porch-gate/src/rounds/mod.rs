@@ -2,6 +2,7 @@
 
 mod applicability;
 mod authority;
+pub mod forward;
 pub mod phase;
 mod requirements;
 pub mod retention;
@@ -15,6 +16,9 @@ pub use authority::{
     ActorKind, AuthorityError, AuthorityEventRecord, AuthorityKind, AuthorityMemberRecord,
     MemberRole, PersistAuthorityPlan, RunEffects, StepEffect, events_for_run, latest_fix_requested,
     persist_authority, persist_authority_with_run_effects,
+};
+pub use forward::{
+    ForwardError, ForwardIntent, ForwardKind, ForwardOutcome, ForwardRecordRow, ObservedRemote,
 };
 pub use phase::{AttemptId, PhaseAttemptRow, PhaseEventRow};
 pub use requirements::{
@@ -38,7 +42,7 @@ use db::now_secs;
 pub(crate) use schema::migrate;
 
 /// Protocol schema version this binary records and understands.
-pub const PROTOCOL_SCHEMA_VERSION: i64 = 3;
+pub const PROTOCOL_SCHEMA_VERSION: i64 = 4;
 
 /// Max stale phase-2 attempts before `abandon_for_history_contention`.
 pub const STALE_REVISION_RETRIES: u32 = 3;

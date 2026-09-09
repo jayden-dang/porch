@@ -18,6 +18,11 @@ impl AttemptId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Rebuild an identity read back from storage.
+    pub(crate) fn from_raw(raw: String) -> Self {
+        Self(raw)
+    }
 }
 
 impl fmt::Display for AttemptId {

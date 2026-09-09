@@ -1751,11 +1751,6 @@ fn upgrading_terminals_active_runs_with_phase_events_cause_and_no_phase_rows() {
     let db = Db::open(&path).unwrap();
     let conn = Connection::open(&path).unwrap();
 
-    assert_eq!(
-        rounds::PROTOCOL_SCHEMA_VERSION,
-        3,
-        "phase-events binary must record protocol 3"
-    );
     let min: i64 = conn
         .query_row(
             "SELECT min_writer_protocol FROM porch_state_meta WHERE id = 1",
@@ -1763,7 +1758,11 @@ fn upgrading_terminals_active_runs_with_phase_events_cause_and_no_phase_rows() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(min, 3, "upgrade must raise the state-root minimum to 3");
+    assert_eq!(
+        min,
+        rounds::PROTOCOL_SCHEMA_VERSION,
+        "upgrade must raise the state-root minimum to what this binary records"
+    );
     assert!(
         trigger_exists(&conn, "porch_runs_writer_status"),
         "upgrade must install the status writer trigger"
@@ -1775,8 +1774,8 @@ fn upgrading_terminals_active_runs_with_phase_events_cause_and_no_phase_rows() {
         assert!(
             run.error
                 .as_deref()
-                .is_some_and(|e| e.contains("phase-events") && e.contains("upgraded")),
-            "{id} must name the phase-events upgrade, got {:?}",
+                .is_some_and(|e| e.contains("writer protocol") && e.contains("upgraded")),
+            "{id} must name the protocol upgrade, got {:?}",
             run.error
         );
         assert!(
@@ -1841,7 +1840,7 @@ fn upgrade_fail_forward_completes_on_fresh_and_already_fenced_roots() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(min, 3);
+        assert_eq!(min, rounds::PROTOCOL_SCHEMA_VERSION);
         assert!(
             trigger_exists(&conn, "porch_runs_writer_insert"),
             "protocol-2 insert trigger must remain"
@@ -1860,7 +1859,7 @@ fn upgrade_fail_forward_completes_on_fresh_and_already_fenced_roots() {
             assert!(
                 run.error
                     .as_deref()
-                    .is_some_and(|e| e.contains("phase-events")),
+                    .is_some_and(|e| e.contains("writer protocol")),
                 "{id} error={:?}",
                 run.error
             );

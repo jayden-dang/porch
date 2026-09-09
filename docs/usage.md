@@ -353,3 +353,29 @@ The fence refuses new runs, approvals, and status writes from a writer that does
 understand protocol 3. Restore a backup of `$PORCH_HOME` taken before the upgrade if you must
 run an older binary.
 
+## T. Upgrading porch (durable forward record)
+
+The same fence, one notch higher. Opening a **protocol 4** binary against an older
+`$PORCH_HOME` adds the `forward_records` table and raises the minimum to 4, and that
+transaction **terminalizes** every still-active run exactly as the protocol-3 upgrade did.
+The cause in `runs.error` now names the writer protocol rather than one feature's regime, so
+it stays accurate at the next bump; recover the same way, with
+`porch rerun --run-id <ULID>`.
+
+**Back up `$PORCH_HOME` first**, and finish parked and running work before upgrading.
+
+What protocol 4 adds is a durable record of each forward attempt: porch commits an *intent*
+row naming the ref, the authorized SHA, and the remote tip the lease was resolved against
+**before** it pushes, and an *outcome* row naming what landed **after** the push returns and
+before it opens or updates the pull request. A gate killed between the push and the pull
+request therefore leaves local evidence that the push was authorized and completed, instead
+of a run that looks like it never tried. Nothing reads that record to decide a restart yet —
+restart still classifies on whether a PR URL was stored.
+
+The three earlier writer triggers are unchanged; no new trigger is added.
+
+**Rollback** to a protocol-3 binary against a protocol-4 state root is **unsupported** for
+the same reason as above: the fence refuses writes from a writer that does not understand 4.
+Reverting the upgrade means restoring a backup of `$PORCH_HOME`. The `forward_records` rows
+themselves are append-only and are never rewritten, so a restored backup simply lacks them.
+

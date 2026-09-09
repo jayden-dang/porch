@@ -31,6 +31,9 @@ fn resolve_gh_bin() -> String {
     }
     gh_bin()
 }
+use porch_gate::rounds::forward::{
+    self, ForwardIntent, ForwardKind, ForwardOutcome, ObservedRemote,
+};
 use porch_gate::rounds::phase::{
     self as phase, AttemptId, OperationKind, PhaseName, PhaseTransition,
 };
@@ -132,7 +135,11 @@ pub(crate) fn run_deliver_phase(
         .run_by_id(run_id)?
         .ok_or_else(|| DeliverError::Msg(format!("unknown run {run_id}")))?;
 
-    let head_sha = porch_git::rev_parse_c(wt, "HEAD")?;
+    // Fail closed before `gh` or any remote read: the forward boundary proves its
+    // own authorization rather than trusting the caller's continuity check.
+    let authorized = crate::authorized_forward_sha(db, run_id, wt)
+        .map_err(|e| DeliverError::Msg(e.to_string()))?;
+    let head_sha = authorized.clone();
     db.set_run_shas(run_id, Some(&head_sha), None)?;
 
     let bin = resolve_gh_bin();
@@ -152,7 +159,16 @@ pub(crate) fn run_deliver_phase(
     let pr_base = effective_base_branch(&trusted.pr_base_branch, default_branch).to_string();
 
     let refname = format!("refs/heads/{}", run.branch);
-    lease_push_exact(bare, &refname, &head_sha, run.base_sha.as_deref())?;
+    let attempt = ensure_deliver_attempt(db, run_id)?;
+    record_and_forward(
+        db,
+        run_id,
+        bare,
+        &attempt,
+        &refname,
+        &authorized,
+        run.base_sha.as_deref(),
+    )?;
 
     if cancelled(cancel) {
         return Err(DeliverError::Msg("cancelled".into()));
@@ -844,12 +860,22 @@ fn failed_names(checks: &[CheckRow]) -> String {
         .join(", ")
 }
 
-fn lease_push_exact(
+/// What the lease observed and decided, before anything mutates `origin`.
+struct ForwardLease {
+    observed: ObservedRemote,
+    decision: PushDecision,
+}
+
+/// Observe the remote tip and decide how to push, refusing before any mutation.
+///
+/// This half performs no external effect, so a refusal here leaves nothing to
+/// reconcile and writes no forward record.
+fn observe_forward_lease(
     bare: &GitDir,
     refname: &str,
     exact_sha: &str,
     base_sha: Option<&str>,
-) -> Result<(), DeliverError> {
+) -> Result<ForwardLease, DeliverError> {
     let tip = ls_remote_sha(bare, "origin", refname)
         .map_err(|e| DeliverError::Msg(format!("ls-remote origin {refname}: {e}")))?;
 
@@ -873,10 +899,26 @@ fn lease_push_exact(
         ));
     }
 
-    push_exact_sha(bare, "origin", refname, exact_sha, decision)
-        .map_err(|e| DeliverError::Msg(format!("push exact sha: {e}")))?;
+    let observed = match tip {
+        RemoteTip::Absent => ObservedRemote::Absent,
+        RemoteTip::Present(sha) => ObservedRemote::Present(sha),
+    };
+    Ok(ForwardLease { observed, decision })
+}
 
-    // Post-push ls-remote must equal pushed SHA (skip for pure up-to-date).
+/// Push the authorized SHA. The intent record must already be committed.
+fn execute_forward_push(
+    bare: &GitDir,
+    refname: &str,
+    exact_sha: &str,
+    decision: PushDecision,
+) -> Result<(), DeliverError> {
+    push_exact_sha(bare, "origin", refname, exact_sha, decision)
+        .map_err(|e| DeliverError::Msg(format!("push exact sha: {e}")))
+}
+
+/// Post-push `ls-remote` must equal the pushed SHA.
+fn verify_forwarded_ref(bare: &GitDir, refname: &str, exact_sha: &str) -> Result<(), DeliverError> {
     let after = ls_remote_sha(bare, "origin", refname)
         .map_err(|e| DeliverError::Msg(format!("post-push ls-remote: {e}")))?;
     match after {
@@ -884,6 +926,90 @@ fn lease_push_exact(
         other => Err(DeliverError::Msg(format!(
             "post-push ls-remote mismatch: expected {exact_sha}, got {other:?}"
         ))),
+    }
+}
+
+/// Observe, record the intent, push, then record the outcome.
+///
+/// The intent commits before the pushing command runs and the outcome commits
+/// after it returns and before the caller reaches the PR adapter, so the only
+/// window left is the single statement between the two (ARCH-13).
+fn record_and_forward(
+    db: &Db,
+    run_id: &str,
+    bare: &GitDir,
+    attempt: &AttemptId,
+    refname: &str,
+    authorized: &str,
+    base_sha: Option<&str>,
+) -> Result<(), DeliverError> {
+    let lease = observe_forward_lease(bare, refname, authorized, base_sha)?;
+    let already_current = matches!(lease.decision, PushDecision::UpToDate);
+
+    forward::append_intent(
+        db,
+        &ForwardIntent {
+            run_id,
+            deliver_attempt_id: attempt,
+            ref_name: refname,
+            authorized_sha: authorized,
+            observed: lease.observed,
+        },
+    )
+    .map_err(|e| DeliverError::Msg(format!("forward intent: {e}")))?;
+
+    let pushed = execute_forward_push(bare, refname, authorized, lease.decision);
+
+    let outcome = match &pushed {
+        Ok(()) if already_current => ForwardOutcome {
+            run_id,
+            deliver_attempt_id: attempt,
+            ref_name: refname,
+            authorized_sha: authorized,
+            kind: ForwardKind::AlreadyCurrent,
+            landed_sha: Some(authorized),
+            detail: None,
+        },
+        Ok(()) => ForwardOutcome {
+            run_id,
+            deliver_attempt_id: attempt,
+            ref_name: refname,
+            authorized_sha: authorized,
+            kind: ForwardKind::Pushed,
+            landed_sha: Some(authorized),
+            detail: None,
+        },
+        Err(_) => ForwardOutcome {
+            run_id,
+            deliver_attempt_id: attempt,
+            ref_name: refname,
+            authorized_sha: authorized,
+            kind: ForwardKind::PushFailed,
+            landed_sha: None,
+            detail: None,
+        },
+    };
+
+    match pushed {
+        Ok(()) => {
+            forward::append_outcome(db, &outcome)
+                .map_err(|e| DeliverError::Msg(format!("forward outcome: {e}")))?;
+            verify_forwarded_ref(bare, refname, authorized)
+        }
+        Err(push_err) => {
+            let detail = push_err.to_string();
+            let failed = ForwardOutcome {
+                detail: Some(&detail),
+                ..outcome
+            };
+            if let Err(write_err) = forward::append_outcome(db, &failed) {
+                tracing::error!(
+                    error = %write_err,
+                    "forward outcome record failed after a refused push"
+                );
+            }
+            Err(push_err)
+        }
     }
 }
 
@@ -1119,6 +1245,8 @@ esac
             .unwrap();
         db.set_pr_title_written(&run.id, Some("porch: feat-composed"))
             .unwrap();
+        db.set_review_approved_head_sha(&run.id, Some(&head))
+            .unwrap();
         // Simulate compose already resolved on this tip (only completed row needed;
         // same-second parked+completed can make latest_step_for_run non-deterministic).
         let deliver = phase::persist_phase_transition(
@@ -1187,6 +1315,26 @@ esac
         assert!(
             compose_already_resolved(&db, &run.id).unwrap(),
             "compose remains resolved"
+        );
+
+        // The forward left a durable intent before the push and an outcome
+        // after it, both under the deliver attempt that owned the forward.
+        let records = forward::records_for_run(&db, &run.id).unwrap();
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0].kind, ForwardKind::Intent);
+        assert_eq!(records[0].ref_name, "refs/heads/feat-composed");
+        assert_eq!(records[0].authorized_sha, head);
+        assert!(records[0].observed.is_some(), "{records:?}");
+        assert!(records[1].kind.reached_origin(), "{records:?}");
+        assert_eq!(records[1].landed_sha.as_deref(), Some(head.as_str()));
+        assert!(records[0].seq < records[1].seq, "{records:?}");
+        assert_eq!(
+            records[0].deliver_attempt_id, records[1].deliver_attempt_id,
+            "{records:?}"
+        );
+        assert!(
+            forward::attempt_reached_origin(&db, &records[0].deliver_attempt_id).unwrap(),
+            "a completed forward is not the ambiguous restart case"
         );
 
         let log = std::fs::read_to_string(&log_file).unwrap_or_default();

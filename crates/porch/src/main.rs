@@ -655,8 +655,7 @@ fn is_git_work_tree(work: &Path) -> bool {
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(work)
         .output()
-        .ok()
-        .is_some_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
 }
 
 fn ensure_daemon_for_cwd(home: &Path) -> Result<()> {

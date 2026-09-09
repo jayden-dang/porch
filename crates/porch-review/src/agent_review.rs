@@ -398,16 +398,10 @@ pub fn agent_review_bin(porch_home: &Path) -> Result<String, Error> {
 /// `PORCH_REVIEW_BIN` wins (keeps generic/OCR PATH fakes green).
 #[must_use]
 pub fn review_uses_agent(porch_home: Option<&Path>) -> bool {
-    if std::env::var(crate::REVIEW_BIN_ENV)
-        .ok()
-        .is_some_and(|s| !s.trim().is_empty())
-    {
+    if std::env::var(crate::REVIEW_BIN_ENV).is_ok_and(|s| !s.trim().is_empty()) {
         return false;
     }
-    if std::env::var(REVIEW_AGENT_BIN_ENV)
-        .ok()
-        .is_some_and(|s| !s.trim().is_empty())
-    {
+    if std::env::var(REVIEW_AGENT_BIN_ENV).is_ok_and(|s| !s.trim().is_empty()) {
         return true;
     }
     let home = porch_home

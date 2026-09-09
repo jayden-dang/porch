@@ -422,7 +422,7 @@ pub fn set_skip_service_load_for_tests(skip: bool) {
     FORCE_SKIP_LOAD.store(skip, Ordering::SeqCst);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn uid_string() -> String {
     // Prefer getuid via libc-free approach: parse id -u; fall back to "501".
     Command::new("id")

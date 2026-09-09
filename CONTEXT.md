@@ -341,6 +341,24 @@ Forwarding the certified branch to `origin` and opening the PR, then babysitting
 PR checks **by allowlist only**.
 _Avoid_: "deploy", "publish"
 
+**Forward authorization**:
+The durable fact that porch may forward exactly one commit for a **Run** — the
+recorded approved SHA, bound by equality. A live HEAD that merely descends from
+it is not authorized; HEAD movement reaches a forward only through the existing
+**Phase handoff** that revokes the prior approval and re-reviews. Persisted
+before any external mutation (**ARCH-13**), never inferred from remote state.
+_Avoid_: "approval" for the forward act; "continuity" as the durable record.
+
+**Forward record**:
+The append-only porch-owned evidence of one forward attempt, keyed to the owning
+`deliver` **Phase attempt**: an intent entry committed before the pushing command
+(run, ref, authorized SHA, observed remote tip) and an outcome entry committed
+after it and before the pull request adapter. It is a reconciliation input — it
+makes an attempt whose push completed distinguishable from one never invoked —
+and never an assurance outcome (**ARCH-11**). Porch derives the outcome from its
+own command result, never from probing `origin`.
+_Avoid_: "push log", "audit event"; `pr_url` as the evidence a push landed.
+
 **Custody**:
 Porch's claim over a ref while a run holds it — the basis for refusing a
 force-push that would drop live remote commits.

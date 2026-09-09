@@ -2981,8 +2981,8 @@ fn assert_legacy_runs_terminalized(db: &Db) {
         parked
             .error
             .as_deref()
-            .is_some_and(|e| { e.contains("upgraded") && e.contains("phase-events") }),
-        "legacy active runs must name the phase-events upgrade, got {:?}",
+            .is_some_and(|e| { e.contains("upgraded") && e.contains("writer protocol") }),
+        "legacy active runs must name the protocol upgrade, got {:?}",
         parked.error
     );
     assert!(parked.review_approved_head_sha.is_none());
@@ -5027,4 +5027,407 @@ fn compose_abort_nested_terminal_closes_owning_deliver_and_cancels_run() {
             .any(|s| s.step == "compose" && s.status == "cancelled"),
         "steps={steps:?}"
     );
+}
+
+// --- FWDAUTH: durable forward record ---
+
+fn seed_deliver_attempt(db: &Db, run_id: &str) -> rounds::AttemptId {
+    rounds::phase::persist_phase_transition(
+        db,
+        rounds::phase::PhaseTransition::Start {
+            run_id: run_id.to_string(),
+            phase: rounds::phase::PhaseName::Deliver,
+        },
+        rounds::RunEffects::none(),
+    )
+    .unwrap()
+}
+
+/// The nullable, per-kind columns of `forward_records`, so a test can offer a
+/// combination the Rust appenders would never build.
+#[derive(Default)]
+struct RawForwardCols<'a> {
+    remote_state: Option<&'a str>,
+    observed_tip: Option<&'a str>,
+    landed_sha: Option<&'a str>,
+    detail: Option<&'a str>,
+}
+
+fn insert_forward_raw(
+    home: &Path,
+    run_id: &str,
+    attempt: &rounds::AttemptId,
+    kind: &str,
+    cols: &RawForwardCols<'_>,
+) -> rusqlite::Result<usize> {
+    let conn = Connection::open(db_path(home)).unwrap();
+    register_current_writer_protocol(&conn);
+    conn.execute(
+        "INSERT INTO forward_records (
+            id, run_id, deliver_attempt_id, seq, kind, ref_name, authorized_sha,
+            remote_state, observed_remote_tip, landed_sha, detail, created_at
+         ) VALUES (?1, ?2, ?3, 99, ?4, 'refs/heads/feat', 'aaa', ?5, ?6, ?7, ?8, '1')",
+        rusqlite::params![
+            format!("raw-{kind}-{}", rand_suffix()),
+            run_id,
+            attempt.as_str(),
+            kind,
+            cols.remote_state,
+            cols.observed_tip,
+            cols.landed_sha,
+            cols.detail,
+        ],
+    )
+}
+
+fn rand_suffix() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or_else(|_| "0".into(), |d| d.as_nanos().to_string())
+}
+
+#[test]
+fn forward_record_store_applies_additively_and_starts_empty() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+
+    assert!(
+        rounds::forward::records_for_run(&db, &run_id)
+            .unwrap()
+            .is_empty(),
+        "a fresh run has no forward records"
+    );
+    assert!(
+        db.run_by_id(&run_id).unwrap().is_some(),
+        "prior rows stay readable across the new table"
+    );
+}
+
+#[test]
+fn forward_record_checks_reject_dishonest_rows() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let attempt = seed_deliver_attempt(&db, &run_id);
+
+    assert!(
+        insert_forward_raw(
+            home.path(),
+            &run_id,
+            &attempt,
+            "intent",
+            &RawForwardCols {
+                remote_state: Some("absent"),
+                landed_sha: Some("bbb"),
+                ..RawForwardCols::default()
+            },
+        )
+        .is_err(),
+        "an intent must not carry a landed sha"
+    );
+    assert!(
+        insert_forward_raw(
+            home.path(),
+            &run_id,
+            &attempt,
+            "intent",
+            &RawForwardCols {
+                remote_state: Some("present"),
+                ..RawForwardCols::default()
+            },
+        )
+        .is_err(),
+        "a present remote state must carry the observed tip"
+    );
+    assert!(
+        insert_forward_raw(
+            home.path(),
+            &run_id,
+            &attempt,
+            "pushed",
+            &RawForwardCols::default(),
+        )
+        .is_err(),
+        "a pushed record must name the landed sha"
+    );
+    assert!(
+        insert_forward_raw(
+            home.path(),
+            &run_id,
+            &attempt,
+            "push_failed",
+            &RawForwardCols::default(),
+        )
+        .is_err(),
+        "a failed record must carry a detail"
+    );
+    assert!(
+        insert_forward_raw(
+            home.path(),
+            &run_id,
+            &attempt,
+            "pushed",
+            &RawForwardCols {
+                remote_state: Some("absent"),
+                landed_sha: Some("bbb"),
+                ..RawForwardCols::default()
+            },
+        )
+        .is_err(),
+        "an outcome must not carry lease observation columns"
+    );
+    assert!(
+        insert_forward_raw(
+            home.path(),
+            &run_id,
+            &attempt,
+            "landed",
+            &RawForwardCols {
+                landed_sha: Some("bbb"),
+                ..RawForwardCols::default()
+            },
+        )
+        .is_err(),
+        "an unknown kind is rejected"
+    );
+}
+
+#[test]
+fn forward_intent_is_one_per_deliver_attempt() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let first = seed_deliver_attempt(&db, &run_id);
+
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &first,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Absent,
+        },
+    )
+    .unwrap();
+
+    let again = rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &first,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Absent,
+        },
+    );
+    assert!(
+        matches!(again, Err(rounds::ForwardError::IntentExists)),
+        "second intent on one attempt is refused: {again:?}"
+    );
+
+    // Terminal the first attempt so a second deliver attempt may open.
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Terminal {
+            attempt: first,
+            outcome: "failed".into(),
+            cause: None,
+        },
+        rounds::RunEffects::none(),
+    )
+    .unwrap();
+    let second = seed_deliver_attempt(&db, &run_id);
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &second,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Present("bbb".into()),
+        },
+    )
+    .expect("a new deliver attempt may record its own forward");
+}
+
+#[test]
+fn forward_outcome_requires_a_committed_intent() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let attempt = seed_deliver_attempt(&db, &run_id);
+
+    let orphan = rounds::forward::append_outcome(
+        &db,
+        &rounds::ForwardOutcome {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            kind: rounds::ForwardKind::Pushed,
+            landed_sha: Some("aaa"),
+            detail: None,
+        },
+    );
+    assert!(
+        matches!(orphan, Err(rounds::ForwardError::IntentMissing)),
+        "an outcome without an intent is refused: {orphan:?}"
+    );
+
+    let not_outcome = rounds::forward::append_outcome(
+        &db,
+        &rounds::ForwardOutcome {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            kind: rounds::ForwardKind::Intent,
+            landed_sha: None,
+            detail: None,
+        },
+    );
+    assert!(
+        matches!(not_outcome, Err(rounds::ForwardError::NotAnOutcome(_))),
+        "intent is not an outcome kind: {not_outcome:?}"
+    );
+
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Absent,
+        },
+    )
+    .unwrap();
+
+    let no_sha = rounds::forward::append_outcome(
+        &db,
+        &rounds::ForwardOutcome {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            kind: rounds::ForwardKind::Pushed,
+            landed_sha: None,
+            detail: None,
+        },
+    );
+    assert!(
+        matches!(no_sha, Err(rounds::ForwardError::LandedShaMissing(_))),
+        "a pushed outcome needs the landed sha: {no_sha:?}"
+    );
+
+    let no_detail = rounds::forward::append_outcome(
+        &db,
+        &rounds::ForwardOutcome {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            kind: rounds::ForwardKind::PushFailed,
+            landed_sha: None,
+            detail: None,
+        },
+    );
+    assert!(
+        matches!(no_detail, Err(rounds::ForwardError::DetailMissing(_))),
+        "a failed outcome needs a detail: {no_detail:?}"
+    );
+}
+
+#[test]
+fn forward_records_order_and_reached_origin_predicate() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let attempt = seed_deliver_attempt(&db, &run_id);
+
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Present("bbb".into()),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !rounds::forward::attempt_reached_origin(&db, &attempt).unwrap(),
+        "an intent alone is the ambiguous case, not proof origin moved"
+    );
+
+    rounds::forward::append_outcome(
+        &db,
+        &rounds::ForwardOutcome {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            kind: rounds::ForwardKind::Pushed,
+            landed_sha: Some("aaa"),
+            detail: None,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        rounds::forward::attempt_reached_origin(&db, &attempt).unwrap(),
+        "a pushed outcome means origin carries the authorized sha"
+    );
+
+    let rows = rounds::forward::records_for_run(&db, &run_id).unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].kind, rounds::ForwardKind::Intent);
+    assert_eq!(
+        rows[0].observed,
+        Some(rounds::ObservedRemote::Present("bbb".into()))
+    );
+    assert_eq!(rows[1].kind, rounds::ForwardKind::Pushed);
+    assert_eq!(rows[1].landed_sha.as_deref(), Some("aaa"));
+    assert!(rows[0].seq < rows[1].seq, "{rows:?}");
+}
+
+#[test]
+fn already_current_outcome_counts_as_reaching_origin() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let attempt = seed_deliver_attempt(&db, &run_id);
+
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Present("aaa".into()),
+        },
+    )
+    .unwrap();
+    rounds::forward::append_outcome(
+        &db,
+        &rounds::ForwardOutcome {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            kind: rounds::ForwardKind::AlreadyCurrent,
+            landed_sha: Some("aaa"),
+            detail: None,
+        },
+    )
+    .unwrap();
+
+    assert!(rounds::forward::attempt_reached_origin(&db, &attempt).unwrap());
+    let rows = rounds::forward::records_for_run(&db, &run_id).unwrap();
+    assert_eq!(rows[1].kind, rounds::ForwardKind::AlreadyCurrent);
 }
