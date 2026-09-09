@@ -206,6 +206,33 @@ pub fn parse_fixer_stdout(bytes: &[u8]) -> Result<FixerOutcome, Error> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
+/// Total budget for retrying a spawn blocked by a concurrent writer.
+const ETXTBSY_RETRY: Duration = Duration::from_millis(500);
+
+/// Spawn, retrying briefly while the binary is still open for writing elsewhere.
+///
+/// `ETXTBSY` means some process holds a write handle to the file being `exec`'d —
+/// a binary mid-install, or a writer about to close. It is transient by nature, so
+/// a short retry is more useful to the operator than failing the run.
+///
+/// It also removes a race in this crate's own tests, which write a fake fixer and
+/// exec it immediately: a concurrent test thread that forks in that window inherits
+/// the writable descriptor, and its child holds it until its own `exec` clears it.
+fn spawn_retrying_etxtbsy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let deadline = Instant::now() + ETXTBSY_RETRY;
+    loop {
+        match cmd.spawn() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Spawn the fixer CLI in `work_tree`, parse stdout JSON, reap the process group.
 ///
 /// # Errors
@@ -238,7 +265,7 @@ pub fn run_fixer(opts: &RunFixerOpts<'_>) -> Result<FixerOutcome, Error> {
         cmd.process_group(0);
     }
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::BinNotFound {
                 bin: opts.bin.to_string(),
