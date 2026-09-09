@@ -200,9 +200,11 @@ fn setup(mode: &str) -> Harness {
     );
 
     init_bare(&origin).unwrap();
+    // The fixture owns its own default branch; do not inherit init.defaultBranch.
+    git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     let seed = root.join("seed");
     std::fs::create_dir_all(&seed).unwrap();
-    git(&seed, &["init"]);
+    git(&seed, &["init", "-b", "main"]);
     git(&seed, &["config", "user.email", "porch@example.com"]);
     git(&seed, &["config", "user.name", "Porch"]);
     git(&seed, &["checkout", "-b", "main"]);
@@ -534,7 +536,7 @@ fn init_intent_prints_tip() {
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&work).unwrap();
-    git(&work, &["init"]);
+    git(&work, &["init", "-b", "main"]);
     git(&work, &["config", "user.email", "porch@example.com"]);
     git(&work, &["config", "user.name", "Porch"]);
     std::fs::write(work.join("README"), "x\n").unwrap();

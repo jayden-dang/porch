@@ -139,7 +139,7 @@ fn init_prints_remote_and_next_steps() {
 
     let st = std::process::Command::new("git")
         .current_dir(&work)
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .status()
         .unwrap();
     assert!(st.success());

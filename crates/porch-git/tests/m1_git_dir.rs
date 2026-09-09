@@ -12,7 +12,7 @@ use tempfile::TempDir;
 fn write_commit(work: &std::path::Path) {
     Command::new("git")
         .current_dir(work)
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .status()
         .unwrap();
     Command::new("git")

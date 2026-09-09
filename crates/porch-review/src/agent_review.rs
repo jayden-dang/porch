@@ -717,7 +717,7 @@ mod tests {
         fs::create_dir_all(wt).unwrap();
         assert!(
             StdCommand::new("git")
-                .args(["init"])
+                .args(["init", "-b", "main"])
                 .current_dir(wt)
                 .status()
                 .unwrap()

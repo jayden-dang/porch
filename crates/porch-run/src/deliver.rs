@@ -1092,7 +1092,7 @@ mod already_composed_tests {
 
         let seed = root.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        git(&seed, &["init"]);
+        git(&seed, &["init", "-b", "main"]);
         git(&seed, &["config", "user.email", "porch@example.com"]);
         git(&seed, &["config", "user.name", "Porch"]);
         git(&seed, &["checkout", "-b", "main"]);

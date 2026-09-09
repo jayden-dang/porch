@@ -141,7 +141,7 @@ mod tests {
         let work = tmp.path().canonicalize().unwrap();
         std::process::Command::new("git")
             .current_dir(&work)
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .status()
             .unwrap();
         std::process::Command::new("git")

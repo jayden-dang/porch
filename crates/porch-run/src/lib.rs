@@ -3472,7 +3472,7 @@ mod custody_tests {
 
         let seed = root.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        git(&seed, &["init"]);
+        git(&seed, &["init", "-b", "main"]);
         git(&seed, &["config", "user.email", "porch@example.com"]);
         git(&seed, &["config", "user.name", "Porch"]);
         git(&seed, &["checkout", "-b", "main"]);
@@ -3524,7 +3524,7 @@ mod custody_tests {
 
         let seed = root.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        git(&seed, &["init"]);
+        git(&seed, &["init", "-b", "main"]);
         git(&seed, &["config", "user.email", "porch@example.com"]);
         git(&seed, &["config", "user.name", "Porch"]);
         git(&seed, &["checkout", "-b", "main"]);
@@ -3582,7 +3582,7 @@ mod continuity_tests {
         let db = Db::open(&home.join("state.sqlite")).unwrap();
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        git(&work, &["init"]);
+        git(&work, &["init", "-b", "main"]);
         git(&work, &["config", "user.email", "porch@example.com"]);
         git(&work, &["config", "user.name", "Porch"]);
         std::fs::write(work.join("README"), "x\n").unwrap();
@@ -3606,7 +3606,7 @@ mod continuity_tests {
         let db = Db::open(&home.join("state.sqlite")).unwrap();
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        git(&work, &["init"]);
+        git(&work, &["init", "-b", "main"]);
         git(&work, &["config", "user.email", "porch@example.com"]);
         git(&work, &["config", "user.name", "Porch"]);
         std::fs::write(work.join("README"), "x\n").unwrap();

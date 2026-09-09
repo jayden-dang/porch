@@ -624,7 +624,7 @@ fn verify_quality_range(backend: &Path) -> Result<(), Error> {
     fs::create_dir_all(&tmp)?;
     let out_json = tmp.join("out.json");
     let result = (|| {
-        git(&tmp, &["init"])?;
+        git(&tmp, &["init", "-b", "main"])?;
         git(&tmp, &["config", "user.email", "porch-setup@example.com"])?;
         git(&tmp, &["config", "user.name", "Porch Setup"])?;
         fs::write(tmp.join("README"), "one\n")?;
@@ -679,7 +679,7 @@ fn verify_ocr_preview(backend: &Path) -> Result<(), Error> {
     let tmp = std::env::temp_dir().join(format!("porch-setup-verify-{stamp}"));
     fs::create_dir_all(&tmp)?;
     let result = (|| {
-        git(&tmp, &["init"])?;
+        git(&tmp, &["init", "-b", "main"])?;
         git(&tmp, &["config", "user.email", "porch-setup@example.com"])?;
         git(&tmp, &["config", "user.name", "Porch Setup"])?;
         fs::write(tmp.join("README"), "one\n")?;

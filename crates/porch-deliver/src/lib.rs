@@ -1400,7 +1400,7 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         Command::new("git")
             .current_dir(&work)
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .status()
             .unwrap();
         Command::new("git")
@@ -1490,7 +1490,7 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         Command::new("git")
             .current_dir(&work)
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .status()
             .unwrap();
         Command::new("git")

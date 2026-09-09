@@ -10,7 +10,7 @@ fn git_repo() -> (TempDir, std::path::PathBuf) {
     let work = tmp.path().canonicalize().unwrap();
     Command::new("git")
         .current_dir(&work)
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .status()
         .unwrap();
     Command::new("git")
@@ -91,13 +91,13 @@ fn init_detects_default_branch_from_origin_head() {
     let seed = root.join("seed");
     let work = root.join("work");
     Command::new("git")
-        .args(["init", "--bare", origin.to_str().unwrap()])
+        .args(["init", "--bare", "-b", "main", origin.to_str().unwrap()])
         .status()
         .unwrap();
     std::fs::create_dir_all(&seed).unwrap();
     Command::new("git")
         .current_dir(&seed)
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .status()
         .unwrap();
     Command::new("git")
