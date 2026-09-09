@@ -74,7 +74,50 @@ pub fn spawn_detached_with_env(
     Ok(child.id())
 }
 
-/// Best-effort terminate of a process group spawned by [`spawn_detached`].
+/// How long [`kill_group`] waits for the signalled group leader to exit.
+const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether `pid` has exited.
+///
+/// A zombie counts as exited. That distinction is load-bearing for callers that
+/// spawned the daemon themselves and never reap it — `/proc/<pid>` outlives such a
+/// process, so only the state field is conclusive. What a caller actually waits for
+/// is the release of the state root's exclusive lock, and a zombie has released it.
+#[must_use]
+pub fn pid_exited(pid: u32) -> bool {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // `pid (comm) state …`, and comm may contain spaces and parentheses.
+        return stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_none_or(|state| state == "Z" || state == "X");
+    }
+    // No procfs (macOS, or a hidden /proc): a signal probe is the portable answer.
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        let Ok(raw) = i32::try_from(pid) else {
+            return true;
+        };
+        matches!(kill(Pid::from_raw(raw), None), Err(Errno::ESRCH))
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+/// Terminate a process group spawned by [`spawn_detached`] and wait for it to go.
+///
+/// Waiting rather than returning on the signal matters: the daemon holds the state
+/// root's exclusive lock until it exits, and a replacement that starts first
+/// correctly refuses with `daemon already running`. Returning early made the
+/// caller's next start a race — one that used to be masked, because the
+/// single-instance guard discarded `fs4`'s `Ok(false)` for a contended lock and let
+/// the replacement serve anyway.
+///
+/// Bounded by [`EXIT_WAIT`], so a process that ignores `SIGTERM` delays the caller
+/// rather than hanging it.
 pub fn kill_group(pid: u32) {
     #[cfg(unix)]
     {
@@ -89,6 +132,10 @@ pub fn kill_group(pid: u32) {
     #[cfg(not(unix))]
     {
         let _ = pid;
+    }
+    let start = std::time::Instant::now();
+    while !pid_exited(pid) && start.elapsed() < EXIT_WAIT {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

@@ -367,8 +367,9 @@ fn stop_process(porch_home: &Path) {
     let pid_file = pid_path(porch_home);
     if let Ok(pid_s) = std::fs::read_to_string(&pid_file) {
         if let Ok(pid) = pid_s.trim().parse::<u32>() {
+            // Waits for the exit, so a `porch daemon start` straight after this does
+            // not race the lock the daemon holds until it goes.
             crate::kill_group(pid);
-            std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }
     let _ = std::fs::remove_file(socket_path(porch_home));

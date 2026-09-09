@@ -49,7 +49,8 @@ pub use init::{InitOptions, InitResult, init};
 pub use notes::{finding_notes_path, load_finding_notes, set_finding_note};
 pub use notify::{git_dir_from_env, notify_push};
 pub use proc::{
-    collect_porch_env, collect_porch_env_from, kill_group, spawn_detached, spawn_detached_with_env,
+    collect_porch_env, collect_porch_env_from, kill_group, pid_exited, spawn_detached,
+    spawn_detached_with_env,
 };
 pub use rpc::start_run as rpc_start_run;
 pub use rpc::{
