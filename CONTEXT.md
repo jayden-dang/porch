@@ -363,6 +363,29 @@ distinguishable from one never invoked — and never an assurance outcome
 probing `origin`.
 _Avoid_: "push log", "audit event"; `pr_url` as the evidence a push landed.
 
+**Forward reconciliation**:
+What a restart concludes about a forward that may already have happened,
+derived from the **Forward record** and never from a network probe. Scoped to
+`origin`, never to a pull request: the durable evidence for a crash before the
+pull request call and for one after it and before `pr_url` is stored is
+identical, so porch may state that pull request state is *unrecorded* and never
+that a pull request is absent. A later conclusion about a terminal run's attempt
+is an append, not a reclassification — the run's outcome is never rewritten.
+_Avoid_: "recovery" for this step; asserting a pull request does not exist;
+`push_failed` as evidence that `origin` is unchanged.
+
+**Forward verdict**:
+One reconciliation conclusion — `not_attempted`, `reached_origin`, or
+`indeterminate` — stored append-only against the owning `deliver` **Phase
+attempt** together with the evidence it rests on. Its vocabulary lives in code,
+not in a database `CHECK`, so a later verdict does not require rebuilding an
+append-only table. An `indeterminate` verdict may be upgraded by the gate
+repository's own remote-tracking ref, which git writes only after the receiving
+end acknowledged the push; that ref is one-sided evidence and never downgrades a
+verdict.
+_Avoid_: a new `runs.status` value for it; "unchanged" as a verdict; treating the
+tracking ref's absence as proof a push failed.
+
 **Custody**:
 Porch's claim over a ref while a run holds it — the basis for refusing a
 force-push that would drop live remote commits.

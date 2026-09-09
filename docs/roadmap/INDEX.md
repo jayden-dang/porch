@@ -62,11 +62,11 @@ gate that died mid-forward discovers what actually happened instead of repeating
 **Goals:** GOAL-1
 **Members:**
 - **ROAD-7** persist assurance authorization and reviewed-input binding before any external forward — Surfaces: `crates/porch-run/src/lib.rs`, `crates/porch-run/src/deliver.rs`, `crates/porch-gate/src/db.rs`
-- **ROAD-8** restart reconciliation of ambiguous external effects — Surfaces: `crates/porch-run/src/deliver.rs`, `crates/porch-gate/src/daemon.rs`
+- **ROAD-8** restart reconciliation of ambiguous external effects — Surfaces: `crates/porch-gate/src/rounds/reconcile.rs`, `crates/porch-gate/src/rounds/phase.rs`
 - **ROAD-9** fault-injection suite across the forward boundary — Surfaces: `crates/porch/tests/`
 **Depends-on:** MILE-2
-**Commitment:** Committed 2026-09-08 — ROAD-7's durable forward record shipped; one blocker below is open again and gates the reviewed-input binding half
-**Closed:** None
+**Commitment:** Committed 2026-09-08 — ROAD-7's durable forward record shipped and ROAD-8 now reads it; one blocker below is open again and gates the reviewed-input binding half
+**Closed:** ROAD-7 (2026-09-08), ROAD-8 (2026-09-09). ROAD-9's fault-injection suite remains, and the enumeration of durable forward states in `docs/specs/2026-09-09-restart-reconciliation/design.md` is what it asserts against. ROAD-8's surfaces moved from the ones planned here: classification is pure over the durable record in `porch-gate`, and the only observation it adds is a local tracking-ref read, so `porch-run/src/deliver.rs` and `daemon.rs` were not touched.
 **Deferred:** None
 **Blockers:**
 - ~~Restart reconciliation behaviour when the branch was pushed but PR creation or local completion persistence did not finish~~ — resolved 2026-09-08 in ROAD-7 discovery: the forward boundary persists an intent record before the push and an outcome record after it, so a restart reads durable local state instead of inferring from `pr_url` alone and can distinguish an authorized, completed push from one never attempted. The residual window between push completion and the outcome write stays owned by ROAD-8, which owns discovery; ROAD-7 does not probe `origin`.
