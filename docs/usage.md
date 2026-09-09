@@ -374,6 +374,32 @@ forward, because a deliver repair that leaves HEAD unmoved now hands the phase o
 next attempt instead of forwarding twice under the same one. Nothing reads that record to
 decide a restart yet — restart still classifies on whether a PR URL was stored.
 
+## U. What you see when a gate died mid-forward
+
+A restart now reads that record instead of guessing from the pull request URL. The run's
+status rule is unchanged — a `failed` run is still `failed`, a run with a stored PR URL is
+still `ci_monitor_interrupted` — and **no upgrade or protocol bump is involved**; the
+conclusion is added to the run's error, after the familiar `daemon restarted...` phrase.
+
+You will see one of:
+
+- **the branch reached `origin`** — porch's own record says the push succeeded, so your
+  commit is on the shared remote. Porch will say that **pull request state is
+  unrecorded**, and it means it: a gate can die after the pull request was created but
+  before porch stored its URL, and that looks identical on disk to dying before the
+  pull request call. Porch will not tell you a pull request does not exist, because it
+  cannot know.
+- **undetermined** — porch invoked the push and never recorded the result. It narrows
+  this case using the gate repository's own `refs/remotes/origin/<branch>`, which git
+  writes only once the remote acknowledges a push, so a match resolves it without any
+  network call. An absent or different ref resolves nothing and the run stays
+  undetermined.
+
+**In both cases the remedy is the same: push again.** The push is safe to repeat, and
+porch adopts an existing pull request for that branch rather than opening a second one.
+That is why porch tells you to re-push rather than leaving you to inspect `origin`
+yourself.
+
 The three earlier writer triggers are unchanged; no new trigger is added.
 
 **Rollback** to a protocol-3 binary against a protocol-4 state root is **unsupported** for
