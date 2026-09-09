@@ -13,8 +13,10 @@ Waves are ordered by dependency. Each wave ends green on
 - [x] **1.1** Add `GIT_BIN_ENV` and `git_bin()` to `porch-git`, and route the six
   `Command::new("git")` sites through it. *(FAULT-4.1, FAULT-4.2)*
 - [x] **1.2** Report the resolved git binary in `porch doctor`. *(FAULT-4.6)*
-- [x] **1.3** Unit-test that the override is honoured and that the default is `git`.
-  *(FAULT-4.1)*
+- [x] **1.3** Test that the override is honoured and that a missing override fails rather
+  than falling back to `PATH`. Done through `porch doctor` as a subprocess: edition 2024
+  makes `env::set_var` unsafe and the workspace forbids `unsafe_code`, so an in-process
+  test cannot set the variable at all. *(FAULT-4.1, FAULT-4.6)*
 
 ## Wave 2 — the ROAD-8 correction
 
@@ -56,6 +58,10 @@ Waves are ordered by dependency. Each wave ends green on
 - [x] **4.4** `refused_push_records_failure_and_leaves_origin_unchanged`. *(FAULT-2.7)*
 - [x] **4.5** `retry_after_reached_origin_adopts_the_pull_request`.
   *(FAULT-3.1, FAULT-3.2, FAULT-3.3)*
+  Following the printed remedy is what found that it did not work: the branch already
+  matches the gate ref, so a re-push reports everything up to date and starts no run.
+  `operator_note` now names `porch rerun` beside the re-push, and the scenario follows the
+  message rather than a path the test invented.
 - [x] **4.6** `two_restarts_leave_one_conclusion`. *(FAULT-3.4)*
 
 ## Wave 5 — the blocker tripwire
