@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -560,21 +561,68 @@ pub fn phase_view_for_run(db: &Db, run_id: &str) -> Result<Option<PhaseView>> {
     }))
 }
 
+/// Environment override for every RPC deadline (`DFAULT-1.8`).
+///
+/// An operator on a loaded machine can widen the deadlines; a test can narrow them.
+/// Either way the knob is a timeout configuration rather than a test-only switch that
+/// changes behaviour, which is what `FAULT-4.2` kept out of the product.
+pub const RPC_TIMEOUT_ENV: &str = "PORCH_RPC_TIMEOUT_MS";
+
+/// Read/write deadline for one daemon RPC.
+///
+/// A daemon stopped after `UnixListener::bind` leaves a bound socket with a listen
+/// backlog and no acceptor, so `connect` and `write` both succeed and the response read
+/// blocks forever. Every request/response call is therefore bounded (`DFAULT-1.1`).
+fn method_timeout(method: &str) -> Duration {
+    if let Some(ms) = std::env::var(RPC_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        return Duration::from_millis(ms);
+    }
+    match method {
+        // Answered from a literal without touching the database, so a `health` that
+        // does not answer at once is a wedged daemon, not a busy one (`DFAULT-1.3`).
+        "health" => Duration::from_secs(2),
+        // Joins a superseded run's executor thread before replying, so it is the one
+        // RPC that can be legitimately slow while the daemon is healthy (`DFAULT-1.4`).
+        "start_run" => Duration::from_secs(120),
+        _ => Duration::from_secs(15),
+    }
+}
+
+/// Classify an I/O failure that may be a deadline expiry.
+///
+/// `SO_RCVTIMEO` / `SO_SNDTIMEO` surface as `WouldBlock` on Linux and `TimedOut` on
+/// some other platforms; both mean the peer did not answer in time.
+fn classify_io(e: std::io::Error, method: &str, waited: Duration) -> crate::Error {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => crate::Error::RpcTimeout {
+            method: method.to_string(),
+            ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        },
+        _ => crate::Error::Io(e),
+    }
+}
+
 fn rpc_call(home: &Path, method: &str, params: Option<serde_json::Value>) -> Result<Response> {
+    let deadline = method_timeout(method);
     let mut stream = UnixStream::connect(socket_path(home))?;
+    stream.set_read_timeout(Some(deadline))?;
+    stream.set_write_timeout(Some(deadline))?;
     let req = Request {
         jsonrpc: "2.0".into(),
         method: method.into(),
         id: 1,
         params,
     };
-    writeln!(
-        stream,
-        "{}",
-        serde_json::to_string(&req).map_err(|e| crate::Error::Other(e.to_string()))?
-    )?;
+    let line = serde_json::to_string(&req).map_err(|e| crate::Error::Other(e.to_string()))?;
+    writeln!(stream, "{line}").map_err(|e| classify_io(e, method, deadline))?;
     let mut buf = String::new();
-    BufReader::new(&mut stream).read_line(&mut buf)?;
+    BufReader::new(&mut stream)
+        .read_line(&mut buf)
+        .map_err(|e| classify_io(e, method, deadline))?;
     serde_json::from_str(buf.trim()).map_err(|e| crate::Error::Other(e.to_string()))
 }
 
@@ -700,7 +748,10 @@ pub fn subscribe_events<F>(home: &Path, run_id: Option<&str>, mut on_event: F) -
 where
     F: FnMut(Event) -> bool,
 {
+    let ack_deadline = method_timeout("subscribe");
     let mut stream = UnixStream::connect(socket_path(home))?;
+    stream.set_read_timeout(Some(ack_deadline))?;
+    stream.set_write_timeout(Some(ack_deadline))?;
     let mut params = serde_json::Map::new();
     if let Some(run_id) = run_id {
         params.insert("run_id".into(), serde_json::Value::String(run_id.into()));
@@ -711,14 +762,14 @@ where
         id: 1,
         params: Some(serde_json::Value::Object(params)),
     };
-    writeln!(
-        stream,
-        "{}",
-        serde_json::to_string(&req).map_err(|e| crate::Error::Other(e.to_string()))?
-    )?;
+    let line = serde_json::to_string(&req).map_err(|e| crate::Error::Other(e.to_string()))?;
+    writeln!(stream, "{line}").map_err(|e| classify_io(e, "subscribe", ack_deadline))?;
     let mut reader = BufReader::new(stream);
     let mut buf = String::new();
-    if reader.read_line(&mut buf)? == 0 {
+    let read = reader
+        .read_line(&mut buf)
+        .map_err(|e| classify_io(e, "subscribe", ack_deadline))?;
+    if read == 0 {
         return Err(crate::Error::Other("subscribe: empty ack".into()));
     }
     let resp: Response =
@@ -736,6 +787,10 @@ where
             .unwrap_or("subscribe failed");
         return Err(crate::Error::Other(err.into()));
     }
+    // The event stream is long-lived and idles between events, kept alive by a
+    // server-side newline every 30s. A deadline here would break the TUI, so only the
+    // ack above is bounded (`DFAULT-1.7`).
+    reader.get_ref().set_read_timeout(None)?;
     loop {
         buf.clear();
         if reader.read_line(&mut buf)? == 0 {

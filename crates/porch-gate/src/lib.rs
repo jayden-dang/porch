@@ -3,6 +3,7 @@
 
 mod admit;
 mod audit;
+mod condition;
 mod custody;
 mod daemon;
 mod db;
@@ -26,6 +27,10 @@ pub use audit::{
     AuditInstance, AuditObservedIdentity, AuditPhase, AuditProducer, AuditReportedVersion,
     AuditRound, AuditStep, AuditText, AuditWatermark, RelatedOccurrenceGroup, build_audit,
 };
+pub use condition::{
+    BARRIER_RECONCILE_STALE, BARRIER_RECOVER_STALE, DaemonCondition, RefusalRecord, clear_refusal,
+    daemon_condition, read_refusal, record_refusal,
+};
 pub use custody::{finish_remove_worktree, pin_recovery_if_needed, recovery_ref_name};
 pub use daemon::{ensure_daemon, run_daemon, wait_for_health};
 pub use db::{Db, RepoRow, RunRow, StepResultRow, UncertifiedPipelineRange};
@@ -35,7 +40,7 @@ pub use events::{
 };
 pub use executor::RunExecutor;
 pub use home::{
-    db_path, lock_path, logs_dir, pid_path, porch_home, repos_dir, run_artifact_dir,
+    db_path, lock_path, logs_dir, pid_path, porch_home, refusal_path, repos_dir, run_artifact_dir,
     run_deliver_repair_dir, run_fixer_dir, run_review_dir, run_worktree_dir, socket_path,
     worktrees_dir,
 };
@@ -49,10 +54,10 @@ pub use proc::{
 pub use rpc::start_run as rpc_start_run;
 pub use rpc::{
     AssuranceRecord, AuditIdentity, FINDING_HUNK_MAX_BYTES, LegacyFindingDto, PhaseView,
-    RunSnapshot, StatusFindingDto, StepSnapshot, UnavailableAudit, clear_rounds_for_run,
-    compact_run_row, get_audit, get_finding_hunk, get_run, health_check, list_runs,
-    operator_failure_report, phase_view_for_run, resolve_run_assurance, round_for_decision,
-    subscribe_events, wire_phase_name,
+    RPC_TIMEOUT_ENV, RunSnapshot, StatusFindingDto, StepSnapshot, UnavailableAudit,
+    clear_rounds_for_run, compact_run_row, get_audit, get_finding_hunk, get_run, health_check,
+    list_runs, operator_failure_report, phase_view_for_run, resolve_run_assurance,
+    round_for_decision, subscribe_events, wire_phase_name,
 };
 pub use service::{
     ServicePaths, ServiceStatus, daemon_service_suffix, install_service, render_launchd_plist,
@@ -72,6 +77,11 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    /// The daemon accepted a connection and did not answer within the deadline.
+    /// Distinct from [`Error::Io`] so a wedged daemon is not reported as an absent
+    /// one (`DFAULT-1.5`).
+    #[error("daemon accepted the connection but did not answer {method} within {ms}ms")]
+    RpcTimeout { method: String, ms: u64 },
     #[error("{0}")]
     Other(String),
 }
