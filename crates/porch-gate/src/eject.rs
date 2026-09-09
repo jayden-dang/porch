@@ -198,35 +198,34 @@ mod tests {
     use crate::init;
     use tempfile::TempDir;
 
+    /// A git invocation that cannot see the ambient user or system configuration.
+    ///
+    /// Signing is the expensive one: with `commit.gpgsign` set on the host, each
+    /// `commit` here calls the operator's signing helper, which turns a 0.2 s
+    /// module into an intermittent 20 s one.
+    fn git(work: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed in {}", work.display());
+    }
+
     fn git_repo() -> (TempDir, PathBuf) {
         let tmp = TempDir::new().unwrap();
         let work = tmp.path().canonicalize().unwrap();
-        std::process::Command::new("git")
-            .current_dir(&work)
-            .args(["init", "-b", "main"])
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .current_dir(&work)
-            .args(["config", "user.email", "porch@example.com"])
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .current_dir(&work)
-            .args(["config", "user.name", "Porch"])
-            .status()
-            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "porch@example.com"]);
+        git(&work, &["config", "user.name", "Porch"]);
         std::fs::write(work.join("README"), "hi\n").unwrap();
-        std::process::Command::new("git")
-            .current_dir(&work)
-            .args(["add", "README"])
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .current_dir(&work)
-            .args(["commit", "-m", "init"])
-            .status()
-            .unwrap();
+        git(&work, &["add", "README"]);
+        git(&work, &["commit", "-m", "init"]);
         (tmp, work)
     }
 

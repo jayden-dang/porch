@@ -109,11 +109,18 @@ Waves are ordered by dependency. Each wave ends green on
   obvious bug: a remote that requires signed commits would reject an unsigned
   correction commit, so this is a trade-off with an owner rather than a fix. Recorded
   here, alongside the wedge-state work, rather than decided in a coding session.
-- **F.8** Test fixtures inherit ambient git configuration. Only
-  `crates/porch/tests/m23_forward_fault.rs` and this wave's
-  `crates/porch-gate/tests/m24_escape.rs` isolate it. Commit signing is the expensive
-  one: with `commit.gpgsign = true` on the host, this wave's fixture went from a stable
-  220 ms to an intermittent 30 s stall inside `git rebase`, waiting on the signing
-  helper. That is a plausible cause of the suite's long-standing load-sensitive flakes.
-  Making every fixture hermetic is a cross-cutting change to roughly twenty test files
-  and belongs on its own, not inside a feature wave.
+- **F.8** Test fixtures inherit ambient git configuration, and commit signing is the
+  expensive one. With `commit.gpgsign = true` on the host, every `git commit` and
+  `git rebase` in a fixture calls the operator's signing helper, which stalls. Measured
+  on this wave: the new integration fixture went from a stable 220 ms to an intermittent
+  30 s stall inside `git rebase`, and `porch-gate --lib` swung between 0.19 s and 21.8 s
+  across five runs. Isolating the two fixtures this wave touches — `m24_escape.rs` and
+  `eject.rs`'s test module — put `porch-gate --lib` at 0.19–0.20 s across six
+  consecutive runs with no stalls, and the daemon test that had been the target's
+  standing flake stopped failing.
+
+  That is strong evidence the suite's long-standing load-sensitive flakes are largely
+  this: a five-second `wait_for_health` starved by a concurrent signing stall looks
+  exactly like a load flake. Only `crates/porch/tests/m23_forward_fault.rs` isolated git
+  config before this wave. Doing it everywhere is a cross-cutting change to roughly
+  twenty test files and belongs on its own rather than inside a feature wave.
