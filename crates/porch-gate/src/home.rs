@@ -35,6 +35,15 @@ pub fn pid_path(home: &std::path::Path) -> PathBuf {
     home.join("daemon.pid")
 }
 
+/// Path of the durable record that the daemon refused to start.
+///
+/// Deliberately not under `logs/`: every spawn truncates `logs/daemon.log`, which is
+/// what made a refusal cause vanish on the operator's first retry (`DFAULT-2.2`).
+#[must_use]
+pub fn refusal_path(home: &std::path::Path) -> PathBuf {
+    home.join("daemon.refusal.json")
+}
+
 /// Path of the `SQLite` state database.
 #[must_use]
 pub fn db_path(home: &std::path::Path) -> PathBuf {
