@@ -132,8 +132,8 @@ requirements and reopened as a MILE-3 blocker.
 
 - [x] Test: a descendant of the approved SHA stays forwardable, documenting the tolerance.
 
-_Requirements: FWDAUTH-1.4, FWDAUTH-1.5, FWDAUTH-1.7, FWDAUTH-1.8, FWDAUTH-7.1, FWDAUTH-7.4_
-_Blocked: FWDAUTH-1.1, FWDAUTH-1.2, FWDAUTH-1.3, FWDAUTH-1.6_
+_Requirements: FWDAUTH-1.5, FWDAUTH-1.7, FWDAUTH-1.8, FWDAUTH-7.1, FWDAUTH-7.4_
+_Blocked: FWDAUTH-1.1, FWDAUTH-1.2, FWDAUTH-1.3, FWDAUTH-1.4, FWDAUTH-1.6_
 
 ## Task 3: The lease splits so intent precedes the mutation
 
@@ -178,7 +178,7 @@ still belongs with ROAD-9's fault-injection suite, which is where crash-window c
 was scheduled — but that is now a scheduling choice, not a consequence of a broken
 harness.
 
-_Requirements: FWDAUTH-1.4, FWDAUTH-2.1, FWDAUTH-2.3, FWDAUTH-2.4, FWDAUTH-2.6, FWDAUTH-3.1, FWDAUTH-3.2, FWDAUTH-3.4, FWDAUTH-3.5, FWDAUTH-3.7, FWDAUTH-6.1, FWDAUTH-7.2, FWDAUTH-7.3, FWDAUTH-7.6_
+_Requirements: FWDAUTH-2.1, FWDAUTH-2.3, FWDAUTH-2.4, FWDAUTH-2.6, FWDAUTH-3.1, FWDAUTH-3.2, FWDAUTH-3.4, FWDAUTH-3.5, FWDAUTH-3.7, FWDAUTH-6.1, FWDAUTH-7.2, FWDAUTH-7.3, FWDAUTH-7.6_
 
 ## Task 4: The upgrade is documented and the suite is green
 

@@ -258,9 +258,10 @@ Implementing it showed the branch is load-bearing rather than dead: certify's ow
 correction commit advances HEAD after review approved and without revoking the approval
 (`crates/porch-run/src/certify.rs`), so equality fails closed on every run whose
 formatter rewrites the tree. The revoke-and-rereview route at `:1638`-`:1696` is
-therefore *not* the only way a moved HEAD reaches the forward. `FWDAUTH-1.6` is blocked
-on the reopened MILE-3 blocker, and `authorized_forward_sha` returns the live HEAD once
-it has confirmed the approval exists and HEAD descends from it.
+therefore *not* the only way a moved HEAD reaches the forward. `FWDAUTH-1.4` and
+`FWDAUTH-1.6` are blocked on the reopened MILE-3 blocker, and `authorized_forward_sha`
+returns the live HEAD once it has confirmed the approval exists and HEAD descends
+from it.
 
 Respects: ARCH-13
 
