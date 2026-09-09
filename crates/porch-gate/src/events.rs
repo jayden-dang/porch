@@ -187,6 +187,24 @@ pub fn event_hub() -> Option<Arc<EventHub>> {
     INSTALLED.lock().expect("event hub install").clone()
 }
 
+/// Serializes tests that install or clear the process-wide hub.
+///
+/// `INSTALLED` is one global per process and unit tests share a process, so a
+/// test that clears it races every test that depends on it having been installed.
+/// That surfaced as a ~10% failure rate in
+/// `daemon::tests::health_list_get_subscribe_with_thread_per_connection`, which
+/// looked load-sensitive — under load the interleaving is likelier — but is a
+/// test-isolation defect: removing the clearing test alone took the same 40-run
+/// loop from four failures to zero.
+///
+/// Any test that installs, clears, or relies on the global hub must hold this.
+#[cfg(test)]
+pub(crate) fn global_hub_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Live subscription; unregisters on drop.
 pub struct Subscriber {
     pub(crate) id: u64,
@@ -368,6 +386,7 @@ mod tests {
 
     #[test]
     fn install_and_clear_global_hub() {
+        let _serialized = crate::events::global_hub_test_lock();
         clear_event_hub();
         assert!(event_hub().is_none());
         let hub = Arc::new(EventHub::new());

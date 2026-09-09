@@ -407,6 +407,10 @@ mod tests {
 
     #[test]
     fn health_list_get_subscribe_with_thread_per_connection() {
+        // `run_daemon` installs the process-wide event hub and clears it on the way
+        // out, and this test reads that global. Held for the whole test so the
+        // clearing test in `events` cannot interleave.
+        let _serialized = crate::events::global_hub_test_lock();
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(&home).unwrap();

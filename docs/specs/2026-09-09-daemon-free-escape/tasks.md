@@ -119,8 +119,21 @@ Waves are ordered by dependency. Each wave ends green on
   consecutive runs with no stalls, and the daemon test that had been the target's
   standing flake stopped failing.
 
-  That is strong evidence the suite's long-standing load-sensitive flakes are largely
-  this: a five-second `wait_for_health` starved by a concurrent signing stall looks
-  exactly like a load flake. Only `crates/porch/tests/m23_forward_fault.rs` isolated git
-  config before this wave. Doing it everywhere is a cross-cutting change to roughly
-  twenty test files and belongs on its own rather than inside a feature wave.
+  Only `crates/porch/tests/m23_forward_fault.rs` isolated git config before this wave.
+  Doing it everywhere is a cross-cutting change to roughly twenty test files and belongs
+  on its own rather than inside a feature wave.
+
+## Fixed along the way, not part of the feature
+
+- `daemon::tests::health_list_get_subscribe_with_thread_per_connection` was **not** a
+  load-sensitive flake, though it had been recorded as one across several changes. The
+  process-wide event hub is a single global, unit tests share a process, and
+  `events::tests::install_and_clear_global_hub` clears that global while the daemon test
+  depends on it having been installed — so the daemon test's
+  `event_hub().expect("hub installed")` panics. Under load the interleaving is likelier,
+  which is what made it look like load.
+
+  Measured on a loop of the compiled lib target: 4 failures in 40 runs; 0 in 40 with only
+  the clearing test skipped; 0 in 80 once both tests serialize on a shared test lock.
+  Fixing it matters beyond the flake itself, because while it stood, every "the suite is
+  green apart from a known flake" claim in this repo was unfalsifiable.
