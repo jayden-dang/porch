@@ -371,8 +371,15 @@ pull request call and for one after it and before `pr_url` is stored is
 identical, so porch may state that pull request state is *unrecorded* and never
 that a pull request is absent. A later conclusion about a terminal run's attempt
 is an append, not a reclassification — the run's outcome is never rewritten.
+Scoped to **interrupted** attempts, and interruption means the absence of a
+`terminal` phase event on the `deliver` **Phase attempt** — not the run's status,
+which a writer-protocol upgrade rewrites before recovery runs. An attempt that
+reached a terminal event reported its own error and is never reconciled, so a
+post-push verification failure is not handed a `reached_origin` conclusion its own
+error contradicts.
 _Avoid_: "recovery" for this step; asserting a pull request does not exist;
-`push_failed` as evidence that `origin` is unchanged.
+`push_failed` as evidence that `origin` is unchanged; `runs.status` as the test of
+whether a forward was interrupted.
 
 **Forward verdict**:
 One reconciliation conclusion — `not_attempted`, `reached_origin`, or
