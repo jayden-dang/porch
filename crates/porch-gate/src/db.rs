@@ -897,22 +897,33 @@ impl Db {
     pub fn delete_repo(&self, repo_id: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex");
         let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM step_results WHERE run_id IN (SELECT id FROM runs WHERE repo_id = ?1)",
-            rusqlite::params![repo_id],
-        )?;
-        tx.execute(
-            "DELETE FROM uncertified_pipeline_ranges WHERE repo_id = ?1",
-            rusqlite::params![repo_id],
-        )?;
-        tx.execute(
-            "DELETE FROM runs WHERE repo_id = ?1",
-            rusqlite::params![repo_id],
-        )?;
-        tx.execute(
-            "DELETE FROM repos WHERE id = ?1",
-            rusqlite::params![repo_id],
-        )?;
+        // Only `review_rounds` declares `ON DELETE CASCADE` on `runs(id)`; the five
+        // tables added since M18 declare a plain reference, so deleting `runs` alone
+        // violates an immediate foreign key on any repo that ran a gate pass
+        // (`ESCAPE-3.1`). Ordering the deletes is not sufficient on its own:
+        // `authority_events` and `phase_attempts` reference themselves, and
+        // `authority_event_members` references `finding_instances`, which is only
+        // reachable by cascade from `review_rounds`. Defer enforcement to COMMIT so
+        // the check sees the final state — a genuine dangling reference still fails.
+        tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+        let of_this_repo = "SELECT id FROM runs WHERE repo_id = ?1";
+        for sql in [
+            format!(
+                "DELETE FROM authority_event_members WHERE event_id IN
+                 (SELECT id FROM authority_events WHERE run_id IN ({of_this_repo}))"
+            ),
+            format!("DELETE FROM forward_reconciliations WHERE run_id IN ({of_this_repo})"),
+            format!("DELETE FROM forward_records WHERE run_id IN ({of_this_repo})"),
+            format!("DELETE FROM phase_events WHERE run_id IN ({of_this_repo})"),
+            format!("DELETE FROM authority_events WHERE run_id IN ({of_this_repo})"),
+            format!("DELETE FROM phase_attempts WHERE run_id IN ({of_this_repo})"),
+            format!("DELETE FROM step_results WHERE run_id IN ({of_this_repo})"),
+            "DELETE FROM uncertified_pipeline_ranges WHERE repo_id = ?1".to_string(),
+            "DELETE FROM runs WHERE repo_id = ?1".to_string(),
+            "DELETE FROM repos WHERE id = ?1".to_string(),
+        ] {
+            tx.execute(&sql, rusqlite::params![repo_id])?;
+        }
         tx.commit()?;
         Ok(())
     }

@@ -7,10 +7,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use porch_gate::{
-    AuditAttempt, AuditDocument, AuditObservedIdentity, AuditText, EjectOptions, InitOptions,
-    admit_push, eject, ensure_daemon, get_audit, get_run, git_dir_from_env, health_check, init,
-    install_service, list_runs, notify_push, porch_home, repo_id_for, run_daemon, service_status,
-    start_service, stop_daemon, uninstall_service,
+    AuditAttempt, AuditDocument, AuditObservedIdentity, AuditText, EjectOptions, GateState,
+    InitOptions, admit_push, eject, ensure_daemon, get_audit, get_run, git_dir_from_env,
+    health_check, init, install_service, list_runs, notify_push, porch_home, repo_id_for,
+    run_daemon, service_status, start_service, stop_daemon, uninstall_service,
 };
 use porch_run::{
     AgentCliResult, AgentResponse, AgentRunOpts, PipelineExecutor, agent_respond, agent_run,
@@ -548,14 +548,25 @@ fn run_eject(purge: bool) -> Result<ExitCode> {
         result.repo_id,
         result.bare_path.display()
     );
-    if result.purged {
-        println!(
-            "purged this repo's bare, worktrees, run artifacts, and DB row under {}",
-            home.display()
-        );
-        println!("other repos under PORCH_HOME were not touched");
-    } else {
-        println!("PORCH_HOME left intact (use --purge to remove this repo's gate state)");
+    match &result.gate_state {
+        GateState::Purged => {
+            println!(
+                "purged this repo's bare, worktrees, run artifacts, and DB rows under {}",
+                home.display()
+            );
+            println!("other repos under PORCH_HOME were not touched");
+        }
+        GateState::Preserved => {
+            println!("PORCH_HOME left intact (use --purge to remove this repo's gate state)");
+        }
+        GateState::LeftBehind(reason) => {
+            println!("detached, but this repo's gate state was left behind: {reason}");
+            println!(
+                "gate state remains at {} — retry `porch eject --purge` once the cause is cleared",
+                result.bare_path.display()
+            );
+            return Ok(ExitCode::FAILURE);
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -3,6 +3,7 @@
 
 mod admit;
 mod audit;
+mod custody;
 mod daemon;
 mod db;
 mod eject;
@@ -25,9 +26,10 @@ pub use audit::{
     AuditInstance, AuditObservedIdentity, AuditPhase, AuditProducer, AuditReportedVersion,
     AuditRound, AuditStep, AuditText, AuditWatermark, RelatedOccurrenceGroup, build_audit,
 };
+pub use custody::{finish_remove_worktree, pin_recovery_if_needed, recovery_ref_name};
 pub use daemon::{ensure_daemon, run_daemon, wait_for_health};
 pub use db::{Db, RepoRow, RunRow, StepResultRow, UncertifiedPipelineRange};
-pub use eject::{EjectOptions, EjectResult, eject};
+pub use eject::{EjectOptions, EjectResult, GateState, eject};
 pub use events::{
     Event, EventHub, MAILBOX_CAP, Subscriber, clear_event_hub, event_hub, install_event_hub,
 };

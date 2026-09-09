@@ -18,12 +18,27 @@ pub struct EjectOptions<'a> {
     pub purge: bool,
 }
 
+/// What eject did to this repo's gate state under `$PORCH_HOME`.
+///
+/// Named so that the operator is never told state was removed when it was not
+/// (`ESCAPE-4.1`, `ESCAPE-4.3`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateState {
+    /// Deliberately kept: eject without `--purge`.
+    Preserved,
+    /// This repo's bare, worktrees, run artifacts, and rows are gone.
+    Purged,
+    /// Detach succeeded, but gate state could not be removed. Carries the reason.
+    LeftBehind(String),
+}
+
 /// Result of a successful eject.
 #[derive(Debug, Clone)]
 pub struct EjectResult {
     pub repo_id: String,
     pub bare_path: PathBuf,
     pub purged: bool,
+    pub gate_state: GateState,
 }
 
 /// Remove the `porch` remote and neutralize bare hooks.
@@ -32,47 +47,90 @@ pub struct EjectResult {
 /// With `purge`: deletes **this** repo's bare, worktrees, per-run artifacts, and
 /// DB rows only — other repos under the same home are untouched.
 ///
+/// Detach never opens the database (`ESCAPE-2.1`). `Db::open` migrates, raises
+/// `min_writer_protocol`, and refuses a binary older than the state root, so
+/// requiring it here made the escape hatch inherit every failure of the state the
+/// operator is escaping. The bare path is derived from the home layout instead of
+/// read from the row (`ESCAPE-2.2`), and a database that cannot be opened downgrades
+/// purge to a reported `LeftBehind` rather than failing the detach (`ESCAPE-2.3`).
+///
 /// # Errors
 ///
-/// Returns an error when the work tree is not a porch-initialized clone, git
-/// remote removal fails hard, or purge cleanup cannot open the database.
+/// Returns an error only when this checkout cannot be identified as a porch clone
+/// at all — no `porch.repo-id` and no `porch` remote to derive one from.
 pub fn eject(opts: EjectOptions<'_>) -> Result<EjectResult> {
     let work = opts.work_tree.canonicalize()?;
     let porch_home = opts
         .porch_home
         .canonicalize()
         .unwrap_or_else(|_| opts.porch_home.to_path_buf());
-    let repo_id = existing_repo_id(&work)?.ok_or_else(|| {
-        crate::Error::Other(format!(
-            "not initialized (no porch.repo-id); run `porch init` first ({})",
-            work.display()
-        ))
-    })?;
+    let repo_id = resolve_repo_id(&work)?;
+    let bare_path = crate::home::repos_dir(&porch_home).join(format!("{repo_id}.git"));
 
-    let db = Db::open(&db_path(&porch_home))?;
-    let repo = db.repo_by_id(&repo_id)?.ok_or_else(|| {
-        crate::Error::Other(format!(
-            "repo {repo_id} not in porch database under {}",
-            porch_home.display()
-        ))
-    })?;
-    let bare_path = repo.bare_path.clone();
-
-    // Remote removal is best-effort when already gone.
+    // Remote removal is best-effort when already gone, which is what makes a
+    // retry after an interrupted eject succeed rather than report "not
+    // initialized" (`ESCAPE-2.5`).
     let _ = porch_git::run_c(&work, &["remote", "remove", "porch"]);
     let _ = porch_git::run_c(&work, &["config", "--unset", "porch.repo-id"]);
 
     neutralize_bare_hooks(&bare_path);
 
-    if opts.purge {
-        purge_repo_state(&db, &porch_home, &repo_id, &bare_path)?;
-    }
+    let gate_state = if opts.purge {
+        purge_or_report(&porch_home, &repo_id, &bare_path)
+    } else {
+        GateState::Preserved
+    };
 
     Ok(EjectResult {
         repo_id,
         bare_path,
-        purged: opts.purge,
+        purged: gate_state == GateState::Purged,
+        gate_state,
     })
+}
+
+/// This repo's porch id, from `porch.repo-id` or from the `porch` remote's path.
+///
+/// An eject interrupted after the config unset leaves the remote in place. Falling
+/// back to the remote is what lets the operator retry instead of hand-editing git
+/// config to get past "not initialized" (`ESCAPE-2.4`).
+fn resolve_repo_id(work: &Path) -> Result<String> {
+    if let Some(id) = existing_repo_id(work)? {
+        return Ok(id);
+    }
+    if let Some(id) = repo_id_from_remote(work) {
+        return Ok(id);
+    }
+    Err(crate::Error::Other(format!(
+        "not a porch clone: no porch.repo-id and no `porch` remote ({})",
+        work.display()
+    )))
+}
+
+/// Recover the repo id from the `porch` remote URL: `.../repos/<repo_id>.git`.
+fn repo_id_from_remote(work: &Path) -> Option<String> {
+    let out = porch_git::run_c(work, &["remote", "get-url", "porch"]).ok()?;
+    let url = porch_git::stdout_trim(&out);
+    let name = Path::new(&url).file_name()?.to_str()?;
+    let id = name.strip_suffix(".git")?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Purge this repo's gate state, or say why it was left behind.
+///
+/// Detach has already happened by this point and must not be undone, so every
+/// failure here is reported rather than propagated (`ESCAPE-2.3`).
+fn purge_or_report(porch_home: &Path, repo_id: &str, bare_path: &Path) -> GateState {
+    let db = match Db::open(&db_path(porch_home)) {
+        Ok(db) => db,
+        Err(e) => {
+            return GateState::LeftBehind(format!("porch database could not be opened: {e}"));
+        }
+    };
+    match purge_repo_state(&db, porch_home, repo_id, bare_path) {
+        Ok(()) => GateState::Purged,
+        Err(e) => GateState::LeftBehind(format!("gate state could not be removed: {e}")),
+    }
 }
 
 fn neutralize_bare_hooks(bare: &Path) {
@@ -85,8 +143,16 @@ fn neutralize_bare_hooks(bare: &Path) {
     }
 }
 
+/// Delete this repo's rows, then its files.
+///
+/// The row deletion is transactional and is the only step that can fail, so it runs
+/// before anything is destroyed on disk: a purge that cannot complete leaves the
+/// bare, the worktrees, and the run artifacts intact (`ESCAPE-3.3`, `ESCAPE-3.4`).
 fn purge_repo_state(db: &Db, home: &Path, repo_id: &str, bare: &Path) -> Result<()> {
     let runs = db.runs_for_repo(repo_id)?;
+
+    db.delete_repo(repo_id)?;
+
     for run in &runs {
         if let Some(wt) = run.worktree_dir.as_ref() {
             if let Ok(g) = GitDir::new(bare) {
@@ -94,15 +160,11 @@ fn purge_repo_state(db: &Db, home: &Path, repo_id: &str, bare: &Path) -> Result<
             }
             let _ = std::fs::remove_dir_all(wt);
         }
-        let art = run_artifact_dir(home, &run.id);
-        let _ = std::fs::remove_dir_all(art);
+        let _ = std::fs::remove_dir_all(run_artifact_dir(home, &run.id));
     }
 
     let wt_root = worktrees_dir(home).join(repo_id);
     let _ = std::fs::remove_dir_all(&wt_root);
-
-    // Commit row deletion before removing porch-owned refs / the bare.
-    db.delete_repo(repo_id)?;
 
     if let Ok(g) = GitDir::new(bare) {
         let _ = crate::rounds::retention::sweep_unreferenced(&g, db);
@@ -136,35 +198,34 @@ mod tests {
     use crate::init;
     use tempfile::TempDir;
 
+    /// A git invocation that cannot see the ambient user or system configuration.
+    ///
+    /// Signing is the expensive one: with `commit.gpgsign` set on the host, each
+    /// `commit` here calls the operator's signing helper, which turns a 0.2 s
+    /// module into an intermittent 20 s one.
+    fn git(work: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(work)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed in {}", work.display());
+    }
+
     fn git_repo() -> (TempDir, PathBuf) {
         let tmp = TempDir::new().unwrap();
         let work = tmp.path().canonicalize().unwrap();
-        std::process::Command::new("git")
-            .current_dir(&work)
-            .args(["init", "-b", "main"])
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .current_dir(&work)
-            .args(["config", "user.email", "porch@example.com"])
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .current_dir(&work)
-            .args(["config", "user.name", "Porch"])
-            .status()
-            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "porch@example.com"]);
+        git(&work, &["config", "user.name", "Porch"]);
         std::fs::write(work.join("README"), "hi\n").unwrap();
-        std::process::Command::new("git")
-            .current_dir(&work)
-            .args(["add", "README"])
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .current_dir(&work)
-            .args(["commit", "-m", "init"])
-            .status()
-            .unwrap();
+        git(&work, &["add", "README"]);
+        git(&work, &["commit", "-m", "init"]);
         (tmp, work)
     }
 
@@ -249,5 +310,129 @@ mod tests {
         );
         let db = Db::open(&db_path(&home_path)).unwrap();
         assert!(db.repo_by_id(&result.repo_id).unwrap().is_none());
+    }
+
+    /// Detach works with no database at all.
+    ///
+    /// `Db::open` migrates, raises `min_writer_protocol`, and refuses a binary
+    /// older than the state root, so requiring it made the escape hatch inherit
+    /// every failure of the state being escaped (`ESCAPE-2.1`, `ESCAPE-2.3`).
+    #[test]
+    fn detach_succeeds_without_a_database() {
+        let (_keep, work) = git_repo();
+        let home = TempDir::new().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let result = init(InitOptions {
+            work_tree: &work,
+            porch_home: &home_path,
+            porch_bin: &dummy_bin(&work),
+            start_daemon: false,
+        })
+        .unwrap();
+        std::fs::remove_file(db_path(&home_path)).unwrap();
+
+        let ejected = eject(EjectOptions {
+            work_tree: &work,
+            porch_home: &home_path,
+            purge: false,
+        })
+        .expect("detach must not depend on the database");
+
+        assert_eq!(ejected.repo_id, result.repo_id);
+        assert_eq!(ejected.gate_state, GateState::Preserved);
+        assert_eq!(ejected.bare_path, result.bare_path);
+        let hook = std::fs::read_to_string(result.bare_path.join("hooks/post-receive")).unwrap();
+        assert!(hook.contains("ejected"), "hooks neutralized without the db");
+        let remotes = std::process::Command::new("git")
+            .current_dir(&work)
+            .args(["remote"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&remotes.stdout)
+                .lines()
+                .any(|l| l.trim() == "porch")
+        );
+    }
+
+    /// An unpurgeable state root is reported, not propagated as a detach failure.
+    #[test]
+    fn purge_that_cannot_open_the_database_is_reported_and_leaves_the_bare() {
+        let (_keep, work) = git_repo();
+        let home = TempDir::new().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let result = init(InitOptions {
+            work_tree: &work,
+            porch_home: &home_path,
+            porch_bin: &dummy_bin(&work),
+            start_daemon: false,
+        })
+        .unwrap();
+        // A directory where the database file belongs: open fails, nothing else does.
+        std::fs::remove_file(db_path(&home_path)).unwrap();
+        std::fs::create_dir(db_path(&home_path)).unwrap();
+
+        let ejected = eject(EjectOptions {
+            work_tree: &work,
+            porch_home: &home_path,
+            purge: true,
+        })
+        .expect("detach still succeeds");
+
+        assert!(!ejected.purged, "must not claim a purge it did not perform");
+        match &ejected.gate_state {
+            GateState::LeftBehind(reason) => {
+                assert!(
+                    reason.contains("database"),
+                    "reason names the cause: {reason}"
+                );
+            }
+            other => panic!("expected LeftBehind, got {other:?}"),
+        }
+        assert!(result.bare_path.is_dir(), "bare survives a failed purge");
+    }
+
+    /// An eject interrupted after the config unset is retryable.
+    ///
+    /// The repo id comes back from the `porch` remote's URL, so the operator is not
+    /// told the checkout was never initialized (`ESCAPE-2.4`, `ESCAPE-2.5`).
+    #[test]
+    fn detach_resumes_after_an_interrupted_eject_and_is_idempotent() {
+        let (_keep, work) = git_repo();
+        let home = TempDir::new().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let result = init(InitOptions {
+            work_tree: &work,
+            porch_home: &home_path,
+            porch_bin: &dummy_bin(&work),
+            start_daemon: false,
+        })
+        .unwrap();
+        // The residue of an eject that died between its first two steps.
+        let _ = porch_git::run_c(&work, &["config", "--unset", "porch.repo-id"]);
+
+        let resumed = eject(EjectOptions {
+            work_tree: &work,
+            porch_home: &home_path,
+            purge: false,
+        })
+        .expect("a retry must not report `not initialized`");
+        assert_eq!(resumed.repo_id, result.repo_id);
+
+        // Fully detached now: neither the config nor the remote remains.
+        let again = eject(EjectOptions {
+            work_tree: &work,
+            porch_home: &home_path,
+            purge: false,
+        });
+        assert!(
+            again.is_err(),
+            "a checkout with no porch marks at all is not a porch clone"
+        );
+        let msg = again.unwrap_err().to_string();
+        assert!(
+            msg.contains("not a porch clone"),
+            "the message must not send the operator to `porch init`: {msg}"
+        );
     }
 }

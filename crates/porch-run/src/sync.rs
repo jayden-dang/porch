@@ -15,9 +15,12 @@ enum SyncErr {
 }
 
 /// Recovery ref under the bare: `refs/porch/recover/<run_id>`.
+///
+/// Custody of porch-authored commits is owned by `porch-gate`, so that the pin and
+/// the worktree removal it guards cannot drift apart (`ESCAPE-1.5`).
 #[must_use]
 pub fn recovery_ref_name(run_id: &str) -> String {
-    format!("refs/porch/recover/{run_id}")
+    porch_gate::recovery_ref_name(run_id)
 }
 
 /// JSON document for `porch agent sync`.
@@ -289,28 +292,6 @@ pub fn sync_hint_for(home: &Path, work_tree: &Path) -> Option<String> {
         Some(format!("pipeline ahead of local — {}", status.fetch_hint))
     } else {
         None
-    }
-}
-
-/// Pin unpublished pipeline commits under `refs/porch/recover/<run>` on the bare.
-///
-/// No-op when HEAD equals the submitted SHA or is not a descendant.
-pub(crate) fn pin_recovery_if_needed(bare: &GitDir, run: &RunRow, wt: &Path) -> Result<(), String> {
-    if !wt.exists() {
-        return Ok(());
-    }
-    let head = porch_git::rev_parse_c(wt, "HEAD").map_err(|e| e.to_string())?;
-    if head == run.sha {
-        return Ok(());
-    }
-    match porch_git::is_ancestor(wt, &run.sha, &head) {
-        Ok(true) => {
-            let name = recovery_ref_name(&run.id);
-            porch_git::update_ref(bare, &name, &head).map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        Ok(false) => Ok(()),
-        Err(e) => Err(e.to_string()),
     }
 }
 

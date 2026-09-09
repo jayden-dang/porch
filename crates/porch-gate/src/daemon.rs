@@ -278,7 +278,7 @@ fn start_run(
 
     let prior = db.in_flight_same_branch(&run.repo_id, &run.branch, run_id)?;
     let mut wait_for: Vec<JoinHandle<()>> = Vec::new();
-    let mut orphan_worktrees: Vec<(String, PathBuf)> = Vec::new();
+    let mut orphan_worktrees: Vec<(crate::db::RunRow, PathBuf)> = Vec::new();
     {
         let mut guard = state.lock().expect("daemon state");
         for old in &prior {
@@ -292,20 +292,27 @@ fn start_run(
                 wait_for.push(inf.handle);
             } else if let Some(wt) = old.worktree_dir.clone() {
                 // Parked runs have no inflight handle; sweep their worktrees.
-                orphan_worktrees.push((old.repo_id.clone(), wt));
+                orphan_worktrees.push((old.clone(), wt));
             }
         }
     }
     for handle in wait_for {
         let _ = handle.join();
     }
-    for (repo_id, wt) in orphan_worktrees {
-        if let Ok(Some(repo)) = db.repo_by_id(&repo_id) {
-            if let Ok(bare) = porch_git::GitDir::new(&repo.bare_path) {
-                let _ = porch_git::worktree_remove_force(&bare, &wt);
+    // A parked run holds fixer commits in its worktree. Pin before sweeping, or a
+    // second push to the same branch destroys them (`ESCAPE-1.4`).
+    for (old, wt) in orphan_worktrees {
+        match db.repo_by_id(&old.repo_id) {
+            Ok(Some(repo)) => match porch_git::GitDir::new(&repo.bare_path) {
+                Ok(bare) => crate::custody::finish_remove_worktree(&bare, &old, &wt),
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(&wt);
+                }
+            },
+            _ => {
+                let _ = std::fs::remove_dir_all(&wt);
             }
         }
-        let _ = std::fs::remove_dir_all(&wt);
     }
 
     // Re-check: may have been cancelled by a newer start_run while we waited.
@@ -400,6 +407,10 @@ mod tests {
 
     #[test]
     fn health_list_get_subscribe_with_thread_per_connection() {
+        // `run_daemon` installs the process-wide event hub and clears it on the way
+        // out, and this test reads that global. Held for the whole test so the
+        // clearing test in `events` cannot interleave.
+        let _serialized = crate::events::global_hub_test_lock();
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(&home).unwrap();
