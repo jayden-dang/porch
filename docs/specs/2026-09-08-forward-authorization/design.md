@@ -252,10 +252,15 @@ Respects: ARCH-1, ARCH-5, ARCH-13
 
 ### `crates/porch-run/src/lib.rs`
 
-`assert_head_continuity` drops the `is_ancestor` branch and reports both SHAs on
-mismatch. Nothing else in the file changes: the repair loop's revoke-and-rereview
-(`:1638`-`:1696`) is already the only route by which a moved HEAD becomes forwardable,
-which is exactly what `FWDAUTH-1.6` and `FWDAUTH-7.4` require.
+`assert_head_continuity` was to drop the `is_ancestor` branch and report both SHAs on
+mismatch. **That change was made, then reverted, and the file keeps the branch.**
+Implementing it showed the branch is load-bearing rather than dead: certify's own
+correction commit advances HEAD after review approved and without revoking the approval
+(`crates/porch-run/src/certify.rs`), so equality fails closed on every run whose
+formatter rewrites the tree. The revoke-and-rereview route at `:1638`-`:1696` is
+therefore *not* the only way a moved HEAD reaches the forward. `FWDAUTH-1.6` is blocked
+on the reopened MILE-3 blocker, and `authorized_forward_sha` returns the live HEAD once
+it has confirmed the approval exists and HEAD descends from it.
 
 Respects: ARCH-13
 

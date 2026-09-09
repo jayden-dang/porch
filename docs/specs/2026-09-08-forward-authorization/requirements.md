@@ -77,6 +77,13 @@ before it pushes, so that a crash cannot hide an attempt from the record.
 - **FWDAUTH-2.6** WHEN a forward is refused before any external mutation, on an
   unincorporated remote tip or an unverifiable safety fact, THE SYSTEM SHALL NOT
   append a forward-intent record for that refusal.
+- **FWDAUTH-2.7** THE SYSTEM SHALL allow a `deliver` phase attempt to hold an ordered
+  sequence of forward attempts, and SHALL identify each forward record by its position
+  in that sequence, because the deliver-repair loop re-enters the forward under the same
+  attempt when a repair leaves HEAD unmoved.
+- **FWDAUTH-2.8** WHILE a forward attempt has an intent record and no outcome record
+  THE SYSTEM SHALL refuse to open a further forward attempt on that `deliver` attempt,
+  so that at most one forward is in flight at a time.
 
 ## 3. The forward outcome is durable before the PR call
 

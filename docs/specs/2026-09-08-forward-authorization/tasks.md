@@ -16,7 +16,8 @@ module, keyed to the owning `deliver` phase attempt, written through a small
 `phase_events` appenders. In `porch-run`, the lease splits into observe-and-decide then
 execute so the intent row commits after the tip observation and before the mutation, and
 the outcome row commits from porch's own command result ahead of the post-push
-verification. `assert_head_continuity` becomes exact equality.
+verification. `assert_head_continuity` was to become exact equality; that half is
+blocked (see Task 2) and the tolerance stays.
 
 **Tech Stack:** Rust 1.85+, edition 2024; `rusqlite` over SQLite under `$PORCH_HOME`;
 `ulid` for row ids; `clap` for the CLI.
@@ -64,7 +65,7 @@ Source: `docs/agents/project.md` (sha256 `a3f5ba93c4d8`), `AGENTS.md`
 | `crates/porch-gate/src/rounds/schema.rs` | add the `forward_records` DDL, index, and partial unique index to the create batch |
 | `crates/porch-gate/src/rounds/mod.rs` | declare `forward`; re-export its public types; raise `PROTOCOL_SCHEMA_VERSION` to 4 |
 | `crates/porch-run/src/deliver.rs` | resolve authorization at the boundary; split the lease; write intent then outcome |
-| `crates/porch-run/src/lib.rs` | `assert_head_continuity` becomes exact equality and names both SHAs |
+| `crates/porch-run/src/lib.rs` | single decision point for the authorized SHA; the equality half is blocked (Task 2) |
 | `crates/porch-gate/tests/m18_rounds.rs` | store-level coverage for the constraints, the index, and the predicate |
 | `crates/porch/tests/m23_forward_auth.rs` | **new** — integration coverage across the forward boundary |
 | `docs/usage.md` | the protocol-4 upgrade note and its rollback consequence |
@@ -160,14 +161,22 @@ local to `porch-run`, so `ARCH-2` and the lease semantics are untouched.
       m6_repair --test m17_pr_compose`; expect no change against the `main` baseline.
 - [x] Commit.
 
-The planned `crates/porch/tests/m23_forward_auth.rs` was **not** created. This
-environment already fails 36 integration tests on an untouched `main` — the
-daemon-and-push harness is not reliable on Linux — so a new end-to-end test there could
-not distinguish its own failure from the environment's. The in-crate deliver test
-exercises a real `git push` to a real bare repository with a `gh` PATH fake, which
-covers the same ordering claim without that ambiguity. A milestone-named integration
-file belongs with ROAD-9's fault-injection suite, which is where crash-window coverage
-was already scheduled.
+The planned `crates/porch/tests/m23_forward_auth.rs` was **not** created, and the reason
+recorded here was wrong. It claimed the environment "already fails 36 integration tests
+on an untouched `main`" because "the daemon-and-push harness is not reliable on Linux".
+Those 37 failures had a single cause with nothing to do with reliability: the fixtures
+inherited `init.defaultBranch` from ambient git config, so where it was unset each fake
+origin's HEAD stayed at `refs/heads/master` while the seed pushed `main`, every clone
+warned `remote HEAD refers to nonexistent ref`, and the work tree had no branch. The
+fixtures now state their own default branch and the suite is green without any global
+git config. An unexamined environment failure was allowed to justify a scope cut; the
+correct move was to diagnose it first.
+
+The in-crate deliver test does exercise a real `git push` to a real bare repository with
+a `gh` PATH fake, so the ordering claim is covered. The milestone-named integration file
+still belongs with ROAD-9's fault-injection suite, which is where crash-window coverage
+was scheduled — but that is now a scheduling choice, not a consequence of a broken
+harness.
 
 _Requirements: FWDAUTH-1.4, FWDAUTH-2.1, FWDAUTH-2.3, FWDAUTH-2.4, FWDAUTH-2.6, FWDAUTH-3.1, FWDAUTH-3.2, FWDAUTH-3.4, FWDAUTH-3.5, FWDAUTH-3.7, FWDAUTH-6.1, FWDAUTH-7.2, FWDAUTH-7.3, FWDAUTH-7.6_
 
