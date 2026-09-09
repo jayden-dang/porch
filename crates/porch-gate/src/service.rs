@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sha2::{Digest, Sha256};
 
 use crate::Result;
+use crate::condition::DaemonCondition;
 use crate::db::Db;
 use crate::home::{db_path, lock_path, logs_dir, pid_path, socket_path};
-use crate::rpc;
 
 const SKIP_LOAD_ENV: &str = "PORCH_SERVICE_SKIP_LOAD";
 
@@ -382,6 +382,13 @@ pub struct ServiceStatus {
     pub running: bool,
     pub pid: Option<u32>,
     pub socket_healthy: bool,
+    /// Which of the four daemon conditions holds (`DFAULT-4.2`).
+    ///
+    /// `running` and `socket_healthy` are both true statements that together cannot
+    /// name a wedged daemon — it has a pid file and an unanswering socket, so it reads
+    /// as `running=true socket_healthy=false`, the same as a daemon that died between
+    /// the pid write and the socket bind. Kept alongside rather than replaced.
+    pub condition: DaemonCondition,
     pub service_file: PathBuf,
     pub service_file_exists: bool,
     pub label: String,
@@ -395,7 +402,8 @@ pub struct ServiceStatus {
 /// Currently infallible; wrapped in Result for API symmetry.
 pub fn service_status(porch_home: &Path, user_home: &Path) -> Result<ServiceStatus> {
     let paths = service_paths(porch_home, user_home);
-    let socket_healthy = rpc::health_check(porch_home).ok() == Some(true);
+    let condition = crate::condition::daemon_condition(porch_home);
+    let socket_healthy = condition.is_ready();
     let pid = std::fs::read_to_string(pid_path(porch_home))
         .ok()
         .and_then(|s| s.trim().parse().ok());
@@ -403,6 +411,7 @@ pub fn service_status(porch_home: &Path, user_home: &Path) -> Result<ServiceStat
         running: socket_healthy || pid.is_some(),
         pid,
         socket_healthy,
+        condition,
         service_file: paths.definition_path.clone(),
         service_file_exists: paths.definition_path.exists(),
         label: paths.label,

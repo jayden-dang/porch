@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use porch_gate::{health_check, porch_home, socket_path};
+use porch_gate::{DaemonCondition, daemon_condition, porch_home, socket_path};
 use porch_review::{
     REVIEW_BIN_ENV, floor, is_executable, load_home_config, resolve_bin, review_bin, which,
 };
@@ -182,19 +182,40 @@ fn check_home_and_daemon() -> Vec<Check> {
         "PORCH_HOME",
         format!("{} (exists)", home.display()),
     )];
-    let sock = socket_path(&home);
-    out.push(match health_check(&home) {
-        Ok(true) => Check::new(Level::Ok, "daemon", format!("healthy ({})", sock.display())),
-        _ => Check::new(
+    // Resolved without starting a daemon, so asking does not change the answer, and
+    // bounded, so it answers even when the daemon is wedged (`DFAULT-4.1`).
+    out.push(daemon_check(&home));
+    out
+}
+
+fn daemon_check(home: &Path) -> Check {
+    let cond = daemon_condition(home);
+    let sock = socket_path(home);
+    match cond {
+        DaemonCondition::Ready { .. } => Check::new(
+            Level::Ok,
+            "daemon",
+            format!("{} ({})", cond.summary(), sock.display()),
+        ),
+        // A daemon that refuses to start or has gone quiet is a fault the operator has
+        // to act on, not a neutral fact about their machine.
+        DaemonCondition::Refusing { .. } | DaemonCondition::NotAnswering { .. } => Check::new(
+            Level::Fail,
+            "daemon",
+            format!("{} — {}", cond.summary(), cond.remedy()),
+        ),
+        // Not running is the ordinary state of a fresh checkout. `porch init` starts a
+        // daemon; the post-receive hook does not — it execs `porch daemon notify-push`,
+        // which makes a best-effort RPC and logs a warning (`DFAULT-4.3`).
+        DaemonCondition::Unreachable { .. } => Check::new(
             Level::Info,
             "daemon",
             format!(
-                "not running (socket {}); started on `porch init` / first push notify",
+                "not running (socket {}); started by `porch init` or `porch daemon start`",
                 sock.display()
             ),
         ),
-    });
-    out
+    }
 }
 
 fn floor_sibling_of(exe: &Path) -> Option<PathBuf> {
