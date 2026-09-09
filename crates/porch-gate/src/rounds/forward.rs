@@ -291,6 +291,32 @@ pub fn records_for_run(db: &Db, run_id: &str) -> Result<Vec<ForwardRecordRow>> {
     records_for_run_conn(&conn, run_id)
 }
 
+/// Forward records for one `deliver` attempt, in sequence order.
+///
+/// # Errors
+///
+/// Returns a storage error if the query fails.
+///
+/// # Panics
+///
+/// Panics if the database mutex is poisoned.
+pub fn records_for_attempt(db: &Db, attempt: &AttemptId) -> Result<Vec<ForwardRecordRow>> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT id, run_id, deliver_attempt_id, seq, kind, ref_name, authorized_sha,
+                remote_state, observed_remote_tip, landed_sha, detail, created_at
+         FROM forward_records
+         WHERE deliver_attempt_id = ?1
+         ORDER BY seq, id",
+    )?;
+    let mut rows = stmt.query([attempt.as_str()])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(map_record(row)?);
+    }
+    Ok(out)
+}
+
 /// Forward records for a run on an open connection, in sequence order.
 ///
 /// # Errors

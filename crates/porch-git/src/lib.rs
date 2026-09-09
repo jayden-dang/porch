@@ -30,6 +30,20 @@ impl GitDir {
     }
 }
 
+/// Env var naming the `git` binary (PATH entry or absolute path).
+///
+/// Same shape as `PORCH_GH_BIN`, `PORCH_REVIEW_BIN`, and `PORCH_FIXER_BIN`: a
+/// binary path indirection with no behaviour of its own, so a debug and a
+/// release build resolve it identically. `porch doctor` reports what it
+/// resolves to, because an override nobody can see is worse than none.
+pub const GIT_BIN_ENV: &str = "PORCH_GIT_BIN";
+
+/// The `git` binary every call in this crate invokes.
+#[must_use]
+pub fn git_bin() -> String {
+    std::env::var(GIT_BIN_ENV).unwrap_or_else(|_| "git".to_string())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("git dir must be absolute, got {}", .0.display())]
@@ -51,7 +65,7 @@ pub enum Error {
 /// Returns [`Error::Spawn`] if `git` cannot be started, or [`Error::Command`]
 /// if the process exits non-zero.
 pub fn run(git_dir: &GitDir, args: &[&str]) -> Result<Output, Error> {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_bin());
     cmd.arg(format!("--git-dir={}", git_dir.as_path().display()));
     cmd.args(args);
     // Isolation: do not inherit the caller's hooks for inspection commands.
@@ -78,7 +92,7 @@ pub fn run_c(work_tree: &Path, args: &[&str]) -> Result<Output, Error> {
     if !work_tree.is_absolute() {
         return Err(Error::GitDirNotAbsolute(work_tree.to_path_buf()));
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_bin());
     cmd.arg("-C").arg(work_tree);
     cmd.args(args);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -105,7 +119,7 @@ pub fn init_bare(path: &Path) -> Result<GitDir, Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(Error::Spawn)?;
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_bin());
     cmd.arg("init").arg("--bare").arg(path);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     let output = cmd.output().map_err(Error::Spawn)?;
@@ -243,7 +257,7 @@ pub fn show_path_at(git_dir: &GitDir, sha: &str, path: &str) -> Result<Option<Ve
     run(git_dir, &["rev-parse", "--verify", &commitish])?;
 
     let spec = format!("{sha}:{path}");
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_bin());
     cmd.arg(format!("--git-dir={}", git_dir.as_path().display()));
     cmd.args(["show", &spec]);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -343,7 +357,7 @@ pub fn is_ancestor(work_tree: &Path, maybe_ancestor: &str, tip: &str) -> Result<
     if !work_tree.is_absolute() {
         return Err(Error::GitDirNotAbsolute(work_tree.to_path_buf()));
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_bin());
     cmd.arg("-C").arg(work_tree);
     cmd.args(["merge-base", "--is-ancestor", maybe_ancestor, tip]);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -386,7 +400,7 @@ pub fn diff_is_empty(work_tree: &Path, range: &str) -> Result<bool, Error> {
     if !work_tree.is_absolute() {
         return Err(Error::GitDirNotAbsolute(work_tree.to_path_buf()));
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_bin());
     cmd.arg("-C").arg(work_tree);
     cmd.args(["diff", "--quiet", range]);
     cmd.env("GIT_TERMINAL_PROMPT", "0");

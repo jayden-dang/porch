@@ -26,6 +26,7 @@ anyhow.workspace = true
 clap.workspace = true
 porch-agent.workspace = true
 porch-gate.workspace = true
+porch-git.workspace = true
 porch-quality.workspace = true
 porch-review.workspace = true
 porch-run.workspace = true

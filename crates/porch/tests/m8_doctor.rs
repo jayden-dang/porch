@@ -183,3 +183,53 @@ fn init_prints_remote_and_next_steps() {
         }
     }
 }
+
+/// The `git` binary override is reported, so it cannot act invisibly.
+///
+/// Proven through a subprocess because the workspace forbids `unsafe_code` and
+/// `std::env::set_var` is unsafe on edition 2024, so an in-process test cannot
+/// set the variable at all.
+#[test]
+fn doctor_reports_the_git_binary_override() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    install_fake_git(&bin);
+    let shim = tmp.path().join("shim-git");
+    fs::write(&shim, "#!/bin/sh\nexec git \"$@\"\n").unwrap();
+    chmod_755(&shim);
+    let home = tmp.path().join("home");
+
+    Command::cargo_bin("porch")
+        .unwrap()
+        .env("PATH", &bin)
+        .env("PORCH_HOME", &home)
+        .env("HOME", tmp.path())
+        .env(porch_git::GIT_BIN_ENV, &shim)
+        .arg("doctor")
+        .assert()
+        .stdout(predicates::str::contains("[ok  ] git:"))
+        .stdout(predicates::str::contains("shim-git"))
+        .stdout(predicates::str::contains(porch_git::GIT_BIN_ENV));
+}
+
+/// An override naming a binary that is not there fails the check, rather than
+/// silently falling back to `git` on `PATH`.
+#[test]
+fn doctor_fails_when_the_git_override_is_missing() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    install_fake_git(&bin);
+    let home = tmp.path().join("home");
+
+    Command::cargo_bin("porch")
+        .unwrap()
+        .env("PATH", &bin)
+        .env("PORCH_HOME", &home)
+        .env("HOME", tmp.path())
+        .env(porch_git::GIT_BIN_ENV, tmp.path().join("absent-git"))
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("FAIL"))
+        .stdout(predicates::str::contains("absent-git"));
+}

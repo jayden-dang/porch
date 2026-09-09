@@ -4,7 +4,7 @@ use rusqlite::{Transaction, TransactionBehavior};
 use ulid::Ulid;
 
 use super::authority::apply_run_effects_tx;
-use super::{RunEffects, StepEffect};
+use super::{RunEffects, StepEffect, forward, reconcile};
 use crate::Result;
 use crate::db::{self, Db};
 
@@ -974,11 +974,98 @@ pub(crate) fn reconcile_interrupted_with_error(db: &Db, error: &str) -> Result<u
         out
     };
 
+    // Phase one: gather evidence and resolve the local discriminator with no
+    // transaction open, so no subprocess runs while the write lock is held.
+    let pending = reconcile::attempts_awaiting_verdict(db)?;
+    let resolved: Vec<ResolvedVerdict> = pending
+        .into_iter()
+        .map(|p| {
+            let records = forward::records_for_attempt(db, &p.deliver_attempt_id)?;
+            let tracking = if records.iter().any(|r| r.kind.reached_origin()) {
+                None
+            } else {
+                reconcile::observed_tracking_sha(&p.bare_path, &p.branch)
+            };
+            let (verdict, evidence) =
+                reconcile::classify(&records, &p.authorized_sha, tracking.as_deref());
+            Ok(ResolvedVerdict {
+                pending: p,
+                verdict,
+                evidence,
+                tracking,
+            })
+        })
+        .collect::<Result<_>>()?;
+
     let mut closed = 0usize;
-    for (run_id, pr_url) in stale {
-        closed += reconcile_one_running(db, &run_id, pr_url.as_deref(), error)?;
+    for (run_id, pr_url) in &stale {
+        let mine: Vec<&ResolvedVerdict> = resolved
+            .iter()
+            .filter(|r| &r.pending.run_id == run_id)
+            .collect();
+        closed += reconcile_one_running(db, run_id, pr_url.as_deref(), error, &mine)?;
+    }
+
+    // A conclusion is owed to every interrupted forward, not only to one whose
+    // run is still `running`. A writer-protocol upgrade terminalizes active runs
+    // inside `Db::open`, before recovery runs, so gating the write on run status
+    // would disarm reconciliation for exactly the runs it exists to classify —
+    // and, because nothing was ever written, would re-derive their verdicts on
+    // every restart forever, each costing a local git read before the socket
+    // binds. The run itself is left alone: it has a terminal outcome already, and
+    // this is evidence about a past forward rather than a reclassification.
+    for r in resolved
+        .iter()
+        .filter(|r| !stale.iter().any(|(id, _)| id == &r.pending.run_id))
+    {
+        append_verdict_for_terminal_run(db, r)?;
     }
     Ok(closed)
+}
+
+/// Append one conclusion for a run that already reached a terminal outcome.
+///
+/// Writes the conclusion record and nothing else — not `runs.status`, not
+/// `runs.error`, not any phase event (`RECON-4.1`).
+fn append_verdict_for_terminal_run(db: &Db, resolved: &ResolvedVerdict) -> Result<()> {
+    let conn = db.conn();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+    reconcile::append_verdict_tx(
+        &tx,
+        &resolved.pending,
+        resolved.verdict,
+        resolved.evidence,
+        resolved.tracking.as_deref(),
+    )?;
+    tx.execute(
+        "UPDATE runs SET audit_rev = audit_rev + 1 WHERE id = ?1",
+        [&resolved.pending.run_id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// A verdict resolved outside the reconciliation transaction, awaiting its
+/// append inside one.
+struct ResolvedVerdict {
+    pending: reconcile::AwaitingVerdict,
+    verdict: reconcile::Verdict,
+    evidence: reconcile::Evidence,
+    tracking: Option<String>,
+}
+
+/// The interruption phrase, then what the record proves, then the remedy.
+///
+/// The phrase stays a prefix so operators and tests matching on it still match.
+fn interrupted_error_with_conclusions(error: &str, resolved: &[&ResolvedVerdict]) -> String {
+    let mut out = error.to_string();
+    for r in resolved {
+        if let Some(note) = reconcile::operator_note(r.verdict, &r.pending.ref_name) {
+            out.push_str("; ");
+            out.push_str(&note);
+        }
+    }
+    out
 }
 
 fn reconcile_one_running(
@@ -986,7 +1073,9 @@ fn reconcile_one_running(
     run_id: &str,
     pr_url: Option<&str>,
     error: &str,
+    resolved: &[&ResolvedVerdict],
 ) -> Result<usize> {
+    let error = interrupted_error_with_conclusions(error, resolved);
     let conn = db.conn();
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
 
@@ -998,7 +1087,7 @@ fn reconcile_one_running(
             PhaseTransition::Terminal {
                 attempt: attempt.id,
                 outcome: "interrupted".into(),
-                cause: Some(error.to_string()),
+                cause: Some(error.clone()),
             },
         )
         .map_err(phase_err_to_storage)?;
@@ -1014,11 +1103,22 @@ fn reconcile_one_running(
         run_id,
         RunEffects {
             status: Some(status.into()),
-            error: Some(error.to_string()),
+            error: Some(error.clone()),
             approved_head: None,
             steps: vec![],
         },
     )?;
+    // The verdict commits with the terminalization, so a restart cannot leave a
+    // run reconciled without a conclusion or the reverse.
+    for r in resolved {
+        reconcile::append_verdict_tx(
+            &tx,
+            &r.pending,
+            r.verdict,
+            r.evidence,
+            r.tracking.as_deref(),
+        )?;
+    }
     tx.execute(
         "UPDATE runs SET audit_rev = audit_rev + 1 WHERE id = ?1",
         [run_id],

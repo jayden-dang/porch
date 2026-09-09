@@ -371,8 +371,43 @@ before it opens or updates the pull request. A gate killed between the push and 
 request therefore leaves local evidence that the push was authorized and completed, instead
 of a run that looks like it never tried. Each `deliver` attempt records at most one
 forward, because a deliver repair that leaves HEAD unmoved now hands the phase off to its
-next attempt instead of forwarding twice under the same one. Nothing reads that record to
-decide a restart yet — restart still classifies on whether a PR URL was stored.
+next attempt instead of forwarding twice under the same one. Section **U** describes what a
+restart makes of that record.
+
+## U. What you see when a gate died mid-forward
+
+A restart now reads that record instead of guessing from the pull request URL. The run's
+status rule is unchanged — a `failed` run is still `failed`, a run with a stored PR URL is
+still `ci_monitor_interrupted` — and **no upgrade or protocol bump is involved**; the
+conclusion is added to the run's error, after the familiar `daemon restarted...` phrase.
+
+You will see one of:
+
+- **the branch reached `origin`** — porch's own record says the push succeeded, so your
+  commit is on the shared remote. Porch will say that **pull request state is
+  unrecorded**, and it means it: a gate can die after the pull request was created but
+  before porch stored its URL, and that looks identical on disk to dying before the
+  pull request call. Porch will not tell you a pull request does not exist, because it
+  cannot know.
+- **undetermined** — porch invoked the push and never recorded the result. It narrows
+  this case using the gate repository's own `refs/remotes/origin/<branch>`, which git
+  writes only once the remote acknowledges a push, so a match resolves it without any
+  network call. An absent or different ref resolves nothing and the run stays
+  undetermined.
+
+**In both cases the remedy is the same: run the branch through the gate again.** The push
+is safe to repeat, and porch adopts an existing pull request for that branch rather than
+opening a second one. That is why porch tells you what to do rather than leaving you to
+inspect `origin` yourself.
+
+Which command depends on whether you have anything left to push. If you have made a commit
+since, `git push porch HEAD:refs/heads/<branch>` as usual. If you have not — the common
+case, because your branch already matches the gate ref — that push reports *everything up
+to date* and starts nothing, so use `porch rerun --run-id <ULID>` instead. It takes a new
+run and a fresh worktree over the same commit.
+
+Both are safe against a duplicate: the retry observes `origin` under its own lease, records
+`already_current` when the branch is already there, and adopts the existing pull request.
 
 The three earlier writer triggers are unchanged; no new trigger is added.
 

@@ -363,6 +363,36 @@ distinguishable from one never invoked — and never an assurance outcome
 probing `origin`.
 _Avoid_: "push log", "audit event"; `pr_url` as the evidence a push landed.
 
+**Forward reconciliation**:
+What a restart concludes about a forward that may already have happened,
+derived from the **Forward record** and never from a network probe. Scoped to
+`origin`, never to a pull request: the durable evidence for a crash before the
+pull request call and for one after it and before `pr_url` is stored is
+identical, so porch may state that pull request state is *unrecorded* and never
+that a pull request is absent. A later conclusion about a terminal run's attempt
+is an append, not a reclassification — the run's outcome is never rewritten.
+Scoped to **interrupted** attempts, and interruption means the absence of a
+`terminal` phase event on the `deliver` **Phase attempt** — not the run's status,
+which a writer-protocol upgrade rewrites before recovery runs. An attempt that
+reached a terminal event reported its own error and is never reconciled, so a
+post-push verification failure is not handed a `reached_origin` conclusion its own
+error contradicts.
+_Avoid_: "recovery" for this step; asserting a pull request does not exist;
+`push_failed` as evidence that `origin` is unchanged; `runs.status` as the test of
+whether a forward was interrupted.
+
+**Forward verdict**:
+One reconciliation conclusion — `not_attempted`, `reached_origin`, or
+`indeterminate` — stored append-only against the owning `deliver` **Phase
+attempt** together with the evidence it rests on. Its vocabulary lives in code,
+not in a database `CHECK`, so a later verdict does not require rebuilding an
+append-only table. An `indeterminate` verdict may be upgraded by the gate
+repository's own remote-tracking ref, which git writes only after the receiving
+end acknowledged the push; that ref is one-sided evidence and never downgrades a
+verdict.
+_Avoid_: a new `runs.status` value for it; "unchanged" as a verdict; treating the
+tracking ref's absence as proof a push failed.
+
 **Custody**:
 Porch's claim over a ref while a run holds it — the basis for refusing a
 force-push that would drop live remote commits.

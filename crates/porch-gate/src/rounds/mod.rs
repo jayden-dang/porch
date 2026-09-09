@@ -4,6 +4,7 @@ mod applicability;
 mod authority;
 pub mod forward;
 pub mod phase;
+pub mod reconcile;
 mod requirements;
 pub mod retention;
 mod schema;
@@ -21,6 +22,7 @@ pub use forward::{
     ForwardError, ForwardIntent, ForwardKind, ForwardOutcome, ForwardRecordRow, ObservedRemote,
 };
 pub use phase::{AttemptId, PhaseAttemptRow, PhaseEventRow};
+pub use reconcile::{AwaitingVerdict, Evidence, Verdict, VerdictRow};
 pub use requirements::{
     RequirementRow, RequirementSpec, Resolution, Role, assurance_shape, assurance_shape_for_rows,
     digest_for_specs, required_set_digest, requirements_for_round, run_required_set_digest,

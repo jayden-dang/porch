@@ -151,9 +151,20 @@ fn check_cargo_bin_on_path() -> Option<Check> {
 }
 
 fn check_git() -> Check {
-    match which("git") {
+    let bin = porch_git::git_bin();
+    let overridden = env::var_os(porch_git::GIT_BIN_ENV).is_some();
+    match resolve_bin(&bin) {
+        Some(p) if overridden => Check::new(
+            Level::Ok,
+            "git",
+            format!("{} ({})", p.display(), porch_git::GIT_BIN_ENV),
+        ),
         Some(p) => Check::new(Level::Ok, "git", p.display().to_string()),
-        None => Check::new(Level::Fail, "git", "not found on PATH (required for push)"),
+        None => Check::new(
+            Level::Fail,
+            "git",
+            format!("`{bin}` not found (required for push)"),
+        ),
     }
 }
 
