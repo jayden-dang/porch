@@ -79,14 +79,16 @@ recover every reachable porch-authored commit, and detach porch from the checkou
 no healthy daemon and no hand-editing of hooks, git config, refs, or the database.
 **Goals:** GOAL-4
 **Members:**
-- **ROAD-10** daemon-independent inspect → recover or abandon → detach, with distinct operator-facing states — Surfaces: `crates/porch-gate/src/eject.rs`, `crates/porch-run/src/sync.rs`, `crates/porch/src/doctor.rs`
+- **ROAD-10** daemon-independent inspect → recover or abandon → detach, with distinct operator-facing states — Surfaces: `crates/porch-gate/src/custody.rs`, `crates/porch-gate/src/eject.rs`, `crates/porch-gate/src/db.rs`, `crates/porch-gate/src/daemon.rs`, `crates/porch-run/src/sync.rs`, `crates/porch/src/doctor.rs`. First wave shipped as `ESCAPE` (`docs/specs/2026-09-09-daemon-free-escape/`): custody of porch-authored commits, and detach that does not depend on the state it escapes. The inspect half is open — see the third blocker.
 - **ROAD-11** wedged, dead, and refusing-startup daemon suite — Surfaces: `crates/porch/tests/`
 **Depends-on:** MILE-3
-**Commitment:** Planned
+**Commitment:** Planned — the first blocker was due before approval and is still open, so the milestone stays `Planned` even though a member has partly shipped. `ESCAPE` was scoped to what needs no policy decision.
 **Closed:** None
 **Deferred:** None
 **Blockers:**
-- The refusal and explicit-abandon policy for `eject --purge` — owner Jayden; due before this milestone is approved for implementation; resolved through feature discovery/design, not here.
+- The refusal and explicit-abandon policy for `eject --purge` — owner Jayden; due before this milestone is approved for implementation; resolved through feature discovery/design, not here. Discovery ran during `ESCAPE` and carried a recommendation forward for ratification (`docs/specs/2026-09-09-daemon-free-escape/requirements.md` §5): refuse when a porch-authored commit is neither reachable from the operator's checkout nor recorded as having reached `origin`; `--abandon` as the single override; a dry-run manifest by default; abandoned SHAs written outside the deleted tree. The runner-up — refuse on any unreachable commit — was rejected because it fires on the benign post-success case and would therefore refuse nearly always, training the override. `ESCAPE` deliberately did not decide this.
+- Whether porch's machine-authored commits should carry the operator's signature — owner Jayden; discovered during `ESCAPE`. Certify's correction commits and the deliver-repair commit already neutralize hooks and pin porch's own identity, but inherit `commit.gpgsign`, so on a signing host the daemon invokes the operator's signing program mid-run with no timeout. Unsigning them would break a remote that requires signed commits; leaving them is a wedge path. Belongs with the wedged-daemon work.
+- The daemon-free inspect surface, and where ROAD-8's `indeterminate` verdict reaches an operator — `ESCAPE` found it reaches one only as prose appended to `runs.error`, and that neither `sync.rs` nor `doctor.rs` knows forward verdicts exist. This is the MILE-3 → MILE-4 handoff; it needs no policy decision and is the next wave rather than a blocker on the owner.
 
 ## MILE-5 — One porch binary
 

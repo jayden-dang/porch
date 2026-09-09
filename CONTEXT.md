@@ -414,10 +414,13 @@ splitting; the TUI's hunk view only shows a finding's diff snippet.
 
 **Eject**:
 The escape hatch back to a plain checkout: removes the `porch` remote and
-neutralizes the bare hooks. Safe eject preserves the database, bare repository,
-recovery refs, and custody evidence. `--purge` is destructive — it deletes this
-repo's bare, worktrees, run artifacts, and DB row (other repos under
-`$PORCH_HOME` untouched) — and is outside the no-loss guarantee of **GOAL-4**.
+neutralizes the bare hooks. Detaching needs neither a healthy daemon nor a
+readable database, and is retryable from any partial state. Safe eject preserves
+the database, bare repository, recovery refs, and custody evidence. `--purge` is
+destructive — it deletes this repo's bare, worktrees, run artifacts, and DB rows
+(other repos under `$PORCH_HOME` untouched) — and is outside the no-loss
+guarantee of **GOAL-4**. Eject reports which of three states it left: gate state
+preserved, purged, or left behind with a reason.
 _Avoid_: "uninstall" — that is the daemon-service verb (`porch daemon uninstall`).
 
 **Trusted SHA**:

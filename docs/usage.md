@@ -261,6 +261,23 @@ porch eject --purge         # also delete this repo’s bare, worktrees, run row
 
 `--purge` does not delete other repos under `$PORCH_HOME` or global `config.yaml`.
 
+**`--purge` is destructive and is outside porch's no-loss guarantee.** It deletes the
+bare repository, which holds every porch-authored commit — certify's correction commits
+and fixer commits — that you have not pulled into your checkout. Run `porch agent sync`
+first if you want them. Plain `porch eject` keeps all of it.
+
+Detaching does not need a healthy daemon or a readable database. It reports one of three
+outcomes:
+
+| Output | Meaning |
+|---|---|
+| `PORCH_HOME left intact` | detached; this repo's gate state preserved |
+| `purged this repo's bare, worktrees, run artifacts, and DB rows` | detached and removed |
+| `detached, but this repo's gate state was left behind: <reason>` | detached; `--purge` could not run, nothing on disk was destroyed, exit code 1 |
+
+The third case is retryable: re-run `porch eject --purge` once the reason is cleared. So
+is an eject interrupted part-way — a second run picks up from whatever step it reached.
+
 ## O. Typical day
 
 ```sh
