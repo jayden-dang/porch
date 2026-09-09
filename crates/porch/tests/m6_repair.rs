@@ -173,11 +173,15 @@ case "$CMD" in
     cat > "$BODY_FILE"
     # Handshake: hold create until the test helper diverges origin/main after
     # seeing this argv line, so pr view observes CONFLICTING against a live tip.
+    # The helper spends a clone's worth of git subprocesses getting there, so this
+    # budget covers a saturated machine and stays under PORCH_GH_TIMEOUT_SECS —
+    # otherwise porch's subprocess timeout adjudicates the handshake and the test
+    # reports a spurious "gh CLI timed out" in place of the verdict it asserts.
     if [ -f "$PORCH_HOME/wait-main-diverge" ]; then
       i=0
       while [ ! -f "$PORCH_HOME/main-diverged" ]; do
         i=$((i + 1))
-        if [ "$i" -gt 200 ]; then
+        if [ "$i" -gt 600 ]; then
           echo "fake-gh: timed out waiting for main-diverged" >&2
           exit 1
         fi
@@ -437,7 +441,10 @@ fn restart_repair_daemon(
         ("PORCH_FAKE_GH_MODE", gh_mode.as_ref()),
         ("PATH", path.as_ref()),
         ("PORCH_REVIEW_TIMEOUT_SECS", "10".as_ref()),
-        ("PORCH_GH_TIMEOUT_SECS", "10".as_ref()),
+        // Above the fake gh's handshake budget: one `pr create` here deliberately
+        // blocks while the helper diverges origin/main, and no test in this file
+        // asserts on porch's gh subprocess timeout.
+        ("PORCH_GH_TIMEOUT_SECS", "60".as_ref()),
         ("PORCH_DELIVER_CHECK_TIMEOUT_SECS", "3".as_ref()),
         ("PORCH_DELIVER_CHECK_POLL_SECS", "1".as_ref()),
         ("PORCH_FIXER_TIMEOUT_SECS", "10".as_ref()),
@@ -534,6 +541,12 @@ enum MainDiverge {
     ConflictingReadme,
 }
 
+/// Terminal-status budget for the two tests that hold `pr create` on the handshake.
+///
+/// A run that blocks in deliver waiting on the helper's git work needs the plain
+/// pipeline budget plus the handshake's worst case on top of it.
+const HANDSHAKE_RUN_BUDGET: Duration = Duration::from_secs(90);
+
 /// After fake-gh logs `pr create`, diverge origin/main and unblock create.
 ///
 /// Requires `$PORCH_HOME/wait-main-diverge` so create holds until `main-diverged`.
@@ -549,8 +562,10 @@ fn spawn_diverge_main_after_pr_create(
             if log.contains("pr create") {
                 break;
             }
+            // The run has to clear review, certify, rebase and the lease push before
+            // deliver calls create, so wait as long as the caller waits for a status.
             assert!(
-                start.elapsed() < Duration::from_secs(30),
+                start.elapsed() < HANDSHAKE_RUN_BUDGET,
                 "timed out waiting for pr create in gh-argv.log"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -908,7 +923,7 @@ fn mergeable_conflicting_rebase_conflict_fails_closed() {
         &db,
         &repo_id,
         &["failed", "completed", "parked"],
-        Duration::from_secs(60),
+        HANDSHAKE_RUN_BUDGET,
     );
     helper.join().unwrap();
     assert_eq!(run.status, "failed", "err={:?}", run.error);
@@ -977,7 +992,7 @@ fn mergeable_conflicting_clean_rebase_rereview_second_lease_push() {
         &db,
         &repo_id,
         &["parked", "failed", "completed"],
-        Duration::from_secs(60),
+        HANDSHAKE_RUN_BUDGET,
     );
     helper.join().unwrap();
     assert_eq!(run.status, "parked", "err={:?}", run.error);
