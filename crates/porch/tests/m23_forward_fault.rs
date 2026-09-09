@@ -51,6 +51,16 @@ fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// Whether a git command succeeds, for the ones that answer with their exit code.
+fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    StdCommand::new("git")
+        .current_dir(dir)
+        .args(args)
+        .status()
+        .unwrap()
+        .success()
+}
+
 fn chmod_755(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(path).unwrap().permissions();
@@ -268,7 +278,19 @@ enum Arm {
     },
 }
 
+/// A certify `format` command that leaves the tree dirty, so the certify phase
+/// makes a correction commit and HEAD advances past the reviewed SHA.
+fn install_dirty_format(bin_dir: &Path) {
+    let path = bin_dir.join("porch-fake-format-dirty");
+    std::fs::write(&path, "#!/bin/sh\nset -e\necho formatted >> dirty.txt\n").unwrap();
+    chmod_755(&path);
+}
+
 fn setup() -> Setup {
+    setup_with_trusted(None)
+}
+
+fn setup_with_trusted(trusted_yaml: Option<&str>) -> Setup {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let origin = root.join("origin.git");
@@ -280,6 +302,7 @@ fn setup() -> Setup {
     let fake_review = install_fake_review(&bin_dir);
     let fake_gh = install_fake_gh(&bin_dir);
     let shim = install_git_shim(&bin_dir);
+    install_dirty_format(&bin_dir);
     let real_git = which_git();
 
     init_bare(&origin).unwrap();
@@ -289,7 +312,7 @@ fn setup() -> Setup {
 
     let seed = root.join("seed");
     std::fs::create_dir_all(&seed).unwrap();
-    seed_repo(&seed, &origin);
+    seed_repo(&seed, &origin, trusted_yaml);
 
     let st = StdCommand::new("git")
         .args(["clone", origin.to_str().unwrap(), work.to_str().unwrap()])
@@ -345,11 +368,15 @@ fn configure_identity(dir: &Path) {
     git(dir, &["config", "commit.gpgsign", "false"]);
 }
 
-fn seed_repo(seed: &Path, origin: &Path) {
+fn seed_repo(seed: &Path, origin: &Path, trusted_yaml: Option<&str>) {
     git(seed, &["init", "-b", "main"]);
     configure_identity(seed);
     std::fs::write(seed.join("README"), "base\n").unwrap();
     git(seed, &["add", "README"]);
+    if let Some(yaml) = trusted_yaml {
+        std::fs::write(seed.join(".porch.yaml"), yaml).unwrap();
+        git(seed, &["add", ".porch.yaml"]);
+    }
     git(seed, &["commit", "-m", "base"]);
     git(seed, &["remote", "add", "origin", origin.to_str().unwrap()]);
     git(seed, &["push", "-u", "origin", "main"]);
@@ -991,5 +1018,83 @@ fn two_restarts_leave_one_conclusion() {
             .is_empty(),
         "and nothing is left awaiting a conclusion (FAULT-5.5)"
     );
+    kill_daemon(&s.home);
+}
+
+// ---------------------------------------------------------------------------
+// Tripwire for the open MILE-3 blocker
+// ---------------------------------------------------------------------------
+
+/// Today's head-continuity tolerance forwards a commit that was never reviewed.
+///
+/// `authorized_forward_sha` accepts a live HEAD that merely *descends* from the
+/// approved SHA, and the certify phase's own correction commit is exactly such a
+/// descendant. So the SHA that reaches `origin` is not the SHA the reviewer saw.
+/// `FWDAUTH-1.4` is recorded Blocked for this reason and the decision is open.
+///
+/// **This test asserts what porch does, not what it should do.** It exists so the
+/// blocker's cost is executable rather than only described in prose, and it
+/// changes when the blocker is decided: if an approval is made to cover exactly
+/// the reviewed tree, this becomes an assertion that the forward is refused or
+/// that re-review is required. It is deliberately not the inverse test — a guard
+/// asserting that an approval *survives* a HEAD advance would freeze an undecided
+/// product question (FAULT-8.3).
+#[test]
+fn tripwire_a_correction_commit_forwards_an_unreviewed_sha() {
+    let yaml = r"
+commands:
+  format: porch-fake-format-dirty
+";
+    let s = setup_with_trusted(Some(yaml));
+    start_daemon(&s, &Arm::RealGit);
+    let branch = "feat-corrected";
+    let reviewed = commit_change(&s.work, "corrected.txt", "x\n");
+    push_branch(&s, branch);
+
+    let db = db_of(&s);
+    let repo_id = repo_id_for(&s.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["completed", "failed", "parked"],
+        Duration::from_secs(120),
+    );
+
+    let forwarded = origin_sha(&s, branch).expect("the branch was forwarded to origin");
+    assert_ne!(
+        forwarded, reviewed,
+        "the certify correction commit advanced HEAD, and that descendant is what \
+         reached origin"
+    );
+    // Name the cause, so the divergence cannot be some other rewrite.
+    let log = git_out(&s.origin, &["log", "-3", "--format=%s", &forwarded]).unwrap_or_default();
+    assert!(
+        log.lines().any(|l| l.contains("porch: apply format")),
+        "the commit that origin carries and the reviewer never saw is porch's own \
+         correction commit:\n{log}"
+    );
+    assert!(
+        git_ok(
+            &s.origin,
+            &["merge-base", "--is-ancestor", &reviewed, &forwarded]
+        ),
+        "and it descends from the reviewed SHA, which is the whole tolerance"
+    );
+    let records = rounds::forward::records_for_run(&db, &run.id).unwrap();
+    let authorized = records
+        .iter()
+        .find(|r| r.kind == rounds::ForwardKind::Intent)
+        .map(|r| r.authorized_sha.clone())
+        .expect("an intent record");
+    assert_eq!(
+        authorized, forwarded,
+        "the forward record names the SHA that actually landed"
+    );
+    if let Some(approved) = run.review_approved_head_sha.as_deref() {
+        assert_ne!(
+            approved, forwarded,
+            "the approval covers a tree that is not the one forwarded — the blocker"
+        );
+    }
     kill_daemon(&s.home);
 }
