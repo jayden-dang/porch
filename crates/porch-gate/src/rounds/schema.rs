@@ -243,6 +243,27 @@ CREATE INDEX IF NOT EXISTS forward_records_run
 CREATE UNIQUE INDEX IF NOT EXISTS forward_records_attempt_intent
     ON forward_records(deliver_attempt_id)
     WHERE kind = 'intent';
+
+-- `verdict` deliberately carries no CHECK. `forward_records` bakes its kind
+-- vocabulary into one, inside a CREATE TABLE IF NOT EXISTS, so widening it on a
+-- state root that already exists means rebuilding an append-only table. The
+-- vocabulary lives in `rounds::reconcile::Verdict` instead.
+CREATE TABLE IF NOT EXISTS forward_reconciliations (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    deliver_attempt_id TEXT NOT NULL REFERENCES phase_attempts(id),
+    seq INTEGER NOT NULL,
+    verdict TEXT NOT NULL,
+    ref_name TEXT NOT NULL,
+    authorized_sha TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    observed_tracking_sha TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS forward_reconciliations_run
+    ON forward_reconciliations(run_id, seq);
+CREATE INDEX IF NOT EXISTS forward_reconciliations_attempt
+    ON forward_reconciliations(deliver_attempt_id, seq);
 ";
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {

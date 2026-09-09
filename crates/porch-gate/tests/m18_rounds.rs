@@ -5299,6 +5299,284 @@ fn same_phase_deliver_handoff_lets_the_retry_forward() {
     );
 }
 
+/// The states ROAD-9's fault injection will assert against: a real kill must
+/// produce one of these and no other.
+#[test]
+fn forward_verdict_covers_every_durable_state() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+
+    let verdict_for = |outcome: Option<(rounds::ForwardKind, Option<&str>, Option<&str>)>| {
+        let attempt = seed_deliver_attempt(&db, &run_id);
+        rounds::forward::append_intent(
+            &db,
+            &rounds::ForwardIntent {
+                run_id: &run_id,
+                deliver_attempt_id: &attempt,
+                ref_name: "refs/heads/feat",
+                authorized_sha: "aaa",
+                observed: rounds::ObservedRemote::Absent,
+            },
+        )
+        .unwrap();
+        if let Some((kind, landed, detail)) = outcome {
+            rounds::forward::append_outcome(
+                &db,
+                &rounds::ForwardOutcome {
+                    run_id: &run_id,
+                    deliver_attempt_id: &attempt,
+                    ref_name: "refs/heads/feat",
+                    authorized_sha: "aaa",
+                    kind,
+                    landed_sha: landed,
+                    detail,
+                },
+            )
+            .unwrap();
+        }
+        let records = rounds::forward::records_for_attempt(&db, &attempt).unwrap();
+        let out = rounds::reconcile::classify(&records, "aaa", None);
+        // Terminal so the next seeded deliver attempt may open.
+        rounds::phase::persist_phase_transition(
+            &db,
+            rounds::phase::PhaseTransition::Terminal {
+                attempt,
+                outcome: "failed".into(),
+                cause: None,
+            },
+            rounds::RunEffects::none(),
+        )
+        .unwrap();
+        out
+    };
+
+    // S0 — no record at all: nothing external happened. Classified for
+    // totality; never persisted, because selection requires an intent row.
+    assert_eq!(
+        rounds::reconcile::classify(&[], "aaa", None),
+        (rounds::Verdict::NotAttempted, rounds::Evidence::NoRecord),
+        "no forward record means no forward was attempted"
+    );
+
+    // S1 — intent only: porch was pushing and never recorded the result.
+    assert_eq!(
+        verdict_for(None),
+        (rounds::Verdict::Indeterminate, rounds::Evidence::IntentOnly)
+    );
+
+    // S2 — the push command reported success.
+    assert_eq!(
+        verdict_for(Some((rounds::ForwardKind::Pushed, Some("aaa"), None))),
+        (
+            rounds::Verdict::ReachedOrigin,
+            rounds::Evidence::PushReportedSuccess
+        )
+    );
+
+    // S3 — the ref already held the authorized SHA.
+    assert_eq!(
+        verdict_for(Some((
+            rounds::ForwardKind::AlreadyCurrent,
+            Some("aaa"),
+            None
+        ))),
+        (
+            rounds::Verdict::ReachedOrigin,
+            rounds::Evidence::RefAlreadyCurrent
+        )
+    );
+
+    // S4 — the push command reported failure. That is a statement about porch's
+    // command, not about the remote, so it is undetermined and never "unchanged".
+    assert_eq!(
+        verdict_for(Some((
+            rounds::ForwardKind::PushFailed,
+            None,
+            Some("rejected")
+        ))),
+        (
+            rounds::Verdict::Indeterminate,
+            rounds::Evidence::PushReportedFailure
+        )
+    );
+}
+
+/// The tracking ref is one-sided evidence: a match concludes, anything else
+/// concludes nothing, and it may never downgrade a verdict.
+#[test]
+fn tracking_ref_match_upgrades_indeterminate_only() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let attempt = seed_deliver_attempt(&db, &run_id);
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Absent,
+        },
+    )
+    .unwrap();
+    let intent_only = rounds::forward::records_for_attempt(&db, &attempt).unwrap();
+
+    assert_eq!(
+        rounds::reconcile::classify(&intent_only, "aaa", Some("aaa")),
+        (
+            rounds::Verdict::ReachedOrigin,
+            rounds::Evidence::TrackingRefMatched
+        ),
+        "git writes that ref only after the remote acknowledged the push"
+    );
+    for other in [None, Some("bbb")] {
+        assert_eq!(
+            rounds::reconcile::classify(&intent_only, "aaa", other).0,
+            rounds::Verdict::Indeterminate,
+            "absence or mismatch is not evidence the push failed: {other:?}"
+        );
+    }
+
+    rounds::forward::append_outcome(
+        &db,
+        &rounds::ForwardOutcome {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            kind: rounds::ForwardKind::Pushed,
+            landed_sha: Some("aaa"),
+            detail: None,
+        },
+    )
+    .unwrap();
+    let pushed = rounds::forward::records_for_attempt(&db, &attempt).unwrap();
+    assert_eq!(
+        rounds::reconcile::classify(&pushed, "aaa", Some("bbb")).0,
+        rounds::Verdict::ReachedOrigin,
+        "a mismatched tracking ref never downgrades a recorded outcome"
+    );
+
+    // A missing gate repository is a failed read, not an error.
+    assert_eq!(
+        rounds::reconcile::observed_tracking_sha(&home.path().join("absent.git"), "feat"),
+        None
+    );
+}
+
+/// Reconciliation states what the record proves and what to do about it, without
+/// changing the status rule and without claiming a pull request is absent.
+#[test]
+fn reconciliation_records_a_verdict_and_states_the_remedy() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let attempt = seed_deliver_attempt(&db, &run_id);
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Absent,
+        },
+    )
+    .unwrap();
+    rounds::forward::append_outcome(
+        &db,
+        &rounds::ForwardOutcome {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            kind: rounds::ForwardKind::Pushed,
+            landed_sha: Some("aaa"),
+            detail: None,
+        },
+    )
+    .unwrap();
+    set_run_status_raw(home.path(), &run_id, "running", None);
+
+    rounds::phase::reconcile_interrupted(&db).expect("reconcile");
+
+    let verdicts = rounds::reconcile::verdicts_for_run(&db, &run_id).unwrap();
+    assert_eq!(verdicts.len(), 1, "one verdict per forward: {verdicts:?}");
+    assert_eq!(verdicts[0].verdict, rounds::Verdict::ReachedOrigin);
+    assert_eq!(verdicts[0].evidence, "push_reported_success");
+
+    let run = db.run_by_id(&run_id).unwrap().unwrap();
+    assert_eq!(
+        run.status, "failed",
+        "the status rule is unchanged; the conclusion travels in the error"
+    );
+    let err = run.error.unwrap_or_default();
+    assert!(
+        err.starts_with("daemon restarted"),
+        "the interruption phrase stays a prefix: {err}"
+    );
+    assert!(
+        err.contains("pull request state is unrecorded"),
+        "a reached-origin conclusion states the branch landed: {err}"
+    );
+    assert!(
+        err.contains("Re-push"),
+        "the operator is told the remedy, not only the diagnosis: {err}"
+    );
+    for forbidden in [
+        "no pull request",
+        "without a pull request",
+        "pull request was not",
+    ] {
+        assert!(
+            !err.contains(forbidden),
+            "must never assert a pull request is absent, which is unknowable here: {err}"
+        );
+    }
+
+    // A second pass appends nothing: repeated restarts are idempotent.
+    rounds::phase::reconcile_interrupted(&db).expect("second reconcile");
+    assert_eq!(
+        rounds::reconcile::verdicts_for_run(&db, &run_id)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Selection reads the record's own shape, so a protocol upgrade that terminalizes
+/// active runs inside `Db::open` — before recovery runs — cannot disarm it.
+#[test]
+fn verdict_selection_does_not_depend_on_run_status() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let attempt = seed_deliver_attempt(&db, &run_id);
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &attempt,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Absent,
+        },
+    )
+    .unwrap();
+    set_run_status_raw(home.path(), &run_id, "failed", Some("already terminal"));
+
+    let pending = rounds::reconcile::attempts_awaiting_verdict(&db).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "an already-failed run's unresolved forward is still selected: {pending:?}"
+    );
+    assert_eq!(pending[0].branch, "feat");
+    assert_eq!(pending[0].bare_path, home.path().join("bare.git"));
+}
+
 #[test]
 fn forward_outcome_requires_a_committed_intent() {
     let home = TempDir::new().unwrap();

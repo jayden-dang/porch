@@ -41,7 +41,10 @@ find out what the gate already knew.
   than that `origin` is unchanged, because a failure reported by the pushing command
   is not evidence about the remote's state.
 - **RECON-1.6** WHEN a `deliver` attempt has no forward record THE SYSTEM SHALL
-  conclude that no forward was attempted for that attempt.
+  classify it as no-forward-attempted. Such an attempt is not selected for a persisted
+  conclusion, because `RECON-1.1` scopes persistence to attempts that have a record;
+  the verdict exists so that the classifier is total over the durable states and so
+  that ROAD-9 can assert against a closed set.
 - **RECON-1.7** THE SYSTEM SHALL NOT assert that a pull request is absent. A
   reached-origin conclusion SHALL state that the pull request state is unrecorded,
   because the durable evidence for a crash before the pull request call and for a
