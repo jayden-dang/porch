@@ -169,10 +169,12 @@ fn setup_with_origin() -> (TempDir, PathBuf, PathBuf, PathBuf) {
     );
 
     init_bare(&origin).unwrap();
+    // The fixture owns its own default branch; do not inherit init.defaultBranch.
+    git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
     let seed = root.join("seed");
     std::fs::create_dir_all(&seed).unwrap();
-    git(&seed, &["init"]);
+    git(&seed, &["init", "-b", "main"]);
     git(&seed, &["config", "user.email", "porch@example.com"]);
     git(&seed, &["config", "user.name", "Porch"]);
     git(&seed, &["checkout", "-b", "main"]);

@@ -1632,6 +1632,19 @@ fn deliver_with_repair(
                             }],
                         },
                     )?;
+                    // Unchanged-HEAD success hands off to the next `deliver`
+                    // attempt and never reuses the same ordinal.
+                    let _ = persist_effects(
+                        db,
+                        run_id,
+                        PhaseTransition::Handoff {
+                            from: deliver_attempt,
+                            to_phase: PhaseName::Deliver,
+                            outcome: "deliver_repair".into(),
+                            cause: Some(format!("attempt {attempt} unchanged_head")),
+                        },
+                        RunEffects::none(),
+                    )?;
                     continue;
                 }
                 // Revoke review binding; do not upsert uncertified_pipeline_ranges.
@@ -3472,7 +3485,7 @@ mod custody_tests {
 
         let seed = root.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        git(&seed, &["init"]);
+        git(&seed, &["init", "-b", "main"]);
         git(&seed, &["config", "user.email", "porch@example.com"]);
         git(&seed, &["config", "user.name", "Porch"]);
         git(&seed, &["checkout", "-b", "main"]);
@@ -3524,7 +3537,7 @@ mod custody_tests {
 
         let seed = root.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        git(&seed, &["init"]);
+        git(&seed, &["init", "-b", "main"]);
         git(&seed, &["config", "user.email", "porch@example.com"]);
         git(&seed, &["config", "user.name", "Porch"]);
         git(&seed, &["checkout", "-b", "main"]);
@@ -3582,7 +3595,7 @@ mod continuity_tests {
         let db = Db::open(&home.join("state.sqlite")).unwrap();
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        git(&work, &["init"]);
+        git(&work, &["init", "-b", "main"]);
         git(&work, &["config", "user.email", "porch@example.com"]);
         git(&work, &["config", "user.name", "Porch"]);
         std::fs::write(work.join("README"), "x\n").unwrap();
@@ -3606,7 +3619,7 @@ mod continuity_tests {
         let db = Db::open(&home.join("state.sqlite")).unwrap();
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        git(&work, &["init"]);
+        git(&work, &["init", "-b", "main"]);
         git(&work, &["config", "user.email", "porch@example.com"]);
         git(&work, &["config", "user.name", "Porch"]);
         std::fs::write(work.join("README"), "x\n").unwrap();

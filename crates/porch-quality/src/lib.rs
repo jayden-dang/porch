@@ -208,7 +208,7 @@ mod integration {
     fn toy_range_emits_coverage_and_rust_rule() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        git(root, &["init"]);
+        git(root, &["init", "-b", "main"]);
         git(root, &["config", "user.email", "porch@example.com"]);
         git(root, &["config", "user.name", "Porch"]);
         fs::create_dir_all(root.join("src")).unwrap();

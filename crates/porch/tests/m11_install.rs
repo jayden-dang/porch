@@ -57,7 +57,7 @@ fn git_work_tree(root: &Path) -> PathBuf {
     fs::create_dir_all(&work).unwrap();
     let st = StdCommand::new("git")
         .current_dir(&work)
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .status()
         .unwrap();
     assert!(st.success());

@@ -148,7 +148,9 @@ pub struct ForwardRecordRow {
 /// Why an append was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum ForwardError {
-    #[error("forward intent refused: attempt already has an intent record")]
+    #[error(
+        "forward intent refused: this deliver attempt already forwarded; a retry takes a new attempt"
+    )]
     IntentExists,
     #[error("forward outcome refused: attempt has no committed intent record")]
     IntentMissing,
@@ -313,10 +315,15 @@ pub fn records_for_run_conn(
     Ok(out)
 }
 
-/// Whether a forward attempt recorded that `origin` carries the authorized SHA.
+/// Whether a forward attempt durably recorded that `origin` carries the
+/// authorized SHA.
 ///
 /// This is the reconciliation predicate: an attempt with an intent but no
 /// reached-origin outcome is the ambiguous case that restart discovery owns.
+/// Read it as positive evidence only. `false` is *not* proof that `origin` is
+/// unchanged — a `push_failed` outcome, and an intent with no outcome, both
+/// leave the remote's state undetermined here, because this reads porch's own
+/// record and never probes `origin`.
 ///
 /// # Errors
 ///

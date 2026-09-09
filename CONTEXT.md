@@ -342,21 +342,25 @@ PR checks **by allowlist only**.
 _Avoid_: "deploy", "publish"
 
 **Forward authorization**:
-The durable fact that porch may forward exactly one commit for a **Run** — the
-recorded approved SHA, bound by equality. A live HEAD that merely descends from
-it is not authorized; HEAD movement reaches a forward only through the existing
-**Phase handoff** that revokes the prior approval and re-reviews. Persisted
-before any external mutation (**ARCH-13**), never inferred from remote state.
-_Avoid_: "approval" for the forward act; "continuity" as the durable record.
+The durable fact that porch may forward a commit for a **Run**, resolved at one
+decision point from the recorded approved SHA. Today a live HEAD that descends
+from that SHA is authorized, because certify's own correction commit advances
+HEAD after approval; whether that commit may be forwarded without re-review is
+an open MILE-3 blocker, and binding by equality waits on it. Persisted before
+any external mutation (**ARCH-13**), never inferred from remote state.
+_Avoid_: "approval" for the forward act; "continuity" as the durable record;
+stating the equality rule as though it were in force.
 
 **Forward record**:
 The append-only porch-owned evidence of one forward attempt, keyed to the owning
-`deliver` **Phase attempt**: an intent entry committed before the pushing command
-(run, ref, authorized SHA, observed remote tip) and an outcome entry committed
-after it and before the pull request adapter. It is a reconciliation input — it
-makes an attempt whose push completed distinguishable from one never invoked —
-and never an assurance outcome (**ARCH-11**). Porch derives the outcome from its
-own command result, never from probing `origin`.
+`deliver` **Phase attempt**, one per attempt: an intent entry committed before
+the pushing command (run, ref, authorized SHA, observed remote tip) and an
+outcome entry committed after it and before the pull request adapter. A retry is
+a new attempt, reached by the **Phase handoff**, never a second record on the
+same one. It is a reconciliation input — it makes an attempt whose push completed
+distinguishable from one never invoked — and never an assurance outcome
+(**ARCH-11**). Porch derives the outcome from its own command result, never from
+probing `origin`.
 _Avoid_: "push log", "audit event"; `pr_url` as the evidence a push landed.
 
 **Custody**:

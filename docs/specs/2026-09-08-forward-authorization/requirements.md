@@ -14,20 +14,19 @@ Vocabulary is locked in `CONTEXT.md` — **Deliver**, **Custody**, **Run**, **Pa
 authorization** and **Forward record** there; these criteria use those terms and do
 not redefine them.
 
-Two MILE-3 blockers were resolved in discovery and are recorded on
-`docs/roadmap/INDEX.md`: an approval never survives HEAD advancing past the reviewed
-SHA, and a restart distinguishes an authorized completed push from one never
-attempted by reading durable local state. This feature owns the durable record and
-the exact binding. It does not own restart classification, which is ROAD-8.
+One MILE-3 blocker was resolved in discovery and is recorded on
+`docs/roadmap/INDEX.md`: a restart distinguishes an authorized completed push from one
+never attempted by reading durable local state. The other — whether an approval
+survives HEAD advancing past the reviewed SHA — was **reopened** during this build and
+is not resolved; see *Blocked: binding by equality* below. This feature owns the durable
+record. It does not own the exact binding, and it does not own restart classification,
+which is ROAD-8.
 
 ## 1. A forward carries only what continuity authorized
 
-**Story:** As an operator, I want the gate to forward the commit continuity blessed
-rather than whatever HEAD happens to be, so that the record and the push agree.
+**Story:** As an operator, I want the gate to forward a commit continuity has blessed,
+resolved once at the forward boundary, so that the record and the push agree.
 
-- **FWDAUTH-1.4** WHEN a forward is performed THE SYSTEM SHALL forward the SHA that
-  continuity authorized, and SHALL NOT independently re-read the worktree HEAD to
-  choose what to forward.
 - **FWDAUTH-1.5** IF no approved SHA is recorded for a run THEN THE SYSTEM SHALL fail
   closed rather than forward.
 - **FWDAUTH-1.7** WHEN the forward boundary is reached THE SYSTEM SHALL evaluate
@@ -55,8 +54,18 @@ recorded and **not implemented**:
   descendant of the approved SHA.
 - **FWDAUTH-1.3** (blocked) IF the live HEAD differs from the approved SHA THEN THE
   SYSTEM SHALL fail closed with an error naming both SHAs.
+- **FWDAUTH-1.4** (blocked) WHEN a forward is performed THE SYSTEM SHALL forward the
+  SHA that continuity authorized, and SHALL NOT re-read the worktree HEAD to choose
+  what to forward.
 - **FWDAUTH-1.6** (blocked) THE SYSTEM SHALL leave HEAD movement reachable only
   through the existing phase handoff that revokes the prior approval and re-reviews.
+
+`FWDAUTH-1.4` is recorded here in its original wording. During this build it was
+reworded to forbid only an *independent* re-read, which the implementation does satisfy
+— but that weakened criterion asserts nothing beyond `FWDAUTH-1.7` and let a blocked
+requirement be reported as met. Restoring the original keeps the ledger honest: the
+forward carries the live HEAD once continuity has confirmed it descends from the
+approval, which is not the same as carrying the approved SHA.
 
 ## 2. A forward intent is durable before any external effect
 
@@ -77,6 +86,10 @@ before it pushes, so that a crash cannot hide an attempt from the record.
 - **FWDAUTH-2.6** WHEN a forward is refused before any external mutation, on an
   unincorporated remote tip or an unverifiable safety fact, THE SYSTEM SHALL NOT
   append a forward-intent record for that refusal.
+- **FWDAUTH-2.7** THE SYSTEM SHALL record at most one forward attempt per `deliver`
+  phase attempt, and WHEN a deliver repair succeeds without moving HEAD THE SYSTEM SHALL
+  hand the `deliver` phase off to its next attempt rather than forwarding a second time
+  under the same one, so that a retry is a new attempt with its own record.
 
 ## 3. The forward outcome is durable before the PR call
 
@@ -183,7 +196,7 @@ appear without hand-editing my database.
    porch's own deterministic correction exempt and record it as such; or forbid
    tree-mutating certify commands after approval. Each has a different blast radius,
    and the re-review answer needs a termination rule for a nondeterministic formatter.
-   Owner Jayden. This blocks FWDAUTH-1.1 … FWDAUTH-1.3 and FWDAUTH-1.6, and it
+   Owner Jayden. This blocks FWDAUTH-1.1 … FWDAUTH-1.4 and FWDAUTH-1.6, and it
    reopens the MILE-3 blocker recorded on `docs/roadmap/INDEX.md`.
 2. The residual window between a completed push and its outcome write is owned by
    ROAD-8 and recorded as an owned unknown on `docs/roadmap/INDEX.md`; this feature

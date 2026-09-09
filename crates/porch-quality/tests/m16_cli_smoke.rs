@@ -31,7 +31,7 @@ fn git_stdout(dir: &Path, args: &[&str]) -> String {
 fn binary_range_review_on_toy_repo() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
-    git(root, &["init"]);
+    git(root, &["init", "-b", "main"]);
     git(root, &["config", "user.email", "porch@example.com"]);
     git(root, &["config", "user.name", "Porch"]);
     fs::create_dir_all(root.join("src")).unwrap();

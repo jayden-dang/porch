@@ -416,7 +416,7 @@ fn init_skip_setup_does_not_write_config_init_yes_does() {
 
     let st = StdCommand::new("git")
         .current_dir(&work)
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .status()
         .unwrap();
     assert!(st.success());

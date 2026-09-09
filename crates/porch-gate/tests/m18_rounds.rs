@@ -1768,7 +1768,7 @@ fn bare_with_config_commit(root: &Path) -> (GitDir, PathBuf, String) {
 
     let seed = root.join("seed");
     std::fs::create_dir_all(&seed).unwrap();
-    git(&seed, &["init"]);
+    git(&seed, &["init", "-b", "main"]);
     git(&seed, &["config", "user.email", "porch@example.com"]);
     git(&seed, &["config", "user.name", "Porch"]);
     git(&seed, &["checkout", "-b", "main"]);
@@ -5250,6 +5250,53 @@ fn forward_intent_is_one_per_deliver_attempt() {
         },
     )
     .expect("a new deliver attempt may record its own forward");
+}
+
+/// A deliver repair that leaves HEAD unmoved hands off to the next `deliver`
+/// attempt rather than reusing the ordinal, so its retry forwards under a fresh
+/// attempt and the one-intent-per-attempt rule holds instead of refusing a
+/// legitimate second forward.
+#[test]
+fn same_phase_deliver_handoff_lets_the_retry_forward() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let first = seed_deliver_attempt(&db, &run_id);
+
+    let forward = |attempt: &rounds::AttemptId| {
+        rounds::forward::append_intent(
+            &db,
+            &rounds::ForwardIntent {
+                run_id: &run_id,
+                deliver_attempt_id: attempt,
+                ref_name: "refs/heads/feat",
+                authorized_sha: "aaa",
+                observed: rounds::ObservedRemote::Absent,
+            },
+        )
+    };
+    forward(&first).unwrap();
+
+    let second = rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Handoff {
+            from: first.clone(),
+            to_phase: rounds::phase::PhaseName::Deliver,
+            outcome: "deliver_repair".into(),
+            cause: Some("attempt 1 unchanged_head".into()),
+        },
+        rounds::RunEffects::none(),
+    )
+    .expect("an unchanged-HEAD repair hands deliver off to the next deliver attempt");
+    assert_ne!(second, first, "the handoff never reuses the same ordinal");
+
+    forward(&second).expect("the successor attempt may record its own forward");
+
+    let refused = forward(&first);
+    assert!(
+        matches!(refused, Err(rounds::ForwardError::IntentExists)),
+        "one forward per deliver attempt still holds: {refused:?}"
+    );
 }
 
 #[test]

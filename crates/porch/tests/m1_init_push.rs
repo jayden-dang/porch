@@ -123,7 +123,7 @@ fn init_then_push_records_a_run() {
         std::env::var("PATH").unwrap_or_default()
     );
 
-    git(&work, &["init"]);
+    git(&work, &["init", "-b", "main"]);
     git(&work, &["config", "user.email", "porch@example.com"]);
     git(&work, &["config", "user.name", "Porch"]);
     std::fs::write(work.join("README"), "hi\n").unwrap();
@@ -194,7 +194,7 @@ fn init_then_push_with_noncanonical_porch_home_records_a_run() {
         return;
     }
 
-    git(&work, &["init"]);
+    git(&work, &["init", "-b", "main"]);
     git(&work, &["config", "user.email", "porch@example.com"]);
     git(&work, &["config", "user.name", "Porch"]);
     std::fs::write(work.join("README"), "hi\n").unwrap();
