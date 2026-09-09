@@ -1632,6 +1632,19 @@ fn deliver_with_repair(
                             }],
                         },
                     )?;
+                    // Unchanged-HEAD success hands off to the next `deliver`
+                    // attempt and never reuses the same ordinal.
+                    let _ = persist_effects(
+                        db,
+                        run_id,
+                        PhaseTransition::Handoff {
+                            from: deliver_attempt,
+                            to_phase: PhaseName::Deliver,
+                            outcome: "deliver_repair".into(),
+                            cause: Some(format!("attempt {attempt} unchanged_head")),
+                        },
+                        RunEffects::none(),
+                    )?;
                     continue;
                 }
                 // Revoke review binding; do not upsert uncertified_pipeline_ranges.

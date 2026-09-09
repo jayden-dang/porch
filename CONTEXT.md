@@ -353,16 +353,15 @@ stating the equality rule as though it were in force.
 
 **Forward record**:
 The append-only porch-owned evidence of one forward attempt, keyed to the owning
-`deliver` **Phase attempt** and its position in that attempt's sequence of
-forwards: an intent entry committed before the pushing command (run, ref,
-authorized SHA, observed remote tip) and an outcome entry committed after it and
-before the pull request adapter. At most one forward is in flight per attempt. It
-is a reconciliation input — it makes an attempt whose push completed
+`deliver` **Phase attempt**, one per attempt: an intent entry committed before
+the pushing command (run, ref, authorized SHA, observed remote tip) and an
+outcome entry committed after it and before the pull request adapter. A retry is
+a new attempt, reached by the **Phase handoff**, never a second record on the
+same one. It is a reconciliation input — it makes an attempt whose push completed
 distinguishable from one never invoked — and never an assurance outcome
 (**ARCH-11**). Porch derives the outcome from its own command result, never from
 probing `origin`.
-_Avoid_: "push log", "audit event"; `pr_url` as the evidence a push landed; one
-forward record per `deliver` attempt.
+_Avoid_: "push log", "audit event"; `pr_url` as the evidence a push landed.
 
 **Custody**:
 Porch's claim over a ref while a run holds it — the basis for refusing a

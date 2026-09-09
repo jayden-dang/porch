@@ -5045,24 +5045,12 @@ fn seed_deliver_attempt(db: &Db, run_id: &str) -> rounds::AttemptId {
 
 /// The nullable, per-kind columns of `forward_records`, so a test can offer a
 /// combination the Rust appenders would never build.
+#[derive(Default)]
 struct RawForwardCols<'a> {
     remote_state: Option<&'a str>,
     observed_tip: Option<&'a str>,
     landed_sha: Option<&'a str>,
     detail: Option<&'a str>,
-    forward_ordinal: i64,
-}
-
-impl Default for RawForwardCols<'_> {
-    fn default() -> Self {
-        Self {
-            remote_state: None,
-            observed_tip: None,
-            landed_sha: None,
-            detail: None,
-            forward_ordinal: 1,
-        }
-    }
 }
 
 fn insert_forward_raw(
@@ -5076,14 +5064,13 @@ fn insert_forward_raw(
     register_current_writer_protocol(&conn);
     conn.execute(
         "INSERT INTO forward_records (
-            id, run_id, deliver_attempt_id, forward_ordinal, seq, kind, ref_name,
-            authorized_sha, remote_state, observed_remote_tip, landed_sha, detail, created_at
-         ) VALUES (?1, ?2, ?3, ?4, 99, ?5, 'refs/heads/feat', 'aaa', ?6, ?7, ?8, ?9, '1')",
+            id, run_id, deliver_attempt_id, seq, kind, ref_name, authorized_sha,
+            remote_state, observed_remote_tip, landed_sha, detail, created_at
+         ) VALUES (?1, ?2, ?3, 99, ?4, 'refs/heads/feat', 'aaa', ?5, ?6, ?7, ?8, '1')",
         rusqlite::params![
             format!("raw-{kind}-{}", rand_suffix()),
             run_id,
             attempt.as_str(),
-            cols.forward_ordinal,
             kind,
             cols.remote_state,
             cols.observed_tip,
@@ -5207,64 +5194,108 @@ fn forward_record_checks_reject_dishonest_rows() {
 }
 
 #[test]
-fn forward_attempts_sequence_within_one_deliver_attempt() {
+fn forward_intent_is_one_per_deliver_attempt() {
     let home = TempDir::new().unwrap();
     let db = fixture_db(home.path());
     let run_id = seed_run(&db, home.path());
-    let attempt = seed_deliver_attempt(&db, &run_id);
+    let first = seed_deliver_attempt(&db, &run_id);
 
-    let intent = |db: &_| {
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &first,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Absent,
+        },
+    )
+    .unwrap();
+
+    let again = rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &first,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Absent,
+        },
+    );
+    assert!(
+        matches!(again, Err(rounds::ForwardError::IntentExists)),
+        "second intent on one attempt is refused: {again:?}"
+    );
+
+    // Terminal the first attempt so a second deliver attempt may open.
+    rounds::phase::persist_phase_transition(
+        &db,
+        rounds::phase::PhaseTransition::Terminal {
+            attempt: first,
+            outcome: "failed".into(),
+            cause: None,
+        },
+        rounds::RunEffects::none(),
+    )
+    .unwrap();
+    let second = seed_deliver_attempt(&db, &run_id);
+    rounds::forward::append_intent(
+        &db,
+        &rounds::ForwardIntent {
+            run_id: &run_id,
+            deliver_attempt_id: &second,
+            ref_name: "refs/heads/feat",
+            authorized_sha: "aaa",
+            observed: rounds::ObservedRemote::Present("bbb".into()),
+        },
+    )
+    .expect("a new deliver attempt may record its own forward");
+}
+
+/// A deliver repair that leaves HEAD unmoved hands off to the next `deliver`
+/// attempt rather than reusing the ordinal, so its retry forwards under a fresh
+/// attempt and the one-intent-per-attempt rule holds instead of refusing a
+/// legitimate second forward.
+#[test]
+fn same_phase_deliver_handoff_lets_the_retry_forward() {
+    let home = TempDir::new().unwrap();
+    let db = fixture_db(home.path());
+    let run_id = seed_run(&db, home.path());
+    let first = seed_deliver_attempt(&db, &run_id);
+
+    let forward = |attempt: &rounds::AttemptId| {
         rounds::forward::append_intent(
-            db,
+            &db,
             &rounds::ForwardIntent {
                 run_id: &run_id,
-                deliver_attempt_id: &attempt,
+                deliver_attempt_id: attempt,
                 ref_name: "refs/heads/feat",
                 authorized_sha: "aaa",
                 observed: rounds::ObservedRemote::Absent,
             },
         )
     };
+    forward(&first).unwrap();
 
-    intent(&db).unwrap();
-
-    let while_open = intent(&db);
-    assert!(
-        matches!(while_open, Err(rounds::ForwardError::ForwardInFlight(1))),
-        "a second forward is refused while the first has no outcome: {while_open:?}"
-    );
-
-    rounds::forward::append_outcome(
+    let second = rounds::phase::persist_phase_transition(
         &db,
-        &rounds::ForwardOutcome {
-            run_id: &run_id,
-            deliver_attempt_id: &attempt,
-            ref_name: "refs/heads/feat",
-            authorized_sha: "aaa",
-            kind: rounds::ForwardKind::PushFailed,
-            landed_sha: None,
-            detail: Some("rejected"),
+        rounds::phase::PhaseTransition::Handoff {
+            from: first.clone(),
+            to_phase: rounds::phase::PhaseName::Deliver,
+            outcome: "deliver_repair".into(),
+            cause: Some("attempt 1 unchanged_head".into()),
         },
+        rounds::RunEffects::none(),
     )
-    .unwrap();
+    .expect("an unchanged-HEAD repair hands deliver off to the next deliver attempt");
+    assert_ne!(second, first, "the handoff never reuses the same ordinal");
 
-    // The deliver-repair loop re-forwards under the same attempt when a repair
-    // leaves HEAD unmoved, so a closed forward must not block the next one.
-    intent(&db).expect("a closed forward permits the next forward on the same attempt");
+    forward(&second).expect("the successor attempt may record its own forward");
 
-    let ordinals: Vec<(rounds::ForwardKind, i64)> = rounds::forward::records_for_run(&db, &run_id)
-        .unwrap()
-        .into_iter()
-        .map(|r| (r.kind, r.forward_ordinal))
-        .collect();
-    assert_eq!(
-        ordinals,
-        vec![
-            (rounds::ForwardKind::Intent, 1),
-            (rounds::ForwardKind::PushFailed, 1),
-            (rounds::ForwardKind::Intent, 2),
-        ],
-        "an outcome inherits its intent's ordinal and the next forward increments"
+    let refused = forward(&first);
+    assert!(
+        matches!(refused, Err(rounds::ForwardError::IntentExists)),
+        "one forward per deliver attempt still holds: {refused:?}"
     );
 }
 

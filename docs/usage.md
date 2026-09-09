@@ -369,10 +369,10 @@ row naming the ref, the authorized SHA, and the remote tip the lease was resolve
 **before** it pushes, and an *outcome* row naming what landed **after** the push returns and
 before it opens or updates the pull request. A gate killed between the push and the pull
 request therefore leaves local evidence that the push was authorized and completed, instead
-of a run that looks like it never tried. A `deliver` attempt may record a sequence of
-forward attempts, since a deliver repair that leaves HEAD unmoved re-forwards under the
-same attempt; at most one is ever in flight. Nothing reads that record to decide a restart
-yet — restart still classifies on whether a PR URL was stored.
+of a run that looks like it never tried. Each `deliver` attempt records at most one
+forward, because a deliver repair that leaves HEAD unmoved now hands the phase off to its
+next attempt instead of forwarding twice under the same one. Nothing reads that record to
+decide a restart yet — restart still classifies on whether a PR URL was stored.
 
 The three earlier writer triggers are unchanged; no new trigger is added.
 
