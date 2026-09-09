@@ -214,6 +214,7 @@ CREATE TABLE IF NOT EXISTS forward_records (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES runs(id),
     deliver_attempt_id TEXT NOT NULL REFERENCES phase_attempts(id),
+    forward_ordinal INTEGER NOT NULL,
     seq INTEGER NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('intent','pushed','already_current','push_failed')),
     ref_name TEXT NOT NULL,
@@ -240,9 +241,12 @@ CREATE TABLE IF NOT EXISTS forward_records (
 );
 CREATE INDEX IF NOT EXISTS forward_records_run
     ON forward_records(run_id, seq);
-CREATE UNIQUE INDEX IF NOT EXISTS forward_records_attempt_intent
-    ON forward_records(deliver_attempt_id)
+CREATE UNIQUE INDEX IF NOT EXISTS forward_records_attempt_forward_intent
+    ON forward_records(deliver_attempt_id, forward_ordinal)
     WHERE kind = 'intent';
+CREATE UNIQUE INDEX IF NOT EXISTS forward_records_attempt_forward_outcome
+    ON forward_records(deliver_attempt_id, forward_ordinal)
+    WHERE kind <> 'intent';
 ";
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
@@ -256,6 +260,35 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     ensure_column(conn, "review_rounds", "intent_source", "TEXT")?;
     ensure_column(conn, "review_rounds", "review_duration_ms", "INTEGER")?;
     rebuild_context_elements_without_snapshot_blob_fk(conn)?;
+    widen_forward_records_to_many_forwards_per_attempt(conn)?;
+    Ok(())
+}
+
+/// A `deliver` attempt holds a *sequence* of forward attempts, not one.
+///
+/// The first shape of `forward_records` allowed a single intent per `deliver`
+/// attempt. The deliver-repair loop re-enters the forward under the same
+/// attempt when a repair leaves HEAD unmoved, so that index refused a legitimate
+/// retry. Protocol 4 is unreleased, so this corrects protocol 4 in place rather
+/// than spending a fence bump: add the ordinal and replace the index.
+fn widen_forward_records_to_many_forwards_per_attempt(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "forward_records",
+        "forward_ordinal",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    conn.execute_batch(
+        "
+        DROP INDEX IF EXISTS forward_records_attempt_intent;
+        CREATE UNIQUE INDEX IF NOT EXISTS forward_records_attempt_forward_intent
+            ON forward_records(deliver_attempt_id, forward_ordinal)
+            WHERE kind = 'intent';
+        CREATE UNIQUE INDEX IF NOT EXISTS forward_records_attempt_forward_outcome
+            ON forward_records(deliver_attempt_id, forward_ordinal)
+            WHERE kind <> 'intent';
+        ",
+    )?;
     Ok(())
 }
 

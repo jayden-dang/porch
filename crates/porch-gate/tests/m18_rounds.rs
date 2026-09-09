@@ -1768,7 +1768,7 @@ fn bare_with_config_commit(root: &Path) -> (GitDir, PathBuf, String) {
 
     let seed = root.join("seed");
     std::fs::create_dir_all(&seed).unwrap();
-    git(&seed, &["init"]);
+    git(&seed, &["init", "-b", "main"]);
     git(&seed, &["config", "user.email", "porch@example.com"]);
     git(&seed, &["config", "user.name", "Porch"]);
     git(&seed, &["checkout", "-b", "main"]);
@@ -5045,12 +5045,24 @@ fn seed_deliver_attempt(db: &Db, run_id: &str) -> rounds::AttemptId {
 
 /// The nullable, per-kind columns of `forward_records`, so a test can offer a
 /// combination the Rust appenders would never build.
-#[derive(Default)]
 struct RawForwardCols<'a> {
     remote_state: Option<&'a str>,
     observed_tip: Option<&'a str>,
     landed_sha: Option<&'a str>,
     detail: Option<&'a str>,
+    forward_ordinal: i64,
+}
+
+impl Default for RawForwardCols<'_> {
+    fn default() -> Self {
+        Self {
+            remote_state: None,
+            observed_tip: None,
+            landed_sha: None,
+            detail: None,
+            forward_ordinal: 1,
+        }
+    }
 }
 
 fn insert_forward_raw(
@@ -5064,13 +5076,14 @@ fn insert_forward_raw(
     register_current_writer_protocol(&conn);
     conn.execute(
         "INSERT INTO forward_records (
-            id, run_id, deliver_attempt_id, seq, kind, ref_name, authorized_sha,
-            remote_state, observed_remote_tip, landed_sha, detail, created_at
-         ) VALUES (?1, ?2, ?3, 99, ?4, 'refs/heads/feat', 'aaa', ?5, ?6, ?7, ?8, '1')",
+            id, run_id, deliver_attempt_id, forward_ordinal, seq, kind, ref_name,
+            authorized_sha, remote_state, observed_remote_tip, landed_sha, detail, created_at
+         ) VALUES (?1, ?2, ?3, ?4, 99, ?5, 'refs/heads/feat', 'aaa', ?6, ?7, ?8, ?9, '1')",
         rusqlite::params![
             format!("raw-{kind}-{}", rand_suffix()),
             run_id,
             attempt.as_str(),
+            cols.forward_ordinal,
             kind,
             cols.remote_state,
             cols.observed_tip,
@@ -5194,62 +5207,65 @@ fn forward_record_checks_reject_dishonest_rows() {
 }
 
 #[test]
-fn forward_intent_is_one_per_deliver_attempt() {
+fn forward_attempts_sequence_within_one_deliver_attempt() {
     let home = TempDir::new().unwrap();
     let db = fixture_db(home.path());
     let run_id = seed_run(&db, home.path());
-    let first = seed_deliver_attempt(&db, &run_id);
+    let attempt = seed_deliver_attempt(&db, &run_id);
 
-    rounds::forward::append_intent(
-        &db,
-        &rounds::ForwardIntent {
-            run_id: &run_id,
-            deliver_attempt_id: &first,
-            ref_name: "refs/heads/feat",
-            authorized_sha: "aaa",
-            observed: rounds::ObservedRemote::Absent,
-        },
-    )
-    .unwrap();
+    let intent = |db: &_| {
+        rounds::forward::append_intent(
+            db,
+            &rounds::ForwardIntent {
+                run_id: &run_id,
+                deliver_attempt_id: &attempt,
+                ref_name: "refs/heads/feat",
+                authorized_sha: "aaa",
+                observed: rounds::ObservedRemote::Absent,
+            },
+        )
+    };
 
-    let again = rounds::forward::append_intent(
-        &db,
-        &rounds::ForwardIntent {
-            run_id: &run_id,
-            deliver_attempt_id: &first,
-            ref_name: "refs/heads/feat",
-            authorized_sha: "aaa",
-            observed: rounds::ObservedRemote::Absent,
-        },
-    );
+    intent(&db).unwrap();
+
+    let while_open = intent(&db);
     assert!(
-        matches!(again, Err(rounds::ForwardError::IntentExists)),
-        "second intent on one attempt is refused: {again:?}"
+        matches!(while_open, Err(rounds::ForwardError::ForwardInFlight(1))),
+        "a second forward is refused while the first has no outcome: {while_open:?}"
     );
 
-    // Terminal the first attempt so a second deliver attempt may open.
-    rounds::phase::persist_phase_transition(
+    rounds::forward::append_outcome(
         &db,
-        rounds::phase::PhaseTransition::Terminal {
-            attempt: first,
-            outcome: "failed".into(),
-            cause: None,
-        },
-        rounds::RunEffects::none(),
-    )
-    .unwrap();
-    let second = seed_deliver_attempt(&db, &run_id);
-    rounds::forward::append_intent(
-        &db,
-        &rounds::ForwardIntent {
+        &rounds::ForwardOutcome {
             run_id: &run_id,
-            deliver_attempt_id: &second,
+            deliver_attempt_id: &attempt,
             ref_name: "refs/heads/feat",
             authorized_sha: "aaa",
-            observed: rounds::ObservedRemote::Present("bbb".into()),
+            kind: rounds::ForwardKind::PushFailed,
+            landed_sha: None,
+            detail: Some("rejected"),
         },
     )
-    .expect("a new deliver attempt may record its own forward");
+    .unwrap();
+
+    // The deliver-repair loop re-forwards under the same attempt when a repair
+    // leaves HEAD unmoved, so a closed forward must not block the next one.
+    intent(&db).expect("a closed forward permits the next forward on the same attempt");
+
+    let ordinals: Vec<(rounds::ForwardKind, i64)> = rounds::forward::records_for_run(&db, &run_id)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.kind, r.forward_ordinal))
+        .collect();
+    assert_eq!(
+        ordinals,
+        vec![
+            (rounds::ForwardKind::Intent, 1),
+            (rounds::ForwardKind::PushFailed, 1),
+            (rounds::ForwardKind::Intent, 2),
+        ],
+        "an outcome inherits its intent's ordinal and the next forward increments"
+    );
 }
 
 #[test]

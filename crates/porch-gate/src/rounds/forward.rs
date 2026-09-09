@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use rusqlite::{Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 use ulid::Ulid;
 
 use super::phase::AttemptId;
@@ -135,6 +135,8 @@ pub struct ForwardRecordRow {
     pub id: String,
     pub run_id: String,
     pub deliver_attempt_id: AttemptId,
+    /// Which forward attempt within that `deliver` attempt, from 1.
+    pub forward_ordinal: i64,
     pub seq: i64,
     pub kind: ForwardKind,
     pub ref_name: String,
@@ -148,9 +150,9 @@ pub struct ForwardRecordRow {
 /// Why an append was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum ForwardError {
-    #[error("forward intent refused: attempt already has an intent record")]
-    IntentExists,
-    #[error("forward outcome refused: attempt has no committed intent record")]
+    #[error("forward intent refused: forward {0} on this attempt has no outcome yet")]
+    ForwardInFlight(i64),
+    #[error("forward outcome refused: attempt has no open intent record")]
     IntentMissing,
     #[error("forward outcome refused: {0} is not an outcome kind")]
     NotAnOutcome(ForwardKind),
@@ -162,15 +164,17 @@ pub enum ForwardError {
     Storage(#[from] crate::Error),
 }
 
-/// Append the intent record for a forward attempt.
+/// Append the intent record opening the next forward attempt.
 ///
 /// Commits before the caller invokes any command that mutates `origin`
-/// (ARCH-13). Refuses a second intent for the same `deliver` attempt.
+/// (ARCH-13). A `deliver` attempt may hold a sequence of forwards — the
+/// deliver-repair loop re-forwards under the same attempt when a repair leaves
+/// HEAD unmoved — but never two open at once.
 ///
 /// # Errors
 ///
-/// Returns [`ForwardError::IntentExists`] when the attempt already has an
-/// intent, or a storage error when the transaction cannot commit.
+/// Returns [`ForwardError::ForwardInFlight`] when the attempt's latest forward
+/// has no outcome yet, or a storage error when the transaction cannot commit.
 ///
 /// # Panics
 ///
@@ -183,21 +187,23 @@ pub fn append_intent(
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
         .map_err(crate::Error::from)?;
 
-    if intent_exists_tx(&tx, intent.deliver_attempt_id)? {
-        return Err(ForwardError::IntentExists);
+    if let Some(open) = open_forward_ordinal_tx(&tx, intent.deliver_attempt_id)? {
+        return Err(ForwardError::ForwardInFlight(open));
     }
 
     let id = Ulid::new().to_string();
     let seq = next_seq_tx(&tx, intent.run_id)?;
+    let ordinal = next_forward_ordinal_tx(&tx, intent.deliver_attempt_id)?;
     tx.execute(
         "INSERT INTO forward_records (
-            id, run_id, deliver_attempt_id, seq, kind, ref_name, authorized_sha,
-            remote_state, observed_remote_tip, landed_sha, detail, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10)",
+            id, run_id, deliver_attempt_id, forward_ordinal, seq, kind, ref_name,
+            authorized_sha, remote_state, observed_remote_tip, landed_sha, detail, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, ?11)",
         rusqlite::params![
             &id,
             intent.run_id,
             intent.deliver_attempt_id.as_str(),
+            ordinal,
             seq,
             ForwardKind::Intent.as_str(),
             intent.ref_name,
@@ -212,17 +218,18 @@ pub fn append_intent(
     Ok(id)
 }
 
-/// Append the outcome record for a forward attempt.
+/// Append the outcome record closing the attempt's open forward.
 ///
-/// Requires a committed intent for the same attempt, so the relation in the
-/// spec is a property of the store rather than a convention of the caller.
+/// Requires an open committed intent, so the relation in the spec is a property
+/// of the store rather than a convention of the caller. The outcome inherits
+/// that intent's `forward_ordinal`.
 ///
 /// # Errors
 ///
 /// Returns [`ForwardError::NotAnOutcome`] for a non-outcome kind,
 /// [`ForwardError::LandedShaMissing`] or [`ForwardError::DetailMissing`] when
 /// the kind's evidence is absent, [`ForwardError::IntentMissing`] when the
-/// attempt has no intent, or a storage error when the transaction cannot
+/// attempt has no open intent, or a storage error when the transaction cannot
 /// commit.
 ///
 /// # Panics
@@ -246,21 +253,22 @@ pub fn append_outcome(
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
         .map_err(crate::Error::from)?;
 
-    if !intent_exists_tx(&tx, outcome.deliver_attempt_id)? {
+    let Some(ordinal) = open_forward_ordinal_tx(&tx, outcome.deliver_attempt_id)? else {
         return Err(ForwardError::IntentMissing);
-    }
+    };
 
     let id = Ulid::new().to_string();
     let seq = next_seq_tx(&tx, outcome.run_id)?;
     tx.execute(
         "INSERT INTO forward_records (
-            id, run_id, deliver_attempt_id, seq, kind, ref_name, authorized_sha,
-            remote_state, observed_remote_tip, landed_sha, detail, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10)",
+            id, run_id, deliver_attempt_id, forward_ordinal, seq, kind, ref_name,
+            authorized_sha, remote_state, observed_remote_tip, landed_sha, detail, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11)",
         rusqlite::params![
             &id,
             outcome.run_id,
             outcome.deliver_attempt_id.as_str(),
+            ordinal,
             seq,
             outcome.kind.as_str(),
             outcome.ref_name,
@@ -300,7 +308,8 @@ pub fn records_for_run_conn(
 ) -> Result<Vec<ForwardRecordRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, run_id, deliver_attempt_id, seq, kind, ref_name, authorized_sha,
-                remote_state, observed_remote_tip, landed_sha, detail, created_at
+                remote_state, observed_remote_tip, landed_sha, detail, created_at,
+                forward_ordinal
          FROM forward_records
          WHERE run_id = ?1
          ORDER BY seq, id",
@@ -313,10 +322,14 @@ pub fn records_for_run_conn(
     Ok(out)
 }
 
-/// Whether a forward attempt recorded that `origin` carries the authorized SHA.
+/// Whether a forward attempt durably recorded that `origin` carries the
+/// authorized SHA.
 ///
-/// This is the reconciliation predicate: an attempt with an intent but no
-/// reached-origin outcome is the ambiguous case that restart discovery owns.
+/// Read this as positive evidence only. `false` is *not* proof that `origin` is
+/// unchanged: a `push_failed` outcome, and an intent with no outcome, both leave
+/// the remote's state undetermined here, because this reads porch's own record
+/// and never probes `origin`. Turning that into a run classification is restart
+/// discovery's job, not this predicate's.
 ///
 /// # Errors
 ///
@@ -336,19 +349,43 @@ pub fn attempt_reached_origin(db: &Db, deliver_attempt_id: &AttemptId) -> Result
     Ok(n > 0)
 }
 
-fn intent_exists_tx(
+/// The ordinal of the attempt's open forward: an intent with no outcome yet.
+fn open_forward_ordinal_tx(
     tx: &Transaction<'_>,
     attempt: &AttemptId,
-) -> std::result::Result<bool, ForwardError> {
-    let n: i64 = tx
+) -> std::result::Result<Option<i64>, ForwardError> {
+    let open: Option<i64> = tx
         .query_row(
-            "SELECT COUNT(*) FROM forward_records
-             WHERE deliver_attempt_id = ?1 AND kind = 'intent'",
+            "SELECT i.forward_ordinal FROM forward_records i
+             WHERE i.deliver_attempt_id = ?1 AND i.kind = 'intent'
+               AND NOT EXISTS (
+                   SELECT 1 FROM forward_records o
+                   WHERE o.deliver_attempt_id = i.deliver_attempt_id
+                     AND o.forward_ordinal = i.forward_ordinal
+                     AND o.kind <> 'intent'
+               )
+             ORDER BY i.forward_ordinal DESC
+             LIMIT 1",
+            [attempt.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(crate::Error::from)?;
+    Ok(open)
+}
+
+fn next_forward_ordinal_tx(
+    tx: &Transaction<'_>,
+    attempt: &AttemptId,
+) -> std::result::Result<i64, ForwardError> {
+    let max: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(forward_ordinal) FROM forward_records WHERE deliver_attempt_id = ?1",
             [attempt.as_str()],
             |row| row.get(0),
         )
         .map_err(crate::Error::from)?;
-    Ok(n > 0)
+    Ok(max.unwrap_or(0) + 1)
 }
 
 fn next_seq_tx(tx: &Transaction<'_>, run_id: &str) -> std::result::Result<i64, ForwardError> {
@@ -374,6 +411,7 @@ fn map_record(row: &rusqlite::Row<'_>) -> Result<ForwardRecordRow> {
         id: row.get(0)?,
         run_id: row.get(1)?,
         deliver_attempt_id: AttemptId::from_raw(row.get::<_, String>(2)?),
+        forward_ordinal: row.get(12)?,
         seq: row.get(3)?,
         kind,
         ref_name: row.get(5)?,
