@@ -124,10 +124,10 @@ anything remains to clean up.
 
 ## 5. What this wave did not decide
 
-- **ESCAPE-5.1** THE SYSTEM SHALL NOT add a refusal to `eject --purge`. Purge remains
-  the lossy door that `CONTEXT.md` already declares outside GOAL-4's no-loss guarantee.
-  A refusal predicate, an `--abandon` override, and a dry-run manifest are all held for
-  the blocker's ratification.
+- **ESCAPE-5.1** ~~THE SYSTEM SHALL NOT add a refusal to `eject --purge`.~~
+  **Superseded 2026-09-10 by PURGE** (`docs/specs/2026-09-10-purge-refuses-unforwarded-tips/`).
+  `--purge` now refuses over unforwarded custody tips and active runs; `--abandon`
+  is the explicit override.
 - **ESCAPE-5.2** This wave SHALL NOT move MILE-4 from `Planned` to `Committed`.
 
 The framing recommendation carried forward for ratification, recorded here so the

@@ -86,6 +86,11 @@ enum Command {
         /// Leaves other repos under `$PORCH_HOME` and global config untouched.
         #[arg(long)]
         purge: bool,
+        /// Proceed with `--purge` despite unforwarded custody tips or active runs.
+        /// The abandoned tips and run ids are written under `$PORCH_HOME/abandoned/`
+        /// before anything is deleted.
+        #[arg(long, requires = "purge")]
+        abandon: bool,
     },
     /// Enqueue a new run from a prior run's recorded tip (fresh worktree).
     Rerun {
@@ -265,7 +270,7 @@ fn main_inner() -> Result<ExitCode> {
         Some(Command::Runs { limit }) => run_runs(limit),
         Some(Command::Status { json }) => run_status(json),
         Some(Command::Attach { run_id }) => run_attach_cmd(run_id.as_deref()),
-        Some(Command::Eject { purge }) => run_eject(purge),
+        Some(Command::Eject { purge, abandon }) => run_eject(purge, abandon),
         Some(Command::Rerun { run_id }) => run_rerun(run_id.as_deref()),
         Some(Command::Daemon { command }) => run_daemon_command(&command),
         Some(Command::Agent {
@@ -532,7 +537,7 @@ fn run_agent_audit(home: &Path, run_id: Option<&str>, work_tree: &Path) -> Agent
     }
 }
 
-fn run_eject(purge: bool) -> Result<ExitCode> {
+fn run_eject(purge: bool, abandon: bool) -> Result<ExitCode> {
     let work = env::current_dir()?;
     if !is_git_work_tree(&work) {
         bail!("not a git work tree");
@@ -542,6 +547,7 @@ fn run_eject(purge: bool) -> Result<ExitCode> {
         work_tree: &work,
         porch_home: &home,
         purge,
+        abandon,
     })?;
     println!(
         "ejected repo {} (bare was {})",

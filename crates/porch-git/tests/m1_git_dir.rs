@@ -3,9 +3,9 @@
 use std::process::Command;
 
 use porch_git::{
-    GitDir, PushDecision, RemoteTip, fetch_git_args, force_fetch_refspec, init_bare,
-    list_tree_names_at, ls_remote_sha, push_exact_sha, remote_commits_incorporated,
-    resolve_push_decision, run, run_c, show_path_at, stdout_trim,
+    GitDir, PushDecision, RemoteTip, fetch_git_args, force_fetch_refspec, init_bare, is_ancestor,
+    is_ancestor_git_dir, list_tree_names_at, ls_remote_sha, push_exact_sha,
+    remote_commits_incorporated, resolve_push_decision, run, run_c, show_path_at, stdout_trim,
 };
 use tempfile::TempDir;
 
@@ -76,6 +76,37 @@ fn rev_parse_head_uses_absolute_git_dir() {
     let sha = stdout_trim(&out);
     assert_eq!(sha.len(), 40, "expected full SHA, got {sha:?}");
     assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[test]
+fn is_ancestor_git_dir_equal_ancestor_not_and_missing_object() {
+    let tmp = TempDir::new().unwrap();
+    let work = tmp.path().canonicalize().unwrap();
+    write_commit(&work);
+    let git_dir = GitDir::new(work.join(".git")).unwrap();
+    let parent = stdout_trim(&run(&git_dir, &["rev-parse", "HEAD"]).unwrap());
+    std::fs::write(work.join("README"), "next\n").unwrap();
+    Command::new("git")
+        .current_dir(&work)
+        .args(["add", "README"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .current_dir(&work)
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", "second"])
+        .status()
+        .unwrap();
+    let child = stdout_trim(&run(&git_dir, &["rev-parse", "HEAD"]).unwrap());
+
+    assert!(is_ancestor_git_dir(&git_dir, &child, &child).unwrap());
+    assert!(is_ancestor_git_dir(&git_dir, &parent, &child).unwrap());
+    assert!(!is_ancestor_git_dir(&git_dir, &child, &parent).unwrap());
+    assert!(is_ancestor(&work, &parent, "HEAD").unwrap());
+    let missing = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    assert!(
+        is_ancestor_git_dir(&git_dir, missing, &child).is_err(),
+        "missing object must be Err, not Ok(false)"
+    );
 }
 
 #[test]

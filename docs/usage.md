@@ -294,6 +294,7 @@ needs a writable open.
 ```sh
 porch eject                 # drop remote `porch` + neutralize hooks
 porch eject --purge         # also delete this repo’s bare, worktrees, run rows
+porch eject --purge --abandon  # chosen loss: proceed despite unforwarded tips or active runs
 ```
 
 `--purge` does not delete other repos under `$PORCH_HOME` or global `config.yaml`.
@@ -303,17 +304,30 @@ bare repository, which holds every porch-authored commit — certify's correctio
 and fixer commits — that you have not pulled into your checkout. Run `porch agent sync`
 first if you want them. Plain `porch eject` keeps all of it.
 
+`--purge` refuses, and does **not** detach, while this repo still has unforwarded
+custody tips (`refs/porch/recover/*` on the gate repository, or leftover worktree
+HEADs) or active runs (`pending` / `running` / `parked`). The refusal prints those
+tips and run ids. Inspect with `porch status`, recover with `porch agent sync --recover`,
+then either leave the gate state in place or pass `--abandon` to record the chosen
+loss under `$PORCH_HOME/abandoned/` and proceed. A tree with nothing unforwarded
+and no active runs still purges without `--abandon`.
+
 Detaching does not need a healthy daemon or a readable database. It reports one of three
-outcomes:
+outcomes after a detach:
 
 | Output | Meaning |
 |---|---|
 | `PORCH_HOME left intact` | detached; this repo's gate state preserved |
 | `purged this repo's bare, worktrees, run artifacts, and DB rows` | detached and removed |
-| `detached, but this repo's gate state was left behind: <reason>` | detached; `--purge` could not run, nothing on disk was destroyed, exit code 1 |
+| `detached, but this repo's gate state was left behind: <reason>` | detached; `--purge` could not finish, exit code 1 |
 
-The third case is retryable: re-run `porch eject --purge` once the reason is cleared. So
-is an eject interrupted part-way — a second run picks up from whatever step it reached.
+A refused `--purge` is a fourth operator-facing case that is **not** a detach:
+the command fails, the `porch` remote remains, and `porch status` still lists the
+tips. Re-run `--purge` once the tips are recovered or pass `--abandon`.
+
+The left-behind case is retryable: re-run `porch eject --purge` once the reason is
+cleared. So is an eject interrupted part-way — a second run picks up from whatever
+step it reached.
 
 ## O. Typical day
 
