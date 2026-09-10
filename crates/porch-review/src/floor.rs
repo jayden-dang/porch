@@ -409,6 +409,109 @@ mod tests {
         );
     }
 
+    // ONEBIN-2. A porch replaced while running keeps its inode and loses its path,
+    // while the directory it lived in survives holding the *new* floor. The override
+    // reproduces the end state that matters -- a launch path naming no file -- which
+    // is what `resolve` tests, rather than racing a real unlink.
+
+    #[test]
+    fn a_launch_path_that_no_longer_exists_refuses_before_the_sibling_is_considered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let install = tmp.path().join("install");
+        let launch = install_exe(&install, "porch", "porch-launch");
+        // The sibling is present and perfectly good. It is still not this porch's.
+        let sibling = install_exe(&install, &quality_name(), "canonical-floor");
+        fs::remove_file(&launch).unwrap();
+
+        let _launch = super::LaunchOverride::set(launch.clone());
+        let err = resolve().expect_err("a replaced porch must not resolve a floor");
+        match err {
+            crate::Error::FloorLaunchReplaced { launch: got } => {
+                assert!(
+                    got.contains(&launch.display().to_string()),
+                    "should name the launch path, got {got}"
+                );
+                let rendered = crate::Error::FloorLaunchReplaced { launch: got }.to_string();
+                assert!(
+                    rendered.contains(super::LAUNCH_REPLACED_REMEDY),
+                    "must carry a remedy, got {rendered}"
+                );
+            }
+            other => panic!("expected the replaced condition, got {other:?}"),
+        }
+        assert!(sibling.exists(), "the sibling was never the problem");
+    }
+
+    #[test]
+    fn a_replaced_launch_is_distinguishable_from_a_missing_sibling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let gone_launch = {
+            let install = tmp.path().join("replaced");
+            let launch = install_exe(&install, "porch", "porch-launch");
+            install_exe(&install, &quality_name(), "canonical-floor");
+            fs::remove_file(&launch).unwrap();
+            let _o = super::LaunchOverride::set(launch);
+            resolve().expect_err("replaced must refuse")
+        };
+        let gone_sibling = {
+            let install = tmp.path().join("no-floor");
+            let launch = install_exe(&install, "porch", "porch-launch");
+            let _o = super::LaunchOverride::set(launch);
+            resolve().expect_err("absent sibling must refuse")
+        };
+
+        assert!(matches!(
+            gone_launch,
+            crate::Error::FloorLaunchReplaced { .. }
+        ));
+        assert!(matches!(gone_sibling, crate::Error::FloorUnresolved { .. }));
+    }
+
+    #[test]
+    fn floor_state_carries_the_identity_the_assurance_record_stores() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let install = tmp.path().join("install");
+        let launch = install_exe(&install, "porch", "porch-launch");
+        install_exe(&install, &quality_name(), "canonical-floor");
+        let _launch = super::LaunchOverride::set(launch);
+
+        let prepared = resolve().expect("floor should resolve");
+        let crate::plan::ObservedVersionIdentity::ArtifactSha256(recorded) =
+            &prepared.plan.descriptor.observed_version_identity
+        else {
+            panic!("identity must be content-derived");
+        };
+
+        match super::state() {
+            super::FloorState::Ready {
+                sibling,
+                artifact_identity,
+            } => {
+                assert_eq!(&artifact_identity, recorded, "one fact, two readers");
+                assert_eq!(sibling, prepared.plan.spawned_target_absolute);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_floor_state_offers_the_operator_a_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let install = tmp.path().join("install");
+        let launch = install_exe(&install, "porch", "porch-launch");
+        let _launch = super::LaunchOverride::set(launch);
+
+        let unresolved = super::state();
+        assert!(!unresolved.is_ready());
+        assert!(
+            unresolved.remedy().contains("cargo install porch"),
+            "remedy must name a command, got {}",
+            unresolved.remedy()
+        );
+        assert!(super::LAUNCH_REPLACED_REMEDY.contains("porch daemon"));
+    }
+
     #[test]
     fn recorded_path_matches_content_identity_and_replacement_fails_stability() {
         let tmp = tempfile::TempDir::new().unwrap();
