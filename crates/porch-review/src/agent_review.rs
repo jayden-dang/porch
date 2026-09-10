@@ -367,10 +367,8 @@ fn derive_agent_coverage(parsed: &AgentReviewJson) -> Vec<String> {
 ///
 /// Returns [`Error::Msg`] when no agent binary can be resolved.
 pub fn agent_review_bin(porch_home: &Path) -> Result<String, Error> {
-    if let Ok(v) = std::env::var(REVIEW_AGENT_BIN_ENV) {
-        if !v.trim().is_empty() {
-            return Ok(v);
-        }
+    if let Some(v) = crate::env_override(REVIEW_AGENT_BIN_ENV) {
+        return Ok(v);
     }
     if let Ok(Some(cfg)) = crate::load_home_config(porch_home) {
         if let Some(b) = cfg
@@ -398,10 +396,10 @@ pub fn agent_review_bin(porch_home: &Path) -> Result<String, Error> {
 /// `PORCH_REVIEW_BIN` wins (keeps generic/OCR PATH fakes green).
 #[must_use]
 pub fn review_uses_agent(porch_home: Option<&Path>) -> bool {
-    if std::env::var(crate::REVIEW_BIN_ENV).is_ok_and(|s| !s.trim().is_empty()) {
+    if crate::env_override(crate::REVIEW_BIN_ENV).is_some() {
         return false;
     }
-    if std::env::var(REVIEW_AGENT_BIN_ENV).is_ok_and(|s| !s.trim().is_empty()) {
+    if crate::env_override(REVIEW_AGENT_BIN_ENV).is_some() {
         return true;
     }
     let home = porch_home

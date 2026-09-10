@@ -132,6 +132,7 @@ fn setup_yes_with_fake_ocr_writes_wrapper_and_records_argv() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["setup", "--yes", "--engine", "ocr"])
         .assert()
         .success();
@@ -191,6 +192,7 @@ fn setup_yes_fails_closed_without_review_engine() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["setup", "--yes"])
         .assert()
         .failure();
@@ -221,6 +223,7 @@ fn porch_review_bin_env_wins_over_config() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["setup", "--yes", "--engine", "ocr"])
         .assert()
         .success();
@@ -253,6 +256,7 @@ fn doctor_warns_before_setup_ok_after() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .arg("doctor")
         .assert()
         .success()
@@ -265,6 +269,7 @@ fn doctor_warns_before_setup_ok_after() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["setup", "--yes", "--engine", "ocr"])
         .assert()
         .success();
@@ -274,6 +279,7 @@ fn doctor_warns_before_setup_ok_after() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .arg("doctor")
         .assert()
         .success()
@@ -295,6 +301,7 @@ fn tampered_wrapper_fails_verify() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["setup", "--yes", "--engine", "ocr"])
         .assert()
         .success();
@@ -308,6 +315,7 @@ fn tampered_wrapper_fails_verify() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["setup", "--verify"])
         .assert()
         .failure();
@@ -331,6 +339,7 @@ fn apply_verify_failure_restores_working_wrapper() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["setup", "--yes", "--engine", "ocr"])
         .assert()
         .success();
@@ -347,6 +356,7 @@ fn apply_verify_failure_restores_working_wrapper() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["setup", "--apply"])
         .assert()
         .failure();
@@ -387,6 +397,7 @@ fn generic_engine_with_fake_review_on_path() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["setup", "--yes", "--engine", "generic"])
         .assert()
         .success();
@@ -444,6 +455,7 @@ fn init_skip_setup_does_not_write_config_init_yes_does() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["init", "--skip-setup"])
         .assert()
         .success();
@@ -465,6 +477,7 @@ fn init_skip_setup_does_not_write_config_init_yes_does() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home2)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .args(["init", "--yes"])
         .assert()
         .success();
@@ -502,6 +515,7 @@ fn nontty_setup_prints_json_no_hang() {
         .env("PATH", path_with(&bin))
         .env("PORCH_HOME", &home)
         .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .arg("setup")
         .assert()
         .success();

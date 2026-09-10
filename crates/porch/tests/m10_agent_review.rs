@@ -346,6 +346,9 @@ fn agent_review_push_writes_prompt_and_completes() {
             (GH_BIN_ENV, fake_gh.as_os_str()),
             ("PATH", path.as_ref()),
             ("PORCH_REVIEW_TIMEOUT_SECS", "10".as_ref()),
+            // The daemon inherits the whole environment; blank reads as unset, and
+            // a set PORCH_REVIEW_BIN would silently route review down the CLI path.
+            ("PORCH_REVIEW_BIN", "".as_ref()),
         ],
     )
     .unwrap();
@@ -359,6 +362,7 @@ fn agent_review_push_writes_prompt_and_completes() {
         .current_dir(&work)
         .env("PORCH_HOME", &home)
         .env("PORCH_REVIEW_AGENT_BIN", &fake_agent)
+        .env_remove("PORCH_REVIEW_BIN")
         .env("PATH", &path)
         .args(["push", "porch", "HEAD:refs/heads/feat-agent"])
         .output()

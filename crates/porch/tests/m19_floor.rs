@@ -378,15 +378,19 @@ fn setup_with(engine: &str, floor_mode: &str, review_timeout: &str) -> Harness {
 
     kill_daemon(&home);
     let timeout: &std::ffi::OsStr = review_timeout.as_ref();
+    // The daemon inherits the whole environment, so the `env_remove` calls above cannot
+    // reach it. Blank the same overrides explicitly; blank reads as unset.
     let mut extra: Vec<(&str, &std::ffi::OsStr)> = vec![
         (GH_BIN_ENV, fake_gh.as_os_str()),
         (FIXER_BIN_ENV, fake_fixer.as_os_str()),
         ("PATH", path.as_ref()),
         ("PORCH_REVIEW_TIMEOUT_SECS", timeout),
+        ("PORCH_REVIEW_BIN", "".as_ref()),
     ];
-    if let Some(agent) = &fake_agent {
-        extra.push((REVIEW_AGENT_BIN_ENV, agent.as_os_str()));
-    }
+    extra.push(match &fake_agent {
+        Some(agent) => (REVIEW_AGENT_BIN_ENV, agent.as_os_str()),
+        None => (REVIEW_AGENT_BIN_ENV, "".as_ref()),
+    });
     porch_gate::spawn_detached_with_env(&porch_bin, &home, &extra).unwrap();
     porch_gate::wait_for_health(&home, Duration::from_secs(5)).unwrap();
 
@@ -419,6 +423,7 @@ fn push_branch(work: &Path, home: &Path, branch: &str) {
     let out = StdCommand::new("git")
         .current_dir(work)
         .env("PORCH_HOME", home)
+        .env_remove("PORCH_REVIEW_BIN")
         .args(["push", "porch", &format!("HEAD:refs/heads/{branch}")])
         .output()
         .unwrap();
@@ -541,6 +546,7 @@ fn push_named(h: &Harness, branch: &str, file: &str) {
     let out = StdCommand::new("git")
         .current_dir(&h.work)
         .env("PORCH_HOME", &h.home)
+        .env_remove("PORCH_REVIEW_BIN")
         .args(["push", "porch", &format!("HEAD:refs/heads/{branch}")])
         .output()
         .unwrap();
