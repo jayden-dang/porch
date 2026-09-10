@@ -438,12 +438,13 @@ fn a_wedged_daemon_is_not_replaced_by_a_second_one() {
     let s = setup();
     let wedged = WedgedDaemon::new(&s);
 
-    // `porch runs` calls `ensure_daemon`. Bounding the RPC turned its former
-    // infinite hang into a reachable spawn, and the spawn used to succeed: the
-    // single-instance guard discarded `fs4`'s `Ok(false)` for a contended lock, so
-    // a second daemon bound the socket and served the same state root while the
-    // first was alive and holding the lock (`DFAULT-6.1`, `DFAULT-6.2`).
-    let out = porch(&s).arg("runs").output().unwrap();
+    // `porch rerun` still calls `ensure_daemon` (a work command). Inspect
+    // commands no longer spawn (`LOOK-1.1`). Bounding the RPC turned the
+    // former infinite hang into a reachable spawn, and the spawn used to
+    // succeed: the single-instance guard discarded `fs4`'s `Ok(false)` for a
+    // contended lock, so a second daemon bound the socket and served the same
+    // state root while the first was alive (`DFAULT-6.1`, `DFAULT-6.2`).
+    let out = porch(&s).arg("rerun").output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("not answering"),

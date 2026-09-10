@@ -139,18 +139,21 @@ From the clone (TTY):
 ```sh
 porch                 # attach TUI if this branch has pending/running/parked
 porch attach          # same; --run-id <ULID> to pick a run
-porch status          # daemon + latest
-porch runs            # JSON list
+porch status          # **Daemon condition**, latest run, recover refs, **Forward verdict**s — does not start a daemon
+porch runs            # JSON list (same join; does not start a daemon)
 ```
 
 Non-TTY `porch` / `attach` prints a snapshot (never raw mode).
 
 When `phase=compose`, `porch agent status` also shows `pr_url`, `compose_packet_path` (`$PORCH_HOME/runs/<run_id>/compose-packet.json`), and `allowed_actions` `respond` | `skip` | `abort`.
 
-`porch agent status` and `porch status` state the run's **assurance shape**
+`porch agent status` states the run's **assurance shape**
 (`floor-only` or `floor+judgment`) on `assurance_record` when a round backs the
 run. Legacy and unreviewed records omit the shape. A delivered PR's hidden
 `porch-attestation` comment includes the same shape next to `head_sha`.
+`porch status` is inspect, not the compact live snapshot: it reports
+**Daemon condition**, recover refs, leftover worktree HEADs, and **Forward
+verdict**s without calling the daemon.
 
 ## I. Parked review (TUI)
 
@@ -259,8 +262,10 @@ porch daemon uninstall
 ```
 
 `porch daemon status` and `porch doctor` both report which of four conditions the
-daemon is in. Neither starts a daemon, so asking does not change the answer, and
-neither can hang: every RPC has a deadline.
+daemon is in. `porch status` and `porch runs` report the same **Daemon condition**
+and also join custody tips and **Forward verdict**s. None of those four starts a
+daemon, so asking does not change the answer, and none of them can hang: every RPC
+has a deadline, and inspect does not wait on one.
 
 | `condition` | Means | What to do |
 |---|---|---|
@@ -277,8 +282,12 @@ diagnosis three times.
 `PORCH_RPC_TIMEOUT_MS` widens or narrows every RPC deadline. Raise it on a loaded
 machine if a healthy gate is reported as `not-answering`.
 
-Whatever the condition, `porch eject` still detaches and `porch agent status` /
-`respond` / `sync` still answer — they read the state database directly.
+Whatever the condition, `porch eject` still detaches. `porch status` and
+`porch runs` still answer: they open the state database read-only (they cannot
+create it, migrate it, or terminalize a run) and they list `refs/porch/recover/*`
+from the gate repository even when that open fails. `porch agent status` /
+`sync` also use that read-only open. `porch agent respond` still writes and still
+needs a writable open.
 
 ## N. Leave a clone
 
@@ -428,10 +437,16 @@ restart makes of that record.
 
 ## U. What you see when a gate died mid-forward
 
-A restart now reads that record instead of guessing from the pull request URL. The run's
-status rule is unchanged — a `failed` run is still `failed`, a run with a stored PR URL is
-still `ci_monitor_interrupted` — and **no upgrade or protocol bump is involved**; the
-conclusion is added to the run's error, after the familiar `daemon restarted...` phrase.
+`porch status` joins three sources and does not start a daemon to do it.
+
+The durable source of a **Forward verdict** is the `forward_reconciliations`
+table, not `runs.error`. A restart still appends the conclusion and, for a run
+that was still `running`, still prefixes `runs.error` — but a protocol bump
+terminalizes active runs *before* that restart path runs, so those rows never
+get the prose. Inspect reads the table. If the table has no row yet (the
+daemon died before the next start classified the **Forward record**), `porch
+status` derives the same `classify` result as a read and labels it awaiting
+reconciliation. It never writes that derivation back.
 
 You will see one of:
 
@@ -446,6 +461,12 @@ You will see one of:
   writes only once the remote acknowledges a push, so a match resolves it without any
   network call. An absent or different ref resolves nothing and the run stays
   undetermined.
+- **not attempted** — there is no intent record. `operator_note` is empty; the typed
+  verdict still appears.
+
+Recover every reachable porch-authored commit with `porch status` (lists
+`refs/porch/recover/*` and leftover worktree HEADs) then `porch agent sync --recover`
+for the one run you want. `--recover` never rewrites `origin`.
 
 **In both cases the remedy is the same: run the branch through the gate again.** The push
 is safe to repeat, and porch adopts an existing pull request for that branch rather than
