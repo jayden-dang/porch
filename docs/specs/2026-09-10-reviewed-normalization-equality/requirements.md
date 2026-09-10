@@ -1,7 +1,7 @@
 # Requirements: Reviewed normalization and binding by equality
 
 Feature code: EQUAL
-Status: Specified
+Status: Implemented
 Date: 2026-09-10
 
 Roadmap item: ROAD-23 (MILE-3 — Crash-safe forwarding). Completes GOAL-1's fourth
@@ -115,11 +115,10 @@ pushed.
 **Story:** As a reader of ROAD-9's suite, I want the test that pinned the bug to
 assert the close, so the suite cannot stay green by keeping the bug.
 
-- **EQUAL-4.1** `tripwire_a_correction_commit_forwards_an_unreviewed_sha` SHALL
-  become a guard that origin's tip equals `review_approved_head_sha` and that
-  a finalized complete round's `to_sha` equals that SHA. When format rewrote,
-  origin's log MAY contain `porch: apply format` *as an ancestor of the approved
-  SHA*, never as a descendant of it.
+- **EQUAL-4.1** `format_rewrite_is_inside_the_reviewed_range_and_forward_binds_by_equality`
+  SHALL replace the ROAD-9 tripwire. Origin's tip SHALL equal
+  `review_approved_head_sha`. When format rewrote, origin's log MAY contain
+  `porch: apply format` as an ancestor of that SHA, never as a descendant of it.
 - **EQUAL-4.2** The unit test that currently asserts a descendant "stays
   forwardable today" SHALL invert: a descendant SHALL be refused, naming both
   SHAs.

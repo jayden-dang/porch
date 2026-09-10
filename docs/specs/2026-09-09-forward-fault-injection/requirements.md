@@ -221,19 +221,19 @@ interrupted, which is what `RECON-3.6` needs.
 **Story:** As the owner of the MILE-3 blocker, I want its cost executable rather than
 argued, so that deciding it is informed by a test I can read.
 
-The live tolerance forwards a descendant of the approved SHA
-(`crates/porch-run/src/lib.rs:1897`-`:1902`), so certify's own correction commit is
-forwarded without re-review and an approval covers a tree that was never reviewed.
-`FWDAUTH-1.4` is recorded Blocked for exactly this reason.
+EQUAL (ROAD-23) decided the blocker: format rewrites in rebase so they are reviewed,
+certify never commits, and the forward binds by equality. The pin below became the
+guard `format_rewrite_is_inside_the_reviewed_range_and_forward_binds_by_equality`.
 
-- **FAULT-8.1** THE SYSTEM SHALL be covered by one test pinning today's behaviour: after
+- **FAULT-8.1** (historical) THE SYSTEM SHALL be covered by one test pinning today's behaviour: after
   a correction commit, the SHA carried to the forward boundary is not the reviewed SHA.
-- **FAULT-8.2** That test SHALL NOT assert that the behaviour is correct, and SHALL say
+  Superseded by EQUAL-4.1.
+- **FAULT-8.2** (historical) That test SHALL NOT assert that the behaviour is correct, and SHALL say
   in its own documentation that it changes when the blocker is decided. It exists so the
   gap is visible in the suite rather than only in prose.
 - **FAULT-8.3** THE SYSTEM SHALL NOT be given a test asserting that an approval survives
-  a HEAD advance, because that would encode an undecided product question as a regression
-  guard.
+  a HEAD advance. EQUAL deleted the writer that advanced HEAD; the surviving guard
+  asserts origin's tip *equals* the approved SHA.
 
 ## Out of scope
 

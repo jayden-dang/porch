@@ -1,6 +1,7 @@
 # Design — reviewed normalization and binding by equality
 
 **Feature code:** EQUAL
+**Status:** Implemented
 **Roadmap item:** ROAD-23 (MILE-3)
 **Requirements:** `requirements.md`
 **Respects:** ARCH-4, ARCH-6, ARCH-13
