@@ -488,8 +488,17 @@ fn execute_run(home: &Path, run_id: &str, cancel: &AtomicBool) -> Result<()> {
                     }
                 }
                 "rebase" => {
-                    let _ = start_phase(&db, run_id, PhaseName::Rebase, RunEffects::none())?;
-                    match run_rebase(&db, home, run_id, &bare, &wt_path, &repo.default_branch)? {
+                    let rebase_attempt =
+                        start_phase(&db, run_id, PhaseName::Rebase, RunEffects::none())?;
+                    match run_rebase(
+                        &db,
+                        home,
+                        run_id,
+                        &bare,
+                        &wt_path,
+                        &repo.default_branch,
+                        &rebase_attempt,
+                    )? {
                         RebaseOutcome::Completed { empty } => {
                             complete_phase_step(&db, run_id, phase, "completed", None)?;
                             if empty {
@@ -1891,11 +1900,10 @@ fn maybe_deliver_repair_commit(wt: &Path) -> Result<bool> {
 
 /// The SHA a forward may carry, or a closed failure.
 ///
-/// A recorded approval is mandatory. Continuity still tolerates a live HEAD
-/// that descends from the approved SHA because certify's own correction commit
-/// advances HEAD after review approves; binding by equality is blocked on
-/// deciding whether that commit is re-reviewed first. See the Open Questions of
-/// `docs/specs/2026-09-08-forward-authorization/requirements.md`.
+/// A recorded approval is mandatory. Continuity requires the live HEAD to
+/// equal that SHA: certify no longer commits after approval, so a descendant is
+/// an unreviewed tree. The value returned is the approved SHA (the continuity-
+/// authorized value), not a re-read of HEAD.
 pub(crate) fn authorized_forward_sha(db: &Db, run_id: &str, wt: &Path) -> Result<String> {
     let run = db
         .run_by_id(run_id)?
@@ -1904,11 +1912,11 @@ pub(crate) fn authorized_forward_sha(db: &Db, run_id: &str, wt: &Path) -> Result
         .review_approved_head_sha
         .ok_or_else(|| RunError::Msg("HEAD continuity: review_approved_head_sha missing".into()))?;
     let head = porch_git::rev_parse_c(wt, "HEAD")?;
-    if head == approved || porch_git::is_ancestor(wt, &approved, &head)? {
-        return Ok(head);
+    if head == approved {
+        return Ok(approved);
     }
     Err(RunError::Msg(format!(
-        "HEAD continuity: live HEAD {head} is not a descendant of approved {approved}"
+        "HEAD continuity: live HEAD {head} does not equal approved {approved}"
     )))
 }
 
@@ -1948,37 +1956,36 @@ fn run_rebase(
     bare: &GitDir,
     wt: &Path,
     default_branch: &str,
+    attempt: &AttemptId,
 ) -> Result<RebaseOutcome> {
-    let (onto, path_instructions, trusted_sha) = {
+    let (onto, commands, path_instructions, trusted_sha) = {
         let _guard = FETCH_RESOLVE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (onto, cfg, trusted_sha) = resolve_rebase_onto(bare, default_branch)?;
-        (onto, cfg.path_instructions, trusted_sha)
+        (onto, cfg.commands, cfg.path_instructions, trusted_sha)
     };
     db.set_trusted_config_sha(run_id, &trusted_sha)?;
     db.set_run_shas(run_id, None, Some(&onto))?;
 
     let head = porch_git::rev_parse_c(wt, "HEAD")?;
-    if head == onto {
-        db.set_run_shas(run_id, Some(&head), Some(&onto))?;
-        maybe_persist_path_instructions(home, run_id, wt, &onto, &head, &path_instructions)?;
-        return Ok(RebaseOutcome::Completed { empty: true });
+    if head != onto {
+        if porch_git::is_ancestor(wt, &head, &onto)? {
+            porch_git::reset_hard(wt, &onto)?;
+        } else if let Err(e) = porch_git::rebase(wt, &onto) {
+            // Fail closed if abort itself fails (E15 superseded: park after clean abort).
+            porch_git::rebase_abort(wt).map_err(|abort_err| {
+                RunError::Msg(format!(
+                    "rebase conflict: {e}; rebase --abort failed: {abort_err}"
+                ))
+            })?;
+            return Ok(RebaseOutcome::Parked {
+                detail: format!("rebase conflict: {e}"),
+            });
+        }
     }
 
-    if porch_git::is_ancestor(wt, &head, &onto)? {
-        porch_git::reset_hard(wt, &onto)?;
-    } else if let Err(e) = porch_git::rebase(wt, &onto) {
-        // Fail closed if abort itself fails (E15 superseded: park after clean abort).
-        porch_git::rebase_abort(wt).map_err(|abort_err| {
-            RunError::Msg(format!(
-                "rebase conflict: {e}; rebase --abort failed: {abort_err}"
-            ))
-        })?;
-        return Ok(RebaseOutcome::Parked {
-            detail: format!("rebase conflict: {e}"),
-        });
-    }
+    apply_rebase_format(db, home, run_id, wt, &commands, attempt)?;
 
     let head = porch_git::rev_parse_c(wt, "HEAD")?;
     db.set_run_shas(run_id, Some(&head), Some(&onto))?;
@@ -1986,6 +1993,31 @@ fn run_rebase(
     let range = format!("{onto}..{head}");
     let empty = porch_git::diff_is_empty(wt, &range)?;
     Ok(RebaseOutcome::Completed { empty })
+}
+
+fn apply_rebase_format(
+    db: &Db,
+    home: &Path,
+    run_id: &str,
+    wt: &Path,
+    cmds: &crate::config::Commands,
+    attempt: &AttemptId,
+) -> Result<()> {
+    match certify::apply_format_mutating(wt, home, cmds, None)? {
+        certify::FormatApply::Committed => {
+            persist_effects(
+                db,
+                run_id,
+                PhaseTransition::Evidence {
+                    attempt: attempt.clone(),
+                    cause: "format_applied".into(),
+                },
+                RunEffects::none(),
+            )?;
+            Ok(())
+        }
+        certify::FormatApply::Absent | certify::FormatApply::Clean => Ok(()),
+    }
 }
 
 fn maybe_persist_path_instructions(
@@ -2696,7 +2728,7 @@ fn respond_rebase_fix(
         .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
 
     // Resume the parked rebase attempt.
-    evidence_open(
+    let rebase_attempt = evidence_open(
         db,
         &run.id,
         PhaseName::Rebase,
@@ -2749,6 +2781,24 @@ fn respond_rebase_fix(
             }
         }
     }
+
+    let head = porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    db.set_run_shas(&run.id, Some(&head), Some(&onto))
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+
+    let trusted_sha = run
+        .trusted_config_sha
+        .as_deref()
+        .ok_or_else(|| UsageOrFail::Fail("rebase retry requires trusted_config_sha".into()))?;
+    let cmds = match load_trusted_at_sha(bare, trusted_sha) {
+        Ok(c) => c.commands,
+        Err(e) if e.contains("parse error") || e.contains("not utf-8") => {
+            crate::config::Commands::default()
+        }
+        Err(e) => return Err(UsageOrFail::Fail(e)),
+    };
+    apply_rebase_format(db, home, &run.id, wt, &cmds, &rebase_attempt)
+        .map_err(|e| UsageOrFail::Fail(e.to_string()))?;
 
     let head = porch_git::rev_parse_c(wt, "HEAD").map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     db.set_run_shas(&run.id, Some(&head), Some(&onto))
@@ -3641,16 +3691,16 @@ mod continuity_tests {
             "an unmoved HEAD forwards the approved sha"
         );
 
-        // Certify's correction commit advances HEAD after review approves, so
-        // continuity tolerates a descendant and the forward carries it.
+        // A descendant of the approved SHA is an unreviewed tree.
         std::fs::write(work.join("README"), "x\ny\n").unwrap();
         git(&work, &["add", "README"]);
         git(&work, &["commit", "-m", "correction"]);
         let descendant = porch_git::rev_parse_c(&work, "HEAD").unwrap();
-        assert_eq!(
-            authorized_forward_sha(&db, &run.id, &work).unwrap(),
-            descendant,
-            "a descendant of the approved sha stays forwardable today"
+        let err = authorized_forward_sha(&db, &run.id, &work).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&descendant) && msg.contains(&approved),
+            "a descendant must be refused, naming both SHAs: {msg}"
         );
 
         // A HEAD off the approved line is refused, naming both SHAs.
