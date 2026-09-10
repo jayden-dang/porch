@@ -85,6 +85,32 @@ pub fn detect_engines() -> Vec<DetectedEngine> {
     out
 }
 
+/// Resolve `engine: quality` from the floor's own rule when `PATH` does not have it.
+///
+/// Only an explicit `--engine quality` reaches here. [`detect_engines`] is left alone
+/// deliberately: it also feeds [`default_engine`], so teaching detection about the
+/// sibling would make floor-only the default on every installation — which is
+/// MILE-5's second blocker, not this one's.
+fn quality_backend_from_floor(kind: EngineKind) -> Option<PathBuf> {
+    if kind != EngineKind::Quality {
+        return None;
+    }
+    match crate::floor::state() {
+        crate::floor::FloorState::Ready { sibling, .. } => Some(sibling),
+        _ => None,
+    }
+}
+
+fn floor_detail(state: &crate::floor::FloorState) -> String {
+    match state {
+        crate::floor::FloorState::Ready { sibling, .. } => sibling.display().to_string(),
+        crate::floor::FloorState::LaunchReplaced { launch } => {
+            format!("porch was replaced while running: {}", launch.display())
+        }
+        crate::floor::FloorState::Unresolved { reason } => reason.clone(),
+    }
+}
+
 fn detect_agent_bin() -> Option<PathBuf> {
     for name in agent_detect_bins() {
         if let Some(bin) = which(name) {
@@ -178,18 +204,26 @@ pub fn setup_yes(porch_home: &Path, engine: Option<EngineKind>) -> Result<SetupR
             warnings,
         ));
     };
-    let Some(backend) = detected
+    let on_path = detected
         .iter()
         .find(|d| d.kind == kind)
-        .map(|d| d.bin.clone())
-    else {
+        .map(|d| d.bin.clone());
+    let Some(backend) = on_path.or_else(|| quality_backend_from_floor(kind)) else {
         let hint = if kind == EngineKind::Agent {
             "claude or codex".to_string()
         } else {
             kind.detect_bin().to_string()
         };
+        let detail = if kind == EngineKind::Quality {
+            format!(
+                " and no floor sibling of porch ({})",
+                floor_detail(&crate::floor::state())
+            )
+        } else {
+            String::new()
+        };
         return Ok(SetupResult::fail(
-            format!("engine `{kind}` requested but `{hint}` not found on PATH"),
+            format!("engine `{kind}` requested but `{hint}` not found on PATH{detail}"),
             warnings,
         ));
     };
