@@ -292,8 +292,20 @@ not the party.
 **Deterministic floor**:
 The computation-only layer of an assurance run — rule packs and the coverage
 manifest over the diff, no shell, no network, no model. Always runs; never
-substitutable (**ARCH-12**).
+substitutable (**ARCH-12**). Located only as the `porch-quality` sibling of the
+running `porch` — never `PATH`, config, or env. Porch reports the artifact
+identity it observed for that sibling but holds no expected value to compare it
+against, so **ARCH-12** binds what porch may substitute, not what an owner may
+replace on disk (`FLOOR-9.2`).
 _Avoid_: "static analysis", "lint"
+
+**Floor condition**:
+What resolving the floor found: `Ready` with the observed artifact identity,
+`LaunchReplaced` when the running `porch`'s own path no longer names a file
+because an install replaced it, or `Unresolved`. Each carries an operator
+remedy, as a **Daemon condition** does.
+_Avoid_: "floor missing" for the replaced case — the sibling is present, and
+that is the problem: it is the new floor beside an old `porch`.
 
 **Judgment layer**:
 The layer above the floor that exercises judgment on the change. Supplied by the
