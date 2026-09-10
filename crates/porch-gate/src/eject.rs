@@ -94,7 +94,15 @@ pub fn eject(opts: EjectOptions<'_>) -> Result<EjectResult> {
 /// An eject interrupted after the config unset leaves the remote in place. Falling
 /// back to the remote is what lets the operator retry instead of hand-editing git
 /// config to get past "not initialized" (`ESCAPE-2.4`).
-fn resolve_repo_id(work: &Path) -> Result<String> {
+/// This repo's porch id, from `porch.repo-id` or from the `porch` remote's path.
+///
+/// Inspect uses the same resolver as detach so a preset `porch.repo-id` is
+/// not silently replaced by a path hash (`LOOK-3.2`).
+///
+/// # Errors
+///
+/// Returns an error when neither the config key nor the remote can supply an id.
+pub fn resolve_repo_id(work: &Path) -> Result<String> {
     if let Some(id) = existing_repo_id(work)? {
         return Ok(id);
     }

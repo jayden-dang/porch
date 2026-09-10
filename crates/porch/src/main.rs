@@ -8,9 +8,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use porch_gate::{
     AuditAttempt, AuditDocument, AuditObservedIdentity, AuditText, EjectOptions, GateState,
-    InitOptions, admit_push, eject, ensure_daemon, get_audit, get_run, git_dir_from_env,
-    health_check, init, install_service, list_runs, notify_push, porch_home, repo_id_for,
-    run_daemon, service_status, start_service, stop_daemon, uninstall_service,
+    InitOptions, admit_push, eject, ensure_daemon, format_status_human, get_audit, get_run,
+    git_dir_from_env, init, install_service, list_runs, look, notify_push, porch_home, repo_id_for,
+    run_daemon, service_status, start_service, status_json, stop_daemon, uninstall_service,
 };
 use porch_run::{
     AgentCliResult, AgentResponse, AgentRunOpts, PipelineExecutor, agent_respond, agent_run,
@@ -726,21 +726,21 @@ fn run_bare() -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     let home = porch_home();
-    ensure_daemon_for_cwd(&home)?;
-
-    let repo_id = repo_id_for(&work);
+    let report = look(&home, Some(&work), 20);
     let branch = doctor::current_branch(&work);
-    let runs = list_runs(&home, Some(&repo_id), Some(20)).unwrap_or_default();
-    let active = runs.iter().find(|r| {
+    let active = report.runs.iter().find(|r| {
         let status = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
         let b = r.get("branch").and_then(|v| v.as_str()).unwrap_or("");
         b == branch && matches!(status, "pending" | "running" | "parked")
     });
 
     if io::stdin().is_terminal() {
+        // Attach needs a live daemon and a subscribe socket. Inspect (the
+        // summary below) does not spawn (`LOOK-1.4`, `LOOK-1.5`).
         if let Some(run) = active {
             let run_id = run.get("id").and_then(|v| v.as_str()).unwrap_or("");
             if !run_id.is_empty() {
+                ensure_daemon_for_cwd(&home)?;
                 tui::run_attach(&home, &work, run_id)?;
                 return Ok(ExitCode::SUCCESS);
             }
@@ -759,7 +759,7 @@ fn run_bare() -> Result<ExitCode> {
         }
     }
 
-    print_runs_summary(&runs);
+    print_runs_summary(&report.runs);
     if setup::setup_incomplete(&home) {
         println!("hint: review setup incomplete — run `porch setup --yes`");
     }
@@ -788,58 +788,20 @@ fn run_runs(limit: usize) -> Result<ExitCode> {
         bail!("not a git work tree");
     }
     let home = porch_home();
-    ensure_daemon_for_cwd(&home)?;
-    let repo_id = repo_id_for(&work);
-    let runs = list_runs(&home, Some(&repo_id), Some(limit))?;
-    println!("{}", serde_json::to_string_pretty(&runs)?);
+    let report = look(&home, Some(&work), limit);
+    println!("{}", serde_json::to_string_pretty(&report.runs)?);
     Ok(ExitCode::SUCCESS)
 }
 
 fn run_status(json: bool) -> Result<ExitCode> {
     let work = env::current_dir()?;
     let home = porch_home();
-    let healthy = health_check(&home).unwrap_or(false);
-    let mut latest: Option<serde_json::Value> = None;
-    if is_git_work_tree(&work) {
-        let _ = ensure_daemon_for_cwd(&home);
-        let repo_id = repo_id_for(&work);
-        if let Ok(runs) = list_runs(&home, Some(&repo_id), Some(1)) {
-            latest = runs.into_iter().next();
-        }
-    }
+    let scoped = is_git_work_tree(&work).then_some(work.as_path());
+    let report = look(&home, scoped, 1);
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "daemon_healthy": healthy,
-                "porch_home": home,
-                "latest_run": latest,
-            })
-        );
+        println!("{}", serde_json::to_string_pretty(&status_json(&report))?);
     } else {
-        println!("daemon_healthy={healthy}");
-        println!("PORCH_HOME={}", home.display());
-        match latest {
-            Some(r) => {
-                let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                println!(
-                    "latest: {id} {} {}",
-                    r.get("branch").and_then(|v| v.as_str()).unwrap_or("?"),
-                    r.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
-                );
-                if let Ok(snap) = get_run(&home, id) {
-                    if let Some(shape) = snap.assurance_record.assurance_shape() {
-                        println!("assurance shape {shape}");
-                    }
-                    if snap.status == "failed" {
-                        if let Some(err) = snap.error.as_deref() {
-                            println!("{err}");
-                        }
-                    }
-                }
-            }
-            None => println!("latest: (none)"),
-        }
+        println!("{}", format_status_human(&report));
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -3,7 +3,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use ulid::Ulid;
 
 use crate::{Error, Result};
@@ -164,6 +164,27 @@ impl Db {
         crate::rounds::migrate(&conn)?;
         install_writer_fence(&conn)?;
         reject_stale_writer(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Open an existing state database without creating, migrating, or
+    /// terminalizing anything.
+    ///
+    /// Inspect and ROAD-24's purge manifest use this. A missing file is an
+    /// error; this constructor will not create a 0-byte database. It does not
+    /// set `journal_mode`, run DDL, install the writer fence, or raise
+    /// `min_writer_protocol`.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O or `SQLite` errors when the file cannot be opened read-only.
+    pub fn open_read(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "query_only", true)?;
+        conn.busy_timeout(Duration::from_millis(100))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1183,5 +1204,71 @@ mod tests {
         let without = db.run_by_id(&no_pr.id).unwrap().unwrap();
         assert_eq!(without.status, "failed");
         assert!(without.pr_url.is_none());
+    }
+
+    #[test]
+    fn open_read_does_not_create_a_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.sqlite");
+        assert!(Db::open_read(&path).is_err());
+        assert!(!path.exists(), "open_read must not create {path:?}");
+    }
+
+    #[test]
+    fn open_read_does_not_terminalize_or_raise_protocol() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.sqlite");
+        let db = Db::open(&path).unwrap();
+        db.upsert_repo("repo1", tmp.path(), &tmp.path().join("bare.git"), "main")
+            .unwrap();
+        let run = db.insert_run("repo1", "feat", "aaa", None, None).unwrap();
+        db.set_run_status(&run.id, "parked", None).unwrap();
+        drop(db);
+
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute("UPDATE porch_state_meta SET min_writer_protocol = 0", [])
+                .unwrap();
+            let min: i64 = conn
+                .query_row(
+                    "SELECT min_writer_protocol FROM porch_state_meta WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(min, 0);
+        }
+
+        let read = Db::open_read(&path).unwrap();
+        let parked = read.run_by_id(&run.id).unwrap().unwrap();
+        assert_eq!(parked.status, "parked");
+        drop(read);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let min: i64 = conn
+            .query_row(
+                "SELECT min_writer_protocol FROM porch_state_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(min, 0, "open_read must not raise min_writer_protocol");
+        drop(conn);
+        let read = Db::open_read(&path).unwrap();
+        let err = read
+            .conn()
+            .execute(
+                "INSERT INTO repos (id, worktree_path, bare_path, created_at)
+                 VALUES ('y', 'w', 'b', '0')",
+                [],
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("readonly")
+                || msg.contains("read-only")
+                || msg.contains("readonly database"),
+            "open_read must reject INSERT: {msg}"
+        );
     }
 }

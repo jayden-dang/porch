@@ -422,6 +422,35 @@ pub fn stdout_trim(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+/// Refs under `prefix` as `(sha, refname)` pairs, in the order git prints.
+///
+/// An empty prefix, or a prefix with no matching refs, is success with no
+/// rows — `for-each-ref` does not fail on absence.
+///
+/// # Errors
+///
+/// Spawn or non-zero git.
+pub fn for_each_ref(git_dir: &GitDir, prefix: &str) -> Result<Vec<(String, String)>, Error> {
+    let out = run(
+        git_dir,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)%09%(refname)",
+            prefix,
+        ],
+    )?;
+    let mut tips = Vec::new();
+    for line in stdout_trim(&out).lines() {
+        let Some((sha, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if !sha.is_empty() && !name.is_empty() {
+            tips.push((sha.to_string(), name.to_string()));
+        }
+    }
+    Ok(tips)
+}
+
 fn redact(stderr: &str) -> String {
     // Keep logs free of credential material if git ever echoes a URL.
     stderr

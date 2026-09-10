@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use porch_gate::{Db, RunRow, db_path, repo_id_for};
+use porch_gate::{Db, RunRow, db_path, resolve_repo_id};
 use porch_git::GitDir;
 use serde::Serialize;
 
@@ -79,8 +79,8 @@ fn agent_sync_inner(
     let work = work_tree
         .canonicalize()
         .map_err(|e| SyncErr::Fail(e.to_string()))?;
-    let db = Db::open(&db_path(home)).map_err(|e| SyncErr::Fail(e.to_string()))?;
-    let repo_id = repo_id_for(&work);
+    let db = Db::open_read(&db_path(home)).map_err(|e| SyncErr::Fail(e.to_string()))?;
+    let repo_id = resolve_repo_id(&work).map_err(|e| SyncErr::Fail(e.to_string()))?;
     let branch = current_branch(&work)?;
     if branch == "HEAD" {
         return Err(SyncErr::Usage("detached HEAD — checkout a branch".into()));
@@ -387,6 +387,7 @@ mod tests {
 
         let db = Db::open(&db_path(&home)).unwrap();
         let repo_id = repo_id_for(&work);
+        git(&work, &["config", "porch.repo-id", &repo_id]);
         db.upsert_repo(&repo_id, &work, &bare_path, "main").unwrap();
         let run = db
             .insert_run(&repo_id, "feat-sync", &submit, None, None)

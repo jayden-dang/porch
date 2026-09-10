@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use porch_gate::{DaemonCondition, daemon_condition, porch_home, socket_path};
+use porch_gate::{DaemonCondition, daemon_condition, look, porch_home, socket_path};
 use porch_review::floor::FloorState;
 use porch_review::{
     REVIEW_BIN_ENV, floor, is_executable, load_home_config, resolve_bin, review_bin, which,
@@ -186,6 +186,47 @@ fn check_home_and_daemon() -> Vec<Check> {
     // Resolved without starting a daemon, so asking does not change the answer, and
     // bounded, so it answers even when the daemon is wedged (`DFAULT-4.1`).
     out.push(daemon_check(&home));
+    out.extend(inspect_checks(&home));
+    out
+}
+
+fn inspect_checks(home: &Path) -> Vec<Check> {
+    let cwd = env::current_dir().ok();
+    let work = cwd.as_deref().filter(|p| {
+        std::process::Command::new("git")
+            .current_dir(p)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    });
+    let report = look(home, work, 1);
+    let mut out = Vec::new();
+    if report.database.readable {
+        out.push(Check::new(
+            Level::Ok,
+            "state database",
+            "readable without writing",
+        ));
+    } else {
+        let reason = report.database.reason.as_deref().unwrap_or("unreadable");
+        // A missing DB on a fresh PORCH_HOME is info, not a fail.
+        let level = if reason.contains("unable to open")
+            || reason.contains("cannot open")
+            || reason.contains("no such file")
+        {
+            Level::Info
+        } else {
+            Level::Warn
+        };
+        out.push(Check::new(level, "state database", reason.to_string()));
+    }
+    if work.is_some() {
+        out.push(Check::new(
+            Level::Info,
+            "recovery tips",
+            format!("{} — `porch status` lists them", report.recovery_tips.len()),
+        ));
+    }
     out
 }
 

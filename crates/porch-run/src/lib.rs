@@ -2252,7 +2252,7 @@ fn agent_status_inner(
     run_id: Option<&str>,
     work_tree: &Path,
 ) -> std::result::Result<AgentStatus, UsageOrFail> {
-    let db = Db::open(&db_path(home)).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
+    let db = Db::open_read(&db_path(home)).map_err(|e| UsageOrFail::Fail(e.to_string()))?;
     let run = resolve_run(&db, run_id, work_tree)?;
     status_from_run(&db, &run, home).map_err(UsageOrFail::Fail)
 }

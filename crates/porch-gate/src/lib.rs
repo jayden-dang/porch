@@ -13,6 +13,7 @@ mod executor;
 mod home;
 mod id;
 mod init;
+mod look;
 mod notes;
 mod notify;
 mod proc;
@@ -34,7 +35,7 @@ pub use condition::{
 pub use custody::{finish_remove_worktree, pin_recovery_if_needed, recovery_ref_name};
 pub use daemon::{ensure_daemon, run_daemon, wait_for_health};
 pub use db::{Db, RepoRow, RunRow, StepResultRow, UncertifiedPipelineRange};
-pub use eject::{EjectOptions, EjectResult, GateState, eject};
+pub use eject::{EjectOptions, EjectResult, GateState, eject, resolve_repo_id};
 pub use events::{
     Event, EventHub, MAILBOX_CAP, Subscriber, clear_event_hub, event_hub, install_event_hub,
 };
@@ -46,6 +47,7 @@ pub use home::{
 };
 pub use id::repo_id_for;
 pub use init::{InitOptions, InitResult, init};
+pub use look::{LookReport, format_status_human, look, status_json};
 pub use notes::{finding_notes_path, load_finding_notes, set_finding_note};
 pub use notify::{git_dir_from_env, notify_push};
 pub use proc::{
