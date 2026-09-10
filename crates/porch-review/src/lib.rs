@@ -282,6 +282,12 @@ pub enum Error {
     ProducerArtifactChanged,
     #[error("floor unresolved: {reason}")]
     FloorUnresolved { reason: String },
+    #[error(
+        "porch was replaced while running: {launch} no longer names a file, so the \
+         sibling next to it is not the floor this porch shipped with — {}",
+        crate::floor::LAUNCH_REPLACED_REMEDY
+    )]
+    FloorLaunchReplaced { launch: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("{0}")]
