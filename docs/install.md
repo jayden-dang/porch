@@ -42,7 +42,7 @@ without asking. Only the plain `cargo install porch --locked` above refuses.
 ## From GitHub
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.2/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.3/install.sh | bash
 export PATH="$HOME/.cargo/bin:$PATH"
 porch setup
 porch doctor
@@ -51,7 +51,7 @@ porch doctor
 Or clone and `./install.sh`. Dry-run: `PORCH_INSTALL_DRY_RUN=1 ./install.sh`. Bindir: `PORCH_PREFIX=/usr/local/bin ./install.sh`.
 
 ```sh
-cargo install --git https://github.com/jayden-dang/porch --tag v0.2.2 --locked --force porch
+cargo install --git https://github.com/jayden-dang/porch --tag v0.2.3 --locked --force porch
 ```
 
 From a checkout: `cargo install --path crates/porch --locked --force`.

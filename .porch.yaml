@@ -1,0 +1,17 @@
+# Trusted config for this repository (ARCH-4: executing fields from the
+# default-branch SHA). Porch eating porch is not GOAL-3 / MILE-7 — those
+# consumers are mailgate then klynt.
+pr:
+  base_branch: main
+
+commands:
+  format: cargo fmt --all
+  lint: cargo clippy --workspace --all-targets -- -D warnings
+
+deliver:
+  github:
+    watch_checks: []
+    rerun_transient: 0
+
+auto_fix:
+  review: 0

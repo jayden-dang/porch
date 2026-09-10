@@ -4,7 +4,7 @@ members = ["crates/*"]
 default-members = ["crates/porch"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -34,13 +34,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
 # Internal slices: path for the workspace, version so `cargo publish` works.
-porch-git = { version = "0.2.1", path = "crates/porch-git" }
-porch-gate = { version = "0.2.1", path = "crates/porch-gate" }
-porch-review = { version = "0.2.1", path = "crates/porch-review" }
-porch-agent = { version = "0.2.1", path = "crates/porch-agent" }
-porch-deliver = { version = "0.2.1", path = "crates/porch-deliver" }
-porch-run = { version = "0.2.1", path = "crates/porch-run" }
-porch-quality = { version = "0.2.1", path = "crates/porch-quality" }
+porch-git = { version = "0.2.3", path = "crates/porch-git" }
+porch-gate = { version = "0.2.3", path = "crates/porch-gate" }
+porch-review = { version = "0.2.3", path = "crates/porch-review" }
+porch-agent = { version = "0.2.3", path = "crates/porch-agent" }
+porch-deliver = { version = "0.2.3", path = "crates/porch-deliver" }
+porch-run = { version = "0.2.3", path = "crates/porch-run" }
+porch-quality = { version = "0.2.3", path = "crates/porch-quality" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
