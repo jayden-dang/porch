@@ -70,6 +70,30 @@ pub const REVIEW_TIMEOUT_ENV: &str = "PORCH_REVIEW_TIMEOUT_SECS";
 const DEFAULT_BIN: &str = "review";
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
+/// Total budget for retrying a spawn blocked by a concurrent writer.
+const ETXTBSY_RETRY: Duration = Duration::from_millis(500);
+
+/// Spawn, retrying briefly while the producer binary is still open for writing.
+///
+/// The deterministic floor is the binary porch's own documented upgrade replaces,
+/// which makes this the spawn site in the workspace most likely to meet a target
+/// still held open. `ETXTBSY` is transient by construction, so a bounded retry serves
+/// an operator better than failing the round.
+fn spawn_retrying_etxtbsy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let deadline = Instant::now() + ETXTBSY_RETRY;
+    loop {
+        match cmd.spawn() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Porch finding severity after mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -636,7 +660,7 @@ fn run_review_cli(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
         cmd.process_group(0);
     }
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             Error::BinNotFound {
                 bin: bin_label,
