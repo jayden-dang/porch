@@ -2,10 +2,11 @@
 
 use std::env;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use porch_gate::{DaemonCondition, daemon_condition, porch_home, socket_path};
+use porch_review::floor::FloorState;
 use porch_review::{
     REVIEW_BIN_ENV, floor, is_executable, load_home_config, resolve_bin, review_bin, which,
 };
@@ -218,48 +219,40 @@ fn daemon_check(home: &Path) -> Check {
     }
 }
 
-fn floor_sibling_of(exe: &Path) -> Option<PathBuf> {
-    floor::sibling_of(exe)
-}
-
+/// Report the floor through the resolver's own rule, and report what was observed.
+///
+/// Reporting the observed artifact identity is not a verdict on it: porch has no
+/// expected value to compare against, and establishing one would extend a guarantee
+/// `FLOOR-9.2` declined. Printing what the assurance record will store lets an
+/// operator compare two installations without porch deciding which is right.
 fn check_floor() -> Check {
-    match env::current_exe() {
-        Ok(exe) => match floor_sibling_of(&exe) {
-            Some(sibling) => {
-                if is_executable(&sibling) {
-                    Check::new(
-                        Level::Ok,
-                        "floor",
-                        format!(
-                            "{} (mandatory deterministic floor sibling)",
-                            sibling.display()
-                        ),
-                    )
-                } else {
-                    Check::new(
-                        Level::Warn,
-                        "floor",
-                        format!(
-                            "`{}` missing or not executable — `cargo install porch --locked` \
-installs both binaries next to each other; every run requires this sibling (not PATH)",
-                            sibling.display()
-                        ),
-                    )
-                }
-            }
-            None => Check::new(
-                Level::Warn,
-                "floor",
-                format!(
-                    "running executable {} has no parent directory; cannot locate porch-quality",
-                    exe.display()
-                ),
+    let state = floor::state();
+    let remedy = state.remedy();
+    match state {
+        FloorState::Ready {
+            sibling,
+            artifact_identity,
+        } => Check::new(
+            Level::Ok,
+            "floor",
+            format!(
+                "{} (mandatory deterministic floor sibling) identity={artifact_identity}",
+                sibling.display()
             ),
-        },
-        Err(e) => Check::new(
+        ),
+        FloorState::LaunchReplaced { launch } => Check::new(
             Level::Warn,
             "floor",
-            format!("could not resolve current_exe: {e}"),
+            format!(
+                "porch was replaced while running: `{}` no longer names a file, so the sibling \
+next to it is not the floor this porch shipped with — {remedy}",
+                launch.display()
+            ),
+        ),
+        FloorState::Unresolved { reason } => Check::new(
+            Level::Warn,
+            "floor",
+            format!("{reason} — {remedy}; every run requires this sibling (not PATH)"),
         ),
     }
 }
@@ -448,13 +441,16 @@ pub fn current_branch(work: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::floor_sibling_of;
+    use porch_review::floor::sibling_of;
     use std::path::PathBuf;
+
+    // Doctor no longer derives the sibling itself; it reports whatever the resolver
+    // resolved. These pin the rule it now depends on.
 
     #[test]
     fn floor_sibling_is_porch_quality_next_to_the_running_exe() {
         let exe = PathBuf::from("/opt/porch/bin/porch");
-        let sibling = floor_sibling_of(&exe).expect("parent directory");
+        let sibling = sibling_of(&exe).expect("parent directory");
         let expected = PathBuf::from(format!(
             "/opt/porch/bin/porch-quality{}",
             std::env::consts::EXE_SUFFIX
@@ -465,6 +461,6 @@ mod tests {
     #[test]
     fn floor_sibling_is_none_when_the_exe_has_no_parent() {
         let exe = PathBuf::from("/");
-        assert!(floor_sibling_of(&exe).is_none());
+        assert!(sibling_of(&exe).is_none());
     }
 }

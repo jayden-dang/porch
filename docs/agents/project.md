@@ -134,7 +134,14 @@ Consumed by `cut-release`. Ordered; do not reorder step 5.
    `porch-git`, `porch-agent`, `porch-deliver`, `porch-quality`, `porch-review`,
    `porch-gate`, `porch-run`, `porch`
 6. `git tag vX.Y.Z && git push origin vX.Y.Z`
-7. Smoke: `cargo install porch --locked` → `porch --version` && `porch-quality --version`
+7. Smoke: `cargo install porch --locked --force` → `porch --version` && `porch-quality --help` && `porch doctor`
+
+   `--force` because a machine that installed the floor separately before v0.2.2
+   refuses the plain form. `porch-quality --help`, not `--version`: the floor
+   binary has no `--version`, and adding one is held by MILE-5's first blocker
+   (`docs/specs/2026-09-09-one-binary-install-coherence/requirements.md` §3, §7.2).
+   `crates/porch/tests/m26_one_binary.rs` asserts these commands so the step
+   cannot rot unobserved again.
 
 ## Paths
 

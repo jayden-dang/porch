@@ -609,8 +609,8 @@ fn run_review_phase(
     let changed = porch_git::diff_name_only(wt, &range)?;
 
     let opened = open_review_round(db, home, bare, &run, &from_sha, &head, &changed)?;
-    if let Some(UnsatisfiedRequired::Floor { reason }) = &opened.unsatisfied {
-        finalize_incomplete(db, &opened.round_id, "floor_unresolved")?;
+    if let Some(UnsatisfiedRequired::Floor { code, reason }) = &opened.unsatisfied {
+        finalize_incomplete(db, &opened.round_id, code)?;
         return Err(RunError::Review(porch_review::Error::FloorUnresolved {
             reason: reason.clone(),
         }));
@@ -651,7 +651,7 @@ struct OpenedSlot {
 }
 
 enum UnsatisfiedRequired {
-    Floor { reason: String },
+    Floor { code: &'static str, reason: String },
     Judgment { reason: String },
 }
 
@@ -692,6 +692,7 @@ struct ComposedProducer {
 enum ComposedRound {
     Prepared(Vec<ComposedProducer>),
     FloorUnresolved {
+        code: &'static str,
         reason: String,
     },
     JudgmentUnresolved {
@@ -737,10 +738,18 @@ fn compose_prepared_invocations(
                 },
             }
         }
-        Err(porch_review::Error::FloorUnresolved { reason }) => {
-            ComposedRound::FloorUnresolved { reason }
+        Err(porch_review::Error::FloorUnresolved { reason }) => ComposedRound::FloorUnresolved {
+            code: "floor_unresolved",
+            reason,
+        },
+        Err(e @ porch_review::Error::FloorLaunchReplaced { .. }) => {
+            ComposedRound::FloorUnresolved {
+                code: "floor_launch_replaced",
+                reason: e.to_string(),
+            }
         }
         Err(e) => ComposedRound::FloorUnresolved {
+            code: "floor_unresolved",
             reason: e.to_string(),
         },
     }
@@ -938,14 +947,14 @@ fn open_review_round(
     }
 
     let (open_plan, prepared, unsatisfied) = match composed {
-        ComposedRound::FloorUnresolved { reason } => (
+        ComposedRound::FloorUnresolved { code, reason } => (
             OpenRoundPlan {
                 run_id: run_id.to_string(),
                 producers: Vec::new(),
                 requirements: vec![unresolved_floor_requirement(reason.clone())],
             },
             Vec::new(),
-            Some(UnsatisfiedRequired::Floor { reason }),
+            Some(UnsatisfiedRequired::Floor { code, reason }),
         ),
         ComposedRound::JudgmentUnresolved { floor, reason } => (
             OpenRoundPlan {
@@ -1186,6 +1195,7 @@ fn incomplete_reason(err: &porch_review::Error, role: Role) -> &'static str {
         (Role::Floor, porch_review::Error::Coverage(_)) => "floor_coverage_shortfall",
         (Role::Floor, porch_review::Error::ProducerArtifactChanged) => "floor_artifact_changed",
         (Role::Floor, porch_review::Error::FloorUnresolved { .. }) => "floor_unresolved",
+        (Role::Floor, porch_review::Error::FloorLaunchReplaced { .. }) => "floor_launch_replaced",
         (Role::Floor, _) => "floor_malformed_output",
         (_, porch_review::Error::Timeout(_)) => "producer_timeout",
         (_, porch_review::Error::Exit { .. }) => "producer_exit",

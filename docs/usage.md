@@ -42,7 +42,7 @@ porch doctor
 
 | Engine | When |
 |---|---|
-| `quality` | Floor-only (no judgment). Default after `cargo install porch`. Still requires the `porch-quality` sibling, not a PATH lookup |
+| `quality` | Floor-only (no judgment). Selected by default when `porch`'s own bindir is on `PATH`, which `cargo install porch` makes true — so on a machine that also has a coding agent, the default is floor-only and the agent is passed over. Requesting it explicitly resolves the sibling, not a `PATH` lookup |
 | `agent` | Coding agent (`claude` / `codex`) for the judgment layer — session-free review turn. Still requires the floor sibling |
 | `generic` | a binary already named `review` that speaks `--from --to --format json --output` (judgment). Floor sibling still required |
 | `ocr` | legacy only: `porch setup --engine ocr` (judgment). Floor sibling still required |
@@ -52,6 +52,12 @@ Do **not** set `PORCH_REVIEW_BIN=ocr` (missing the `review` subcommand). Env sti
 Re-apply after editing `config.yaml`: `porch setup --apply`. Re-check: `porch setup --verify`. Optional login service: `porch setup --yes --install-daemon`.
 
 `porch doctor` must show **floor** ok (`porch-quality` next to `porch`), judgment **review** ok when you selected `agent` / `generic` / `ocr`, and `git` **ok**. Exit 1 only if a hard check fails (`git` missing).
+
+The floor line also carries `identity=<sha256>` — the artifact identity porch observed
+for that sibling, and the one the assurance record stores. Two installations reporting
+the same identity are running the same floor. Porch does not judge the value: the floor
+is whatever sits next to the running `porch`, and porch holds no expected identity to
+check it against.
 
 ## D. Trusted repo config
 
@@ -324,7 +330,9 @@ porch agent sync                    # if local branch lags pipeline
 | `condition=not-answering` | Wedged daemon: `porch daemon stop --force && porch daemon start`. If a *healthy* gate reports this under load, raise `PORCH_RPC_TIMEOUT_MS` |
 | `condition=refusing` | Read the cause in the same output, or `$PORCH_HOME/daemon.refusal.json`. It survives retries |
 | `daemon already running` on start | One daemon per `$PORCH_HOME`, so the previous one has not exited. `porch daemon status` shows which pid holds it |
-| doctor warns floor | Install so `porch-quality` sits next to `porch` (`cargo install porch --locked`); restart the daemon |
+| doctor warns floor | Install so `porch-quality` sits next to `porch` (`cargo install porch --locked --force`); restart the daemon |
+| doctor: `porch was replaced while running` | An install landed under a live daemon, so the sibling beside it is the new floor. `porch daemon restart`. Stop the daemon before upgrading to avoid it |
+| `cargo install porch` says `binary porch-quality already exists` | You installed the floor separately on v0.2.1 or earlier. Nothing was installed — add `--force`, or `cargo uninstall porch-quality` first |
 | doctor warns review | `porch setup --yes` (judgment: `agent` / `claude`/`codex`; `quality` is floor-only and still needs the sibling) |
 | certify `biome: not found` | Put biome on `PATH`; `porch daemon stop --force && porch daemon start` so the daemon inherits it |
 | lefthook/e2e on every push | `git push --no-verify porch …` |
@@ -333,7 +341,8 @@ porch agent sync                    # if local branch lags pipeline
 | compose respond rejected | Drop gate theater headings from the body; do not paste Review/Certify/Pipeline boards |
 | deliver no PR | `gh auth status`; doctor `gh` ok |
 | old `~/.porch` still OCR | `porch setup --yes` again |
-| run failed: floor unresolved / missing `porch-quality` | Restart the porch daemon, then `porch rerun --run-id <ULID>` (copy from status). Do not approve or skip — there is no park |
+| run failed: floor unresolved / missing `porch-quality` | Reinstall so the sibling is next to `porch`, restart the porch daemon, then `porch rerun --run-id <ULID>` (copy from status). Do not approve or skip — there is no park |
+| run failed: `floor_launch_replaced` | Porch was upgraded under a running daemon. `porch daemon restart`, then `porch rerun --run-id <ULID>` |
 | run failed: assurance shape mismatch | Status names pinned vs attempted shape. Fix review config, then `porch rerun --run-id <ULID>` |
 
 ## Q. What porch is not
