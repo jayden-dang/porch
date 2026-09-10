@@ -345,7 +345,9 @@ _Avoid_: "reviewer" — the two roles are deliberately separate.
 
 **Certify**:
 The cheap local check phase (format, typecheck, lint, tests) that runs inside the
-worktree after review. Certification is not review.
+worktree after review. `commands.format` also ran at the end of **Rebase** so any
+rewrite is inside the reviewed range; certify re-runs it as a check and never
+commits. Certification is not review.
 _Avoid_: "verify", "validate" — those name different skill-side concepts.
 
 **Deliver**:
@@ -355,13 +357,10 @@ _Avoid_: "deploy", "publish"
 
 **Forward authorization**:
 The durable fact that porch may forward a commit for a **Run**, resolved at one
-decision point from the recorded approved SHA. Today a live HEAD that descends
-from that SHA is authorized, because certify's own correction commit advances
-HEAD after approval; whether that commit may be forwarded without re-review is
-an open MILE-3 blocker, and binding by equality waits on it. Persisted before
-any external mutation (**ARCH-13**), never inferred from remote state.
-_Avoid_: "approval" for the forward act; "continuity" as the durable record;
-stating the equality rule as though it were in force.
+decision point from the recorded approved SHA. The live worktree HEAD must equal
+that SHA; a descendant is refused. Persisted before any external mutation
+(**ARCH-13**), never inferred from remote state.
+_Avoid_: "approval" for the forward act; "continuity" as the durable record.
 
 **Forward record**:
 The append-only porch-owned evidence of one forward attempt, keyed to the owning

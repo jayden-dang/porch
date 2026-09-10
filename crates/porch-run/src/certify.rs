@@ -36,6 +36,17 @@ pub(crate) fn certify_timeout() -> Duration {
         .map_or(Duration::from_secs(600), Duration::from_secs)
 }
 
+/// What [`apply_format_mutating`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormatApply {
+    /// `commands.format` was empty.
+    Absent,
+    /// Ran and left the tree clean.
+    Clean,
+    /// Ran, dirtied the tree, and committed `porch: apply format`.
+    Committed,
+}
+
 /// Load trusted commands and run one pass of format then lint.
 ///
 /// Caller must assert HEAD continuity first. Empty commands complete without spawn.
@@ -43,13 +54,18 @@ pub(crate) fn certify_timeout() -> Duration {
 /// (default-branch tip observed at rebase), not from a fresh remote-tracking
 /// rev-parse and not from the rebase-onto / `base_sha` tip.
 ///
+/// Both adapters are verify-only: a dirty tree is a certify failure, not a
+/// commit. Mutating format belongs to the rebase phase
+/// ([`apply_format_mutating`]).
+///
 /// Child PATH is enriched with parent dirs of `$PORCH_HOME/config.yaml` `tools.*`
 /// so cold daemons (thin PATH) still see recorded binaries such as `biome`.
 ///
 /// # Errors
 ///
 /// Fails closed on missing `base_sha` or `trusted_config_sha`, unreadable pinned
-/// commit, unparseable yaml, non-zero format/lint, timeout, or cancel.
+/// commit, unparseable yaml, non-zero format/lint, a dirty tree after either
+/// adapter, timeout, or cancel.
 pub(crate) fn run_certify_phase(
     db: &Db,
     home: &Path,
@@ -68,9 +84,7 @@ pub(crate) fn run_certify_phase(
             return Err(CertifyError::Msg("cancelled".into()));
         }
         run_adapter(wt, "format", cmd, timeout, &path_extra)?;
-        if maybe_correction_commit(wt, "porch: apply format")? {
-            refresh_head_sha(db, run_id, wt)?;
-        }
+        fail_if_dirty(wt, "format", cmd)?;
     }
 
     if let Some(cmd) = non_empty(&cmds.lint) {
@@ -78,14 +92,44 @@ pub(crate) fn run_certify_phase(
             return Err(CertifyError::Msg("cancelled".into()));
         }
         run_adapter(wt, "lint", cmd, timeout, &path_extra)?;
-        if maybe_correction_commit(wt, "porch: apply lint")? {
-            refresh_head_sha(db, run_id, wt)?;
-        }
+        fail_if_dirty(wt, "lint", cmd)?;
     }
 
     // commands.test is intentionally not run in M5.
     let _ = cmds.test;
     Ok(())
+}
+
+/// Run `commands.format` and commit if it dirties the tree.
+///
+/// Used at the end of rebase, before **Review**, so the rewrite is inside
+/// `base..head`. The caller records `runs.head_sha` and the rebase Evidence
+/// event. `-c commit.gpgsign=false` is required: this site is new and would
+/// otherwise inherit the operator's signing program before review.
+///
+/// # Errors
+///
+/// Non-zero format, timeout, cancel, or git failure.
+pub(crate) fn apply_format_mutating(
+    wt: &Path,
+    home: &Path,
+    cmds: &Commands,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<FormatApply, CertifyError> {
+    let Some(cmd) = non_empty(&cmds.format) else {
+        return Ok(FormatApply::Absent);
+    };
+    if cancelled(cancel) {
+        return Err(CertifyError::Msg("cancelled".into()));
+    }
+    let timeout = certify_timeout();
+    let path_extra = tools_path_prefix(home);
+    run_adapter(wt, "format", cmd, timeout, &path_extra)?;
+    if !worktree_dirty(wt)? {
+        return Ok(FormatApply::Clean);
+    }
+    commit_porch_identity(wt, "porch: apply format")?;
+    Ok(FormatApply::Committed)
 }
 
 /// Parent directories of recorded `tools.*` paths, joined for PATH prepend.
@@ -115,7 +159,11 @@ fn tools_path_prefix(home: &Path) -> String {
     dirs.join(":")
 }
 
-fn load_trusted_commands(db: &Db, run_id: &str, bare: &GitDir) -> Result<Commands, CertifyError> {
+pub(crate) fn load_trusted_commands(
+    db: &Db,
+    run_id: &str,
+    bare: &GitDir,
+) -> Result<Commands, CertifyError> {
     let run = db
         .run_by_id(run_id)?
         .ok_or_else(|| CertifyError::Msg(format!("unknown run {run_id}")))?;
@@ -138,12 +186,6 @@ fn non_empty(s: &str) -> Option<&str> {
 
 fn cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
-}
-
-fn refresh_head_sha(db: &Db, run_id: &str, wt: &Path) -> Result<(), CertifyError> {
-    let head = porch_git::rev_parse_c(wt, "HEAD")?;
-    db.set_run_shas(run_id, Some(&head), None)?;
-    Ok(())
 }
 
 const OUTPUT_TRUNCATE: usize = 2_048;
@@ -280,11 +322,23 @@ fn run_shell(
     })
 }
 
-fn maybe_correction_commit(wt: &Path, subject: &str) -> Result<bool, CertifyError> {
-    if !worktree_dirty(wt)? {
-        return Ok(false);
+fn fail_if_dirty(wt: &Path, name: &str, command: &str) -> Result<(), CertifyError> {
+    let out = porch_git::run_c(wt, &["status", "--porcelain"])?;
+    let body = porch_git::stdout_trim(&out);
+    if body.is_empty() {
+        return Ok(());
     }
+    let paths: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+    Err(CertifyError::Msg(format!(
+        "{name} left the worktree dirty: {command}: {}",
+        paths.join(", ")
+    )))
+}
+
+fn commit_porch_identity(wt: &Path, subject: &str) -> Result<(), CertifyError> {
     // Porch-managed identity + hook isolation (disposable worktree has neither).
+    // gpgsign=false: this commit runs at rebase, before review; inheriting the
+    // operator's signing program would wedge the run on a signing host.
     porch_git::run_c(
         wt,
         &[
@@ -304,6 +358,8 @@ fn maybe_correction_commit(wt: &Path, subject: &str) -> Result<bool, CertifyErro
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
+            "commit.gpgsign=false",
+            "-c",
             "user.email=porch@example.com",
             "-c",
             "user.name=Porch",
@@ -313,7 +369,7 @@ fn maybe_correction_commit(wt: &Path, subject: &str) -> Result<bool, CertifyErro
             subject,
         ],
     )?;
-    Ok(true)
+    Ok(())
 }
 
 fn worktree_dirty(wt: &Path) -> Result<bool, CertifyError> {

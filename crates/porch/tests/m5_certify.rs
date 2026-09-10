@@ -208,11 +208,24 @@ echo hostile >> "$PORCH_HOME/certify-hostile.ran"
 set -e
 : "${PORCH_HOME:?PORCH_HOME required}"
 echo format-dirty >> "$PORCH_HOME/certify-format-dirty.ran"
-echo formatted >> dirty.txt
+printf 'formatted\n' > dirty.txt
 "#,
     )
     .unwrap();
     chmod_755(&format_dirty);
+
+    let lint_dirty = bin_dir.join("porch-fake-lint-dirty");
+    std::fs::write(
+        &lint_dirty,
+        r#"#!/bin/sh
+set -e
+: "${PORCH_HOME:?PORCH_HOME required}"
+echo lint-dirty >> "$PORCH_HOME/certify-lint-dirty.ran"
+printf 'linted\n' > lint-dirty.txt
+"#,
+    )
+    .unwrap();
+    chmod_755(&lint_dirty);
 }
 
 struct Setup {
@@ -566,8 +579,14 @@ fn empty_diff_skips_certify_without_spawn() {
         last_step(&steps, "certify").map(|s| s.status.as_str()),
         Some("skipped")
     );
-    assert!(!s.home.join("certify-format.ran").is_file());
-    assert!(!s.home.join("certify-lint.ran").is_file());
+    assert!(
+        s.home.join("certify-format.ran").is_file(),
+        "format runs at the end of rebase, before review or certify can skip"
+    );
+    assert!(
+        !s.home.join("certify-lint.ran").is_file(),
+        "lint is certify-only and must not run when certify is skipped"
+    );
 
     kill_daemon(&s.home);
 }
@@ -669,8 +688,14 @@ fn agent_skip_skips_certify_without_spawn() {
         last_step(&steps, "certify").map(|s| s.status.as_str()),
         Some("skipped")
     );
-    assert!(!s.home.join("certify-format.ran").is_file());
-    assert!(!s.home.join("certify-lint.ran").is_file());
+    assert!(
+        s.home.join("certify-format.ran").is_file(),
+        "format runs at the end of rebase, before review or certify can skip"
+    );
+    assert!(
+        !s.home.join("certify-lint.ran").is_file(),
+        "lint is certify-only and must not run when certify is skipped"
+    );
 
     kill_daemon(&s.home);
 }
@@ -723,9 +748,15 @@ commands:
     assert!(s.home.join("certify-format-dirty.ran").is_file());
     assert!(s.home.join("certify-lint.ran").is_file());
 
-    // Correction commit is on the run worktree tip (gate bare), not forwarded yet.
     let run = db.run_by_id(&run.id).unwrap().unwrap();
     let head = run.head_sha.expect("head_sha");
+    let approved = run
+        .review_approved_head_sha
+        .expect("review approved the formatted tip");
+    assert_eq!(
+        head, approved,
+        "certify must not advance HEAD past the reviewed SHA"
+    );
     let gate_bare = gate_bare_dir(&s.home);
     let subj = StdCommand::new("git")
         .args([
@@ -739,11 +770,64 @@ commands:
         .output()
         .unwrap();
     let log = String::from_utf8_lossy(&subj.stdout);
-    assert!(
-        log.lines().any(|l| l.contains("porch: apply format")),
-        "expected format correction commit in log:\n{log}\nsubj_err={}",
-        String::from_utf8_lossy(&subj.stderr)
+    let format_commits = log
+        .lines()
+        .filter(|l| l.contains("porch: apply format"))
+        .count();
+    assert_eq!(
+        format_commits, 1,
+        "format commit belongs in rebase, once, not again in certify:\n{log}"
     );
+
+    kill_daemon(&s.home);
+}
+
+#[test]
+fn lint_dirty_tree_fails_certify_and_does_not_commit() {
+    let yaml = r"
+commands:
+  lint: porch-fake-lint-dirty
+";
+    let s = setup(Some(yaml), "clean");
+    commit_change(&s.work, "feat.txt", "x\n");
+    push_with_env(&s, "feat-lint-dirty", "clean");
+
+    let db = Db::open(&s.home.join("state.sqlite")).unwrap();
+    let repo_id = repo_id_for(&s.work);
+    let run = wait_status(
+        &db,
+        &repo_id,
+        &["failed", "parked"],
+        Duration::from_secs(30),
+    );
+    assert_eq!(run.status, "failed", "err={:?}", run.error);
+    let err = run.error.unwrap_or_default();
+    assert!(
+        err.contains("lint") && err.contains("dirty"),
+        "certify must name the dirty lint command, got {err}"
+    );
+    assert!(s.home.join("certify-lint-dirty.ran").is_file());
+
+    let run = db.run_by_id(&run.id).unwrap().unwrap();
+    if let Some(head) = run.head_sha.as_deref() {
+        let gate_bare = gate_bare_dir(&s.home);
+        let subj = StdCommand::new("git")
+            .args([
+                "--git-dir",
+                gate_bare.to_str().unwrap(),
+                "log",
+                "-5",
+                "--format=%s",
+                head,
+            ])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&subj.stdout);
+        assert!(
+            !log.lines().any(|l| l.contains("porch: apply lint")),
+            "lint must not commit: {log}"
+        );
+    }
 
     kill_daemon(&s.home);
 }

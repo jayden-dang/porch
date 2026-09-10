@@ -17,10 +17,9 @@ not redefine them.
 One MILE-3 blocker was resolved in discovery and is recorded on
 `docs/roadmap/INDEX.md`: a restart distinguishes an authorized completed push from one
 never attempted by reading durable local state. The other — whether an approval
-survives HEAD advancing past the reviewed SHA — was **reopened** during this build and
-is not resolved; see *Blocked: binding by equality* below. This feature owns the durable
-record. It does not own the exact binding, and it does not own restart classification,
-which is ROAD-8.
+survives HEAD advancing past the reviewed SHA — was completed by EQUAL (ROAD-23);
+see *Binding by equality* below. This feature owns the durable record. EQUAL owns the
+exact binding. Restart classification is ROAD-8.
 
 ## 1. A forward carries only what continuity authorized
 
@@ -34,38 +33,25 @@ resolved once at the forward boundary, so that the record and the push agree.
 - **FWDAUTH-1.8** IF the live HEAD is not on the approved line THEN THE SYSTEM SHALL
   fail closed with an error naming both the live HEAD and the approved SHA.
 
-### Blocked: binding by equality
+### Binding by equality — completed by EQUAL (ROAD-23)
 
-Discovery while building found that certify's own correction commit
-(`crates/porch-run/src/certify.rs:71`, `:81`) advances HEAD *after* review approves,
-and then `refresh_head_sha` records the new tip without revoking the approval. The
-descendant tolerance in continuity is therefore load-bearing, not dead: binding by
-equality turns every run whose `commands.format` leaves the tree dirty into a
-fail-closed run, which `m5_certify::format_dirty_tree_gets_correction_commit` proves
-and which would break the dogfood consumers named in `AGENTS.md`.
+These criteria were recorded blocked because certify's correction commit made
+equality fail-closed on every dirty `commands.format`. EQUAL moved the mutating
+format into rebase, made certify verify-only, and implemented them as originally
+worded. The descendant-tolerance paragraph above is historical.
 
-Deciding whether a correction commit is re-reviewed, exempt, or forbidden is a
-product decision of the same class as the two MILE-3 blockers, so these criteria are
-recorded and **not implemented**:
-
-- **FWDAUTH-1.1** (blocked) WHEN the gate evaluates HEAD continuity THE SYSTEM SHALL
+- **FWDAUTH-1.1** WHEN the gate evaluates HEAD continuity THE SYSTEM SHALL
   require the live worktree HEAD to equal the recorded approved SHA.
-- **FWDAUTH-1.2** (blocked) THE SYSTEM SHALL NOT accept a live HEAD that is merely a
+- **FWDAUTH-1.2** THE SYSTEM SHALL NOT accept a live HEAD that is merely a
   descendant of the approved SHA.
-- **FWDAUTH-1.3** (blocked) IF the live HEAD differs from the approved SHA THEN THE
+- **FWDAUTH-1.3** IF the live HEAD differs from the approved SHA THEN THE
   SYSTEM SHALL fail closed with an error naming both SHAs.
-- **FWDAUTH-1.4** (blocked) WHEN a forward is performed THE SYSTEM SHALL forward the
+- **FWDAUTH-1.4** WHEN a forward is performed THE SYSTEM SHALL forward the
   SHA that continuity authorized, and SHALL NOT re-read the worktree HEAD to choose
-  what to forward.
-- **FWDAUTH-1.6** (blocked) THE SYSTEM SHALL leave HEAD movement reachable only
+  what to forward. EQUAL returns the approved SHA after proving equality; a
+  `rev-parse` remains as a guard only.
+- **FWDAUTH-1.6** THE SYSTEM SHALL leave HEAD movement reachable only
   through the existing phase handoff that revokes the prior approval and re-reviews.
-
-`FWDAUTH-1.4` is recorded here in its original wording. During this build it was
-reworded to forbid only an *independent* re-read, which the implementation does satisfy
-— but that weakened criterion asserts nothing beyond `FWDAUTH-1.7` and let a blocked
-requirement be reported as met. Restoring the original keeps the ledger honest: the
-forward carries the live HEAD once continuity has confirmed it descends from the
-approval, which is not the same as carrying the approved SHA.
 
 ## 2. A forward intent is durable before any external effect
 

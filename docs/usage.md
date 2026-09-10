@@ -68,8 +68,8 @@ pr:
   base_branch: dev          # empty → repos.default_branch from origin/HEAD
 
 commands:
-  format: just fmt          # cheap; not full CI
-  lint: just lint           # format/lint/drift — not Playwright/Postgres
+  format: just fmt          # runs at rebase (may rewrite) and again as a check in certify
+  lint: just lint           # certify-only; a command that writes files fails certify, it does not commit
 
 deliver:
   github:
@@ -125,9 +125,9 @@ Fixed order: **intent → rebase → review → certify → deliver**.
 | Phase | What happens |
 |---|---|
 | intent | Stored from `--intent` / `PORCH_INTENT`. Empty → skip, do not fail |
-| rebase | Onto `pr.base_branch` or `origin/HEAD`. Conflict → **park** (`fix` or `abort`) |
+| rebase | Onto `pr.base_branch` or `origin/HEAD`. Then `commands.format` (may rewrite; a check-only command refuses dirt). Conflict → **park** (`fix` or `abort`) |
 | review | Session-free engine. Blocking findings → **park** |
-| certify | Trusted `commands.format` / `lint` in the disposable worktree |
+| certify | Re-runs `commands.format` as a check, then `lint`. A dirty tree fails; certify never commits |
 | deliver | Lease-push (`--force-with-lease`), scaffold PR (no self-review theater on the visible body), **park** at `compose`, then after respond/skip babysit **allowlisted** checks only |
 
 A **Park** can halt at `rebase`, `review`, or `compose`. Reviewer turns never resume the fixer session. Review auto-fix stays **off**.

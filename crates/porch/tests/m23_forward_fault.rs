@@ -278,11 +278,15 @@ enum Arm {
     },
 }
 
-/// A certify `format` command that leaves the tree dirty, so the certify phase
-/// makes a correction commit and HEAD advances past the reviewed SHA.
+/// A rebase-phase `format` command that leaves a stable dirty.txt, so the first
+/// run commits and a certify re-run is a no-op.
 fn install_dirty_format(bin_dir: &Path) {
     let path = bin_dir.join("porch-fake-format-dirty");
-    std::fs::write(&path, "#!/bin/sh\nset -e\necho formatted >> dirty.txt\n").unwrap();
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nset -e\nprintf 'formatted\\n' > dirty.txt\n",
+    )
+    .unwrap();
     chmod_755(&path);
 }
 
@@ -1022,25 +1026,14 @@ fn two_restarts_leave_one_conclusion() {
 }
 
 // ---------------------------------------------------------------------------
-// Tripwire for the open MILE-3 blocker
+// Guard: format rewrite is reviewed, forward binds by equality (EQUAL / ROAD-23)
 // ---------------------------------------------------------------------------
 
-/// Today's head-continuity tolerance forwards a commit that was never reviewed.
-///
-/// `authorized_forward_sha` accepts a live HEAD that merely *descends* from the
-/// approved SHA, and the certify phase's own correction commit is exactly such a
-/// descendant. So the SHA that reaches `origin` is not the SHA the reviewer saw.
-/// `FWDAUTH-1.4` is recorded Blocked for this reason and the decision is open.
-///
-/// **This test asserts what porch does, not what it should do.** It exists so the
-/// blocker's cost is executable rather than only described in prose, and it
-/// changes when the blocker is decided: if an approval is made to cover exactly
-/// the reviewed tree, this becomes an assertion that the forward is refused or
-/// that re-review is required. It is deliberately not the inverse test — a guard
-/// asserting that an approval *survives* a HEAD advance would freeze an undecided
-/// product question (FAULT-8.3).
+/// The SHA that reaches `origin` is the SHA review approved, even when format
+/// rewrote the tree. The rewrite happens in rebase, so it is inside the reviewed
+/// range; certify does not move HEAD afterwards.
 #[test]
-fn tripwire_a_correction_commit_forwards_an_unreviewed_sha() {
+fn format_rewrite_is_inside_the_reviewed_range_and_forward_binds_by_equality() {
     let yaml = r"
 commands:
   format: porch-fake-format-dirty
@@ -1048,7 +1041,7 @@ commands:
     let s = setup_with_trusted(Some(yaml));
     start_daemon(&s, &Arm::RealGit);
     let branch = "feat-corrected";
-    let reviewed = commit_change(&s.work, "corrected.txt", "x\n");
+    let pushed = commit_change(&s.work, "corrected.txt", "x\n");
     push_branch(&s, branch);
 
     let db = db_of(&s);
@@ -1059,26 +1052,36 @@ commands:
         &["completed", "failed", "parked"],
         Duration::from_secs(120),
     );
+    assert!(
+        run.status == "parked" || run.status == "completed",
+        "run must reach deliver, err={:?}",
+        run.error
+    );
 
     let forwarded = origin_sha(&s, branch).expect("the branch was forwarded to origin");
-    assert_ne!(
-        forwarded, reviewed,
-        "the certify correction commit advanced HEAD, and that descendant is what \
-         reached origin"
+    let approved = run
+        .review_approved_head_sha
+        .as_deref()
+        .expect("review approved a SHA");
+    assert_eq!(
+        forwarded, approved,
+        "origin carries the approved SHA, not a descendant of it"
     );
-    // Name the cause, so the divergence cannot be some other rewrite.
-    let log = git_out(&s.origin, &["log", "-3", "--format=%s", &forwarded]).unwrap_or_default();
+    assert_ne!(
+        forwarded, pushed,
+        "format rewrote the tree; the rewrite is what was reviewed"
+    );
+    let log = git_out(&s.origin, &["log", "-5", "--format=%s", &forwarded]).unwrap_or_default();
     assert!(
         log.lines().any(|l| l.contains("porch: apply format")),
-        "the commit that origin carries and the reviewer never saw is porch's own \
-         correction commit:\n{log}"
+        "the format commit is an ancestor of the forwarded SHA:\n{log}"
     );
     assert!(
         git_ok(
             &s.origin,
-            &["merge-base", "--is-ancestor", &reviewed, &forwarded]
+            &["merge-base", "--is-ancestor", &pushed, &forwarded]
         ),
-        "and it descends from the reviewed SHA, which is the whole tolerance"
+        "the operator's commit is still on the line"
     );
     let records = rounds::forward::records_for_run(&db, &run.id).unwrap();
     let authorized = records
@@ -1090,11 +1093,5 @@ commands:
         authorized, forwarded,
         "the forward record names the SHA that actually landed"
     );
-    if let Some(approved) = run.review_approved_head_sha.as_deref() {
-        assert_ne!(
-            approved, forwarded,
-            "the approval covers a tree that is not the one forwarded — the blocker"
-        );
-    }
     kill_daemon(&s.home);
 }
