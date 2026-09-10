@@ -5,6 +5,9 @@
 Unifies every published crate at **0.2.3** (workspace slices were still 0.2.1 while
 `porch` was 0.2.2). Catch-up of `main` since the 30 August crates.io cut.
 
+- **Daemon (macOS):** `pid_exited` treats zombies as exited via `ps` state (signal 0
+  alone is not enough without procfs), so `kill_group` and the DFAULT suite wait
+  correctly on macOS.
 - **Forward:** durable authorization before any push (FWDAUTH), restart
   reconciliation of interrupted forwards (RECON), and a fault-injection suite
   across that boundary (FAULT). **GOAL-1 / MILE-3 Closed.**

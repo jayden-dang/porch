@@ -83,6 +83,9 @@ const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// spawned the daemon themselves and never reap it — `/proc/<pid>` outlives such a
 /// process, so only the state field is conclusive. What a caller actually waits for
 /// is the release of the state root's exclusive lock, and a zombie has released it.
+///
+/// On platforms without procfs (macOS), a signal-0 probe alone is not enough: a
+/// zombie still accepts it. `ps -o state=` supplies the same Z/X distinction.
 #[must_use]
 pub fn pid_exited(pid: u32) -> bool {
     if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -92,19 +95,35 @@ pub fn pid_exited(pid: u32) -> bool {
             .and_then(|(_, rest)| rest.split_whitespace().next())
             .is_none_or(|state| state == "Z" || state == "X");
     }
-    // No procfs (macOS, or a hidden /proc): a signal probe is the portable answer.
     #[cfg(unix)]
     {
         use nix::errno::Errno;
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
+        if let Some(state) = ps_state_letter(pid) {
+            return state == 'Z' || state == 'X';
+        }
         let Ok(raw) = i32::try_from(pid) else {
             return true;
         };
+        // No `ps` row and no /proc: ESRCH means the pid is gone.
         matches!(kill(Pid::from_raw(raw), None), Err(Errno::ESRCH))
     }
     #[cfg(not(unix))]
     true
+}
+
+/// First letter of `ps -o state=` for `pid`, when `ps` is available.
+#[cfg(unix)]
+fn ps_state_letter(pid: u32) -> Option<char> {
+    let out = Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().chars().next()
 }
 
 /// Terminate a process group spawned by [`spawn_detached`] and wait for it to go.

@@ -135,24 +135,34 @@ fn daemon_pid(home: &Path) -> Option<u32> {
 
 /// True while `pid` is still running.
 ///
-/// A zombie counts as dead: the daemon is spawned by this test process and never
-/// reaped, so `/proc/<pid>` outlives it and only the state field is conclusive.
+/// Uses [`porch_gate::pid_exited`] so Linux `/proc` and macOS `ps` agree that a
+/// zombie counts as dead (signal 0 alone is not enough on macOS).
 fn pid_alive(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .is_some_and(|state| state != "Z" && state != "X")
+    !porch_gate::pid_exited(pid)
 }
 
-/// `/proc` state letter, so a test can prove a process is stopped rather than
-/// assume the signal landed.
+/// Process state letter, so a test can prove a process is stopped rather than
+/// assume the signal landed. `/proc/<pid>/stat` on Linux; `ps -o state=` on
+/// platforms without procfs (macOS).
 fn pid_state(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .map(str::to_string)
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .map(str::to_string);
+    }
+    let out = StdCommand::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .chars()
+        .next()
+        .map(|c| c.to_string())
 }
 
 fn kill_daemon(home: &Path) -> Option<u32> {
