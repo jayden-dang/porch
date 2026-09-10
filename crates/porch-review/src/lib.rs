@@ -318,13 +318,26 @@ pub enum Error {
     Msg(String),
 }
 
+/// Read `key` as an operator override, treating a blank value as unset.
+///
+/// Exported-but-empty is how a shell says "not configured", and it is the only way
+/// a caller of [`crate::REVIEW_BIN_ENV`] can neutralize an inherited value for a
+/// child process. Every reader of an override variable must agree on that, or
+/// `doctor` reports a source the resolver does not actually use.
+#[must_use]
+pub fn env_override(key: &str) -> Option<String> {
+    override_from_raw(std::env::var(key).ok())
+}
+
+fn override_from_raw(raw: Option<String>) -> Option<String> {
+    raw.filter(|v| !v.trim().is_empty())
+}
+
 /// Resolve the review binary: `PORCH_REVIEW_BIN` > `$PORCH_HOME/config.yaml` wrapper > `review`.
 #[must_use]
 pub fn review_bin() -> String {
-    if let Ok(v) = std::env::var(REVIEW_BIN_ENV) {
-        if !v.trim().is_empty() {
-            return v;
-        }
+    if let Some(v) = env_override(REVIEW_BIN_ENV) {
+        return v;
     }
     if let Some(home) = porch_home_dir() {
         if let Ok(Some(cfg)) = load_home_config(&home) {
@@ -739,6 +752,17 @@ fn kill_child_group(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_override_reads_the_same_as_unset() {
+        assert_eq!(override_from_raw(None), None);
+        assert_eq!(override_from_raw(Some(String::new())), None);
+        assert_eq!(override_from_raw(Some("   \t ".into())), None);
+        assert_eq!(
+            override_from_raw(Some("/usr/bin/review".into())),
+            Some("/usr/bin/review".into())
+        );
+    }
 
     #[test]
     fn high_bug_is_blocking() {

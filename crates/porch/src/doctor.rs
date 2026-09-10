@@ -259,8 +259,7 @@ next to it is not the floor this porch shipped with — {remedy}",
 
 fn check_review() -> Check {
     let home = porch_home();
-    let from_env = env::var_os(REVIEW_BIN_ENV).is_some();
-    if from_env {
+    if porch_review::env_override(REVIEW_BIN_ENV).is_some() {
         let bin = review_bin();
         return match resolve_bin(&bin) {
             Some(p) => Check::new(

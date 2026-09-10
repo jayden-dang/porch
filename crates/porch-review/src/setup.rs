@@ -157,15 +157,11 @@ pub fn detect_optional_tools() -> (Option<PathBuf>, Option<PathBuf>, ToolsConfig
 /// Whether review setup looks complete for doctor / bare porch.
 #[must_use]
 pub fn review_setup_ok(porch_home: &Path) -> bool {
-    if std::env::var_os(crate::REVIEW_BIN_ENV).is_some() {
+    if crate::env_override(crate::REVIEW_BIN_ENV).is_some() {
         return resolve_bin(&crate::review_bin()).is_some();
     }
-    if std::env::var_os(crate::REVIEW_AGENT_BIN_ENV).is_some() {
-        return std::env::var(crate::REVIEW_AGENT_BIN_ENV)
-            .ok()
-            .as_deref()
-            .and_then(resolve_bin)
-            .is_some();
+    if let Some(agent) = crate::env_override(crate::REVIEW_AGENT_BIN_ENV) {
+        return resolve_bin(&agent).is_some();
     }
     match load_home_config(porch_home) {
         Ok(Some(cfg)) => {

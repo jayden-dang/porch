@@ -382,10 +382,8 @@ fn resolve_cli_target(opts: &PrepareOpts<'_>) -> (String, SelectionSource) {
     if let Some(v) = opts.review_bin.map(str::trim).filter(|s| !s.is_empty()) {
         return (v.to_string(), SelectionSource::EnvReviewBin);
     }
-    if let Ok(v) = std::env::var(REVIEW_BIN_ENV) {
-        if !v.trim().is_empty() {
-            return (v, SelectionSource::EnvReviewBin);
-        }
+    if let Some(v) = crate::env_override(REVIEW_BIN_ENV) {
+        return (v, SelectionSource::EnvReviewBin);
     }
     if let Some(home) = opts.porch_home {
         if let Ok(Some(cfg)) = load_home_config(home) {
@@ -403,10 +401,8 @@ fn resolve_agent_target(opts: &PrepareOpts<'_>) -> Result<(String, SelectionSour
     if let Some(v) = opts.agent_bin.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok((v.to_string(), SelectionSource::EnvAgentBin));
     }
-    if let Ok(v) = std::env::var(crate::REVIEW_AGENT_BIN_ENV) {
-        if !v.trim().is_empty() {
-            return Ok((v, SelectionSource::EnvAgentBin));
-        }
+    if let Some(v) = crate::env_override(crate::REVIEW_AGENT_BIN_ENV) {
+        return Ok((v, SelectionSource::EnvAgentBin));
     }
     let home = opts.porch_home.ok_or_else(|| {
         Error::Msg("agent plan requires porch_home when agent_bin is unset".into())
