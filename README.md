@@ -19,6 +19,8 @@ porch doctor
 
 That one command installs **`porch` and `porch-quality`**. Rust 1.85+ and git.
 
+If an older install left a standalone `porch-quality` package, use `--force` (or uninstall it first) so cargo can replace the sibling binary.
+
 - Install: **[docs/install.md](docs/install.md)**
 - Usage A–Z: **[docs/usage.md](docs/usage.md)**
 
