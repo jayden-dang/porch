@@ -185,14 +185,29 @@ fn fill_database_arm(home: &Path, report: &mut LookReport) {
     }
 }
 
-fn recovery_tips(bare_path: &Path) -> Vec<RecoveryTip> {
-    let Ok(git_dir) = porch_git::GitDir::new(bare_path) else {
-        return Vec::new();
-    };
-    let Ok(rows) = porch_git::for_each_ref(&git_dir, "refs/porch/recover") else {
-        return Vec::new();
-    };
-    rows.into_iter()
+/// Recover refs on the layout-derived bare. Inspect fail-soft: errors become
+/// an empty list. Purge uses [`recovery_tips_strict`].
+pub(crate) fn recovery_tips(bare_path: &Path) -> Vec<RecoveryTip> {
+    recovery_tips_strict(bare_path).unwrap_or_default()
+}
+
+/// Strict recover-ref inventory for `--purge`.
+///
+/// An absent bare is "no tips". A present bare whose git listing fails is an
+/// error: purge must not treat that as empty.
+///
+/// # Errors
+///
+/// Returns a reason when the bare exists and cannot be listed.
+pub(crate) fn recovery_tips_strict(bare_path: &Path) -> Result<Vec<RecoveryTip>, String> {
+    if !bare_path.exists() {
+        return Ok(Vec::new());
+    }
+    let git_dir = porch_git::GitDir::new(bare_path).map_err(|e| e.to_string())?;
+    let rows =
+        porch_git::for_each_ref(&git_dir, "refs/porch/recover").map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
         .map(|(sha, ref_name)| {
             let run_id = ref_name
                 .strip_prefix("refs/porch/recover/")
@@ -204,23 +219,47 @@ fn recovery_tips(bare_path: &Path) -> Vec<RecoveryTip> {
                 run_id,
             }
         })
-        .collect()
+        .collect())
 }
 
-fn worktree_tips(home: &Path, repo_id: &str) -> Vec<WorktreeTip> {
+/// Leftover worktree HEADs. Inspect fail-soft: errors become an empty list.
+pub(crate) fn worktree_tips(home: &Path, repo_id: &str) -> Vec<WorktreeTip> {
+    worktree_tips_strict(home, repo_id).unwrap_or_default()
+}
+
+/// Strict leftover-worktree inventory for `--purge`.
+///
+/// An absent worktree root is "no tips". A present root that cannot be read,
+/// or a leftover directory whose HEAD cannot be parsed, is an error.
+///
+/// # Errors
+///
+/// Returns a reason when inventory cannot be proven complete.
+pub(crate) fn worktree_tips_strict(home: &Path, repo_id: &str) -> Result<Vec<WorktreeTip>, String> {
     let root = worktrees_dir(home).join(repo_id);
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = std::fs::read_dir(&root)
+        .map_err(|e| format!("cannot list leftover worktrees at {}: {e}", root.display()))?;
     let mut tips = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            format!(
+                "cannot read leftover worktree entry under {}: {e}",
+                root.display()
+            )
+        })?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let Ok(sha) = porch_git::rev_parse_c(&path, "HEAD") else {
-            continue;
-        };
+        let sha = porch_git::rev_parse_c(&path, "HEAD").map_err(|e| {
+            format!(
+                "cannot read HEAD of leftover worktree {}: {e}",
+                path.display()
+            )
+        })?;
         let run_id = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -232,7 +271,7 @@ fn worktree_tips(home: &Path, repo_id: &str) -> Vec<WorktreeTip> {
         });
     }
     tips.sort_by(|a, b| a.path.cmp(&b.path));
-    tips
+    Ok(tips)
 }
 
 fn project_run_forwards(

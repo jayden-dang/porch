@@ -17,6 +17,7 @@ mod look;
 mod notes;
 mod notify;
 mod proc;
+mod purge;
 pub mod rounds;
 mod rpc;
 mod service;
@@ -41,9 +42,9 @@ pub use events::{
 };
 pub use executor::RunExecutor;
 pub use home::{
-    db_path, lock_path, logs_dir, pid_path, porch_home, refusal_path, repos_dir, run_artifact_dir,
-    run_deliver_repair_dir, run_fixer_dir, run_review_dir, run_worktree_dir, socket_path,
-    worktrees_dir,
+    abandoned_dir, db_path, lock_path, logs_dir, pid_path, porch_home, refusal_path, repos_dir,
+    run_artifact_dir, run_deliver_repair_dir, run_fixer_dir, run_review_dir, run_worktree_dir,
+    socket_path, worktrees_dir,
 };
 pub use id::repo_id_for;
 pub use init::{InitOptions, InitResult, init};

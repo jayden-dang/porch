@@ -68,6 +68,7 @@ to be incapable of creating a file, migrating schema, or terminalizing active
   use `open_read`. `porch agent respond` SHALL keep `Db::open` because it writes.
 - **LOOK-2.5** ROAD-24's purge manifest SHALL be able to call `open_read`. This
   wave SHALL NOT implement purge, `--abandon`, or the refusal predicate.
+  Consumed 2026-09-10 by PURGE.
 
 ## 3. One join of three sources, each legal with the others down
 

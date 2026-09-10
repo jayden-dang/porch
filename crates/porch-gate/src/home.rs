@@ -44,6 +44,15 @@ pub fn refusal_path(home: &std::path::Path) -> PathBuf {
     home.join("daemon.refusal.json")
 }
 
+/// Directory for `--abandon` records. Outside the tree `--purge` deletes.
+///
+/// Not under `repos/`, `worktrees/`, `runs/`, or `logs/` (`logs/` is truncated
+/// on daemon spawn). A later purge must not delete these files.
+#[must_use]
+pub fn abandoned_dir(home: &std::path::Path) -> PathBuf {
+    home.join("abandoned")
+}
+
 /// Path of the `SQLite` state database.
 #[must_use]
 pub fn db_path(home: &std::path::Path) -> PathBuf {

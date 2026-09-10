@@ -361,6 +361,31 @@ pub fn is_ancestor(work_tree: &Path, maybe_ancestor: &str, tip: &str) -> Result<
     cmd.arg("-C").arg(work_tree);
     cmd.args(["merge-base", "--is-ancestor", maybe_ancestor, tip]);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    ancestor_status(cmd, maybe_ancestor, tip)
+}
+
+/// `git --git-dir=<abs> merge-base --is-ancestor <maybe_ancestor> <tip>`.
+///
+/// Same 0/1/other contract as [`is_ancestor`]. Recover objects live on the gate
+/// bare, so origin-proof for a custody tip cannot use the work-tree helper.
+///
+/// # Errors
+///
+/// Returns [`Error::Spawn`] on I/O failure. Non-zero exit from git that is not
+/// status 1 is returned as [`Error::Command`]. Status 1 means "not an ancestor".
+pub fn is_ancestor_git_dir(
+    git_dir: &GitDir,
+    maybe_ancestor: &str,
+    tip: &str,
+) -> Result<bool, Error> {
+    let mut cmd = Command::new(git_bin());
+    cmd.arg(format!("--git-dir={}", git_dir.as_path().display()));
+    cmd.args(["merge-base", "--is-ancestor", maybe_ancestor, tip]);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    ancestor_status(cmd, maybe_ancestor, tip)
+}
+
+fn ancestor_status(mut cmd: Command, maybe_ancestor: &str, tip: &str) -> Result<bool, Error> {
     let output = cmd.output().map_err(Error::Spawn)?;
     match output.status.code() {
         Some(0) => Ok(true),

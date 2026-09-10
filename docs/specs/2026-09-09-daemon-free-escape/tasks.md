@@ -97,8 +97,8 @@ Waves are ordered by dependency. Each wave ends green on
   first push notify". The push hook execs `porch daemon notify-push`, which does a
   best-effort RPC and logs a warning when it fails; it does not spawn. The advice
   misdirects in exactly the scenario MILE-4 serves.
-- **F.6** The purge refusal and explicit-abandon policy — MILE-4's blocker, owned by
-  Jayden. Recommendation recorded in `requirements.md` §5.
+- **F.6** ~~The purge refusal and explicit-abandon policy — MILE-4's blocker.~~
+  Closed 2026-09-10 as PURGE / ROAD-24.
 - **F.7** Porch's machine-authored commits inherit the operator's commit-signing
   configuration. `certify.rs` and the deliver-repair path both commit with
   `-c core.hooksPath=/dev/null -c user.email=… -c user.name=… --no-verify` — porch

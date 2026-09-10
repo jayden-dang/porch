@@ -434,8 +434,13 @@ readable database, and is retryable from any partial state. Safe eject preserves
 the database, bare repository, recovery refs, and custody evidence. `--purge` is
 destructive — it deletes this repo's bare, worktrees, run artifacts, and DB rows
 (other repos under `$PORCH_HOME` untouched) — and is outside the no-loss
-guarantee of **GOAL-4**. Eject reports which of three states it left: gate state
-preserved, purged, or left behind with a reason.
+guarantee of **GOAL-4**. `--purge` refuses, without detaching, while this repo
+has unforwarded **Custody** tips (`refs/porch/recover/*` or leftover worktree
+HEADs) or active **Run**s; `--abandon` is the single explicit override and writes
+the abandoned tips and run ids under `$PORCH_HOME/abandoned/` before deletion.
+Eject reports which of three states it left after a detach: gate state
+preserved, purged, or left behind with a reason. A refused `--purge` is not a
+fourth detach state: the checkout stays attached.
 _Avoid_: "uninstall" — that is the daemon-service verb (`porch daemon uninstall`).
 
 **Daemon condition**:
