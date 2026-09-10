@@ -14,12 +14,37 @@ porch attributes the excuse to an authority that never spoke.
 
 **A producer states a reason; it never supplies an authority.** Waiving review of a changed file
 is a decision that the file may reach `origin` unreviewed, which is an approval, which ARCH-11
-already forbids a producer to issue. The `"producer"` default is deleted and
-`round_coverage.authority` is constrained to the closed set `authority_events.actor_kind` already
-uses. A producer's stated reason is retained as evidence. This is a **live defect against a
-shipped invariant and is repaired immediately**, not held for the milestone; the module's own
+already forbids a producer to issue. A producer's stated reason is retained as evidence; the
+authority slot is `operator` or `porch`, or the path is not waived. The module's own
 `waived_without_authority_is_rejected` test already asserts the manifest path fails closed while
 the status-row path beside it never can.
+
+**The repair is not to delete the default, and finding out why changed this ADR.** Going to
+implement the deletion showed that `"producer"` is doing two jobs, and only one of them is the
+hole. The deterministic floor emits `skip` with a reason for every changed path it does not
+review — a lock file, for instance — and `porch-quality`'s own `CoverageEntry` carries only
+`path`, `status` and `reason`, with **no authority field at all**
+(`crates/porch-quality/src/coverage.rs:7-15`, `:105-115`). Its output is parsed back through the
+same `from_status_rows` path, so the fabricated string is what currently lets the floor's own
+skips satisfy `meets_required`. Deleting it would make the mandatory floor fail closed on the
+first run that touches a skipped path, which is an ARCH-12 break far worse than the hole being
+closed. Both adversarial reviews probed this code with a judgment producer and neither noticed
+that the floor depends on the same line.
+
+So the repair is **role-aware stamping**, and it is a wave rather than a one-line change:
+derivation must be told which authority porch is willing to stamp for the slot it is deriving.
+The floor's skips are porch's own determination and are stamped `porch` — which is what they
+always were, honestly labelled. A judgment producer's skips are stamped by nobody, so they are
+not waivers and the path falls to a shortfall. The two halves must land together or ARCH-12
+breaks between them. It is scheduled inside ROAD-15 with priority rather than shipped as a
+drive-by, and it carries a value migration, because rows already recorded say `"producer"`.
+
+One residual is named rather than closed: until the authority is supplied out of band, a producer
+that writes `"operator"` into its own payload is still believed. A closed-set check in derivation
+does not catch that, and a `CHECK` constraint cannot be added to `round_coverage` retroactively,
+because the table is created with `IF NOT EXISTS` and existing databases would never gain it —
+the same trap already recorded for `authority_events.kind`. Moving the authority out of the
+producer's payload is therefore the first thing ROAD-15 does, not the last.
 
 **Operator configuration loaded from the trusted default-branch SHA may supply a coverage waiver
 under `operator` authority,** recorded with the config SHA as its evidence. This is what makes
