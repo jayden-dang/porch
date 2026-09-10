@@ -10,7 +10,7 @@ Install: [install.md](install.md). This page is the operator loop after the bina
 
 | Need | Why |
 |---|---|
-| `porch` 0.2.2+ on `PATH` | Gate CLI (`cargo install porch --locked` also installs the floor sibling) |
+| `porch` 0.2.3+ on `PATH` | Gate CLI (`cargo install porch --locked` also installs the floor sibling) |
 | `porch-quality` next to `porch` | Mandatory **deterministic floor**. Not PATH-selected, not optional. `porch doctor` checks the sibling of `current_exe` |
 | `git` | Gate operations shell out to git |
 | `gh` logged in | Deliver (PR). `porch doctor` checks it |
@@ -25,7 +25,7 @@ State lives under `$PORCH_HOME` (default `~/.porch`).
 ```sh
 cargo install porch --locked
 export PATH="$HOME/.cargo/bin:$PATH"    # persist in ~/.zshrc if doctor warns
-porch --version                         # porch 0.2.2
+porch --version                         # porch 0.2.3
 ```
 
 Full install options: [install.md](install.md).

@@ -5,20 +5,20 @@
 #   cargo install porch --locked
 #
 # One-liner from git:
-#   curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.2/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/jayden-dang/porch/v0.2.3/install.sh | bash
 #
 # From a clone:
 #   ./install.sh
 #
 # Default bindir: $CARGO_HOME/bin (usually ~/.cargo/bin).
 # Override with PORCH_PREFIX=/path/to/bin.
-# Pin a git ref with PORCH_GIT_REF=v0.2.2 (when not run from a clone).
+# Pin a git ref with PORCH_GIT_REF=v0.2.3 (when not run from a clone).
 # Dry-run: PORCH_INSTALL_DRY_RUN=1 ./install.sh
 
 set -euo pipefail
 
 PORCH_GIT_URL="${PORCH_GIT_URL:-https://github.com/jayden-dang/porch}"
-PORCH_GIT_REF="${PORCH_GIT_REF:-v0.2.2}"
+PORCH_GIT_REF="${PORCH_GIT_REF:-v0.2.3}"
 
 script_dir=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
