@@ -400,9 +400,13 @@ not in a database `CHECK`, so a later verdict does not require rebuilding an
 append-only table. An `indeterminate` verdict may be upgraded by the gate
 repository's own remote-tracking ref, which git writes only after the receiving
 end acknowledged the push; that ref is one-sided evidence and never downgrades a
-verdict.
+verdict. Inspect (`porch status`) projects a stored row when one exists, and
+otherwise derives the same `classify` result as a read over the **Forward
+record** without writing it back — so an operator can see an intent-only
+forward before the next start manufactures the row.
 _Avoid_: a new `runs.status` value for it; "unchanged" as a verdict; treating the
-tracking ref's absence as proof a push failed.
+tracking ref's absence as proof a push failed; treating `runs.error` as the
+source of truth.
 
 **Custody**:
 Porch's claim over a ref while a run holds it — the basis for refusing a

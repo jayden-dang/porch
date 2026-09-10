@@ -1,7 +1,7 @@
 # Design — daemon-free inspect
 
 **Feature code:** LOOK
-**Status:** Specified
+**Status:** Implemented
 **Roadmap item:** ROAD-10 (MILE-4), second wave
 **Requirements:** [requirements.md](requirements.md)
 **Respects:** ARCH-1, ARCH-2, ARCH-10, ARCH-11, ARCH-13

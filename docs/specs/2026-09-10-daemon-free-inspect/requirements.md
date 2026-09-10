@@ -1,7 +1,7 @@
 # Requirements: Daemon-free inspect
 
 Feature code: LOOK
-Status: Specified
+Status: Implemented
 Date: 2026-09-10
 
 Roadmap item: ROAD-10 (MILE-4 — Escape without the daemon), second wave. Completes
