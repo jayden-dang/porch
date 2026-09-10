@@ -696,6 +696,7 @@ mod tests {
     use crate::home_config::{HomeConfig, ReviewConfig, write_home_config};
     use crate::pathutil::chmod_755;
     use crate::setup::write_wrapper;
+    use std::process::Command;
     use std::time::Duration;
 
     fn install_fake(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -704,6 +705,42 @@ mod tests {
         fs::write(&path, body).unwrap();
         chmod_755(&path).unwrap();
         path
+    }
+
+    const CLEAN_ENV_CHILD: &str = "PORCH_PLAN_TEST_CLEAN_ENV";
+
+    /// True when the caller re-ran itself in a child and should stop here.
+    ///
+    /// The cases that cover the home-config wrapper need the override variables
+    /// absent, and an operator who exports one would otherwise steer them onto the
+    /// env branch. Clearing in-process is not an option — the workspace forbids
+    /// unsafe, and an env write would race the other test threads — so the test
+    /// re-runs itself in a child whose environment is built explicitly.
+    fn reran_without_overrides() -> bool {
+        if std::env::var_os(CLEAN_ENV_CHILD).is_some() {
+            return false;
+        }
+        if crate::env_override(REVIEW_BIN_ENV).is_none()
+            && crate::env_override(crate::REVIEW_AGENT_BIN_ENV).is_none()
+        {
+            return false;
+        }
+        let thread = std::thread::current();
+        let test_name = thread.name().expect("test thread name").to_string();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env(CLEAN_ENV_CHILD, "1")
+            .env_remove(REVIEW_BIN_ENV)
+            .env_remove(crate::REVIEW_AGENT_BIN_ENV)
+            .args(["--exact", &test_name])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{test_name} failed in the clean-env child\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
     }
 
     #[test]
@@ -767,6 +804,9 @@ printf '%s\n' '{"comments":[],"files":["a.rs"]}' > "$OUT"
 
     #[test]
     fn wrapper_identity_spans_wrapper_backend_and_argv() {
+        if reran_without_overrides() {
+            return;
+        }
         let tmp = tempfile::TempDir::new().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
@@ -870,6 +910,9 @@ printf '%s\n' '{"comments":[],"files":["a.rs"]}' > "$OUT"
 
     #[test]
     fn unobservable_version_records_unavailable_with_reason() {
+        if reran_without_overrides() {
+            return;
+        }
         let tmp = tempfile::TempDir::new().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(home.join("bin")).unwrap();
@@ -964,6 +1007,9 @@ printf '%s\n' '{"comments":[],"files":["a.rs"]}' > "$OUT"
 
     #[test]
     fn post_spawn_stability_detects_backend_swap() {
+        if reran_without_overrides() {
+            return;
+        }
         let tmp = tempfile::TempDir::new().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
