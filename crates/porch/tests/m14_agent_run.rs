@@ -512,8 +512,45 @@ fn agent_run_attach_run_id() {
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     let v: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(v.is_object(), "agent stdout must be one JSON object; stdout={stdout}");
     assert_eq!(v["run_id"], run.id);
     assert_eq!(v["status"], "parked");
+    // AgentStatus serde field names (not AgentCliResult wrapper keys).
+    for key in [
+        "run_id",
+        "repo_id",
+        "branch",
+        "status",
+        "phase",
+        "head_sha",
+        "base_sha",
+        "review_approved_head_sha",
+        "findings",
+        "assurance_record",
+    ] {
+        assert!(
+            v.get(key).is_some(),
+            "missing AgentStatus key {key}; stdout={stdout}"
+        );
+    }
+    for wrapper in ["exit_code", "already_emitted", "json"] {
+        assert!(
+            v.get(wrapper).is_none(),
+            "must not emit AgentCliResult wrapper key {wrapper}; stdout={stdout}"
+        );
+    }
+    let shape = v
+        .pointer("/assurance_record/assurance_shape")
+        .and_then(|x| x.as_str());
+    assert!(
+        matches!(shape, Some("floor-only") | Some("floor+judgment")),
+        "assurance_shape must stay floor-only or floor+judgment, not a human phrase; got {shape:?}; stdout={stdout}"
+    );
+    assert_ne!(
+        shape,
+        Some("rules only"),
+        "assurance_shape must not use human voice; stdout={stdout}"
+    );
 
     // --intent with --run-id is usage
     Command::cargo_bin("porch")
