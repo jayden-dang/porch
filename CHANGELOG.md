@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.5 — 2026-10-21
+
+- **Operator voice:** human surfaces (`setup`, `doctor`, `status`, `runs`, `init`,
+  `attach`, errors) say `rules` and `reader` instead of engine names. The assurance
+  shape is selected by the new `review.assurance` key (`rules-only` or
+  `rules+reader`), which wins over `review.engine`; the engine key keeps its wire
+  values so existing configs still load. A review config with neither key is now an
+  error.
+- **Review:** the agent reviewer's stdout and stderr are kept as `agent-stdout.txt` /
+  `agent-stderr.txt` beside `prompt.txt`, so a coverage or JSON failure can be
+  diagnosed.
+
 ## 0.2.4 — 2026-10-21
 
 - **Review:** the agent CLI family (`claude` / `codex`) follows the configured name,
