@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4 — 2026-10-21
+
+- **Review:** the agent CLI family (`claude` / `codex`) follows the configured name,
+  not the canonicalized spawn target. A `claude` symlink into a versioned install
+  dir (`.../versions/2.1.306`) was treated as a generic CLI and failed with
+  `unknown option '--prompt-file'`. The spawned path and recorded identity are unchanged.
+
 ## 0.2.3 — 2026-09-10
 
 Unifies every published crate at **0.2.3** (workspace slices were still 0.2.1 while

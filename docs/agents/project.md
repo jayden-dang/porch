@@ -14,7 +14,7 @@ Edit these two lines directly whenever the project moves phase — no wizard nee
 
 - **Delivery intent:** `Production` — published crate (`cargo install porch`), fail-closed
   safety rules, `unsafe_code = "forbid"`, clippy `all = deny`.
-- **Lifecycle stage:** `Cut Released` — `v0.2.0`–`v0.2.3` tagged and on crates.io.
+- **Lifecycle stage:** `Cut Released` — `v0.2.0`–`v0.2.4` tagged and on crates.io.
   Dogfood on mailgate/klynt not yet started. `.porch.yaml` here lets porch gate
   porch; that is not GOAL-3.
 - **Default PR base:** `main`
