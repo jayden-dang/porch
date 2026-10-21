@@ -9,7 +9,7 @@ use porch_deliver::GH_BIN_ENV;
 use porch_gate::rounds;
 use porch_gate::{Db, get_run, kill_group, repo_id_for, run_worktree_dir};
 use porch_git::init_bare;
-use porch_review::{HomeConfig, REVIEW_BIN_ENV, ToolsConfig, write_home_config};
+use porch_review::{HomeConfig, REVIEW_BIN_ENV, ReviewConfig, ToolsConfig, write_home_config};
 use tempfile::TempDir;
 
 fn git(work: &Path, args: &[&str]) {
@@ -760,7 +760,12 @@ echo biome-ok
     .unwrap();
     chmod_755(&biome);
 
+    // The fake review CLI arrives via REVIEW_BIN_ENV; the config still has to name an engine.
     let cfg = HomeConfig {
+        review: ReviewConfig {
+            engine: Some("generic".into()),
+            ..Default::default()
+        },
         tools: ToolsConfig {
             biome: Some(biome.to_string_lossy().into_owned()),
             ..Default::default()
