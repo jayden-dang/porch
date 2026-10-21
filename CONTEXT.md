@@ -310,8 +310,16 @@ that is the problem: it is the new floor beside an old `porch`.
 **Judgment layer**:
 The layer above the floor that exercises judgment on the change. Supplied by the
 porch-native review by default, or by an external **Producer** that meets the
-declared bar.
+declared bar. On human CLI text its name is **Reader**.
 _Avoid_: "the reviewer" — that names the turn, not the layer.
+
+**Reader**:
+The operator-facing name of the **Judgment layer** on human CLI text (`rules + reader`).
+_Avoid_: engine, reviewer — engine is the config wire value; reviewer is the turn.
+
+**Rules**:
+The operator-facing name of the **Deterministic floor** on human CLI text (`rules only`).
+_Avoid_: quality, engine — those are `review.engine` wire values, not the layer.
 
 **Required producer set**:
 The producers a **Review round** was required to have, recorded when the round is
