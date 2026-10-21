@@ -247,6 +247,7 @@ mod tests {
             &home,
             &HomeConfig {
                 review: ReviewConfig {
+                    assurance: None,
                     engine: Some("agent".into()),
                     bin: Some(config_bin.display().to_string()),
                     wrapper: Some(wrapper.display().to_string()),

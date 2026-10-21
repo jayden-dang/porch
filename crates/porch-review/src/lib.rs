@@ -37,8 +37,8 @@ pub use engine::{
     AGENT_DETECT_BINS, DetectedEngine, EngineKind, agent_detect_bins, known_engines, wrapper_script,
 };
 pub use home_config::{
-    CONFIG_FILE, FixerConfig, GithubConfig, HomeConfig, ReviewConfig, ToolsConfig, config_path,
-    load_home_config, write_home_config,
+    CONFIG_FILE, FixerConfig, GithubConfig, HomeConfig, ReviewConfig, ToolsConfig, VoiceKey,
+    VoiceSelection, config_path, load_home_config, voice_phrase, write_home_config,
 };
 pub use identity::{
     Anchor, AnchorContext, AnchorKind, CandidateKey, Confidence, ConfidenceKind, CriterionMapping,

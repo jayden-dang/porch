@@ -408,13 +408,13 @@ pub fn review_uses_agent(porch_home: Option<&Path>) -> bool {
     let Some(home) = home else {
         return false;
     };
-    matches!(
-        crate::load_home_config(&home)
-            .ok()
-            .flatten()
-            .and_then(|c| c.review.engine_kind()),
-        Some(crate::EngineKind::Agent)
-    )
+    match crate::load_home_config(&home).ok().flatten() {
+        Some(cfg) => match cfg.review.selected() {
+            Ok(sel) => !sel.floor_only && sel.reader == Some(crate::EngineKind::Agent),
+            Err(_) => false,
+        },
+        None => false,
+    }
 }
 
 /// Spawn the review agent (session-free), parse JSON, enforce coverage-lite.

@@ -61,6 +61,14 @@ pub fn wrapper_path(porch_home: &Path) -> PathBuf {
     porch_home.join(WRAPPER_REL)
 }
 
+fn assurance_for(kind: EngineKind) -> &'static str {
+    if kind == EngineKind::Quality {
+        "rules-only"
+    } else {
+        "rules+reader"
+    }
+}
+
 /// Detect known engines currently on PATH.
 #[must_use]
 pub fn detect_engines() -> Vec<DetectedEngine> {
@@ -257,6 +265,7 @@ pub fn setup_yes(porch_home: &Path, engine: Option<EngineKind>) -> Result<SetupR
 
     let cfg = HomeConfig {
         review: ReviewConfig {
+            assurance: Some(assurance_for(kind).into()),
             engine: Some(kind.as_str().into()),
             bin: Some(backend.display().to_string()),
             wrapper: Some(wrap.display().to_string()),
@@ -308,6 +317,7 @@ fn setup_yes_agent(
 
     let cfg = HomeConfig {
         review: ReviewConfig {
+            assurance: Some(assurance_for(EngineKind::Agent).into()),
             engine: Some(EngineKind::Agent.as_str().into()),
             bin: None,
             wrapper: None,

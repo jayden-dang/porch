@@ -37,7 +37,7 @@ use porch_gate::{
 };
 use porch_git::GitDir;
 use porch_review::{
-    Action, AdapterKind, CriterionMapping, CurrentFinding, EngineKind, Finding, History,
+    Action, AdapterKind, CriterionMapping, CurrentFinding, Finding, History,
     ObservedVersionIdentity, PrepareOpts, PreparedInvocation, PriorInstance, ProducerDescriptor,
     ProducerOutput, RunReviewOpts, Severity, SourceRange, check_artifacts_stable, derive,
     load_home_config, prepare, producer_artifact_dir, reconcile, review_timeout, run_review,
@@ -686,11 +686,13 @@ impl SpawnedReview {
 }
 
 fn engine_is_quality(home: &Path) -> bool {
-    load_home_config(home)
-        .ok()
-        .flatten()
-        .and_then(|cfg| cfg.review.engine_kind())
-        == Some(EngineKind::Quality)
+    match load_home_config(home).ok().flatten() {
+        Some(cfg) => match cfg.review.selected() {
+            Ok(sel) => sel.floor_only,
+            Err(_) => false,
+        },
+        None => false,
+    }
 }
 
 struct ComposedProducer {

@@ -175,7 +175,8 @@ pub struct ArtifactStamp {
 ///
 /// # Errors
 ///
-/// Returns when the selected target cannot be resolved to an executable path.
+/// Returns when the selected target cannot be resolved to an executable path,
+/// or when home-config assurance shape selection fails.
 pub fn prepare(opts: &PrepareOpts<'_>) -> Result<PreparedInvocation, Error> {
     let use_agent = match opts.prefer_agent {
         Some(v) => v,
@@ -185,6 +186,21 @@ pub fn prepare(opts: &PrepareOpts<'_>) -> Result<PreparedInvocation, Error> {
             } else if opts.agent_bin.is_some() {
                 true
             } else {
+                if let Some(home) = opts.porch_home {
+                    if crate::env_override(REVIEW_BIN_ENV).is_none()
+                        && crate::env_override(crate::REVIEW_AGENT_BIN_ENV).is_none()
+                    {
+                        if let Ok(Some(cfg)) = load_home_config(home) {
+                            let sel = cfg.review.selected()?;
+                            if sel.floor_only {
+                                return Err(Error::Msg(
+                                    "assurance shape is floor-only; no judgment producer to plan"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                }
                 review_uses_agent(opts.porch_home)
             }
         }
@@ -561,10 +577,11 @@ fn parse_exec_backend(body: &str) -> Option<String> {
 
 fn declared_engine_from_home(porch_home: Option<&Path>) -> Option<EngineKind> {
     let home = porch_home?;
-    load_home_config(home)
-        .ok()
-        .flatten()
-        .and_then(|c| c.review.engine_kind())
+    let cfg = load_home_config(home).ok().flatten()?;
+    match cfg.review.selected() {
+        Ok(sel) if !sel.floor_only => sel.reader.or_else(|| cfg.review.engine_kind()),
+        _ => cfg.review.engine_kind(),
+    }
 }
 
 fn consumed_context_cli(opts: &PrepareOpts<'_>) -> Vec<PreparedContextElement> {
@@ -820,6 +837,7 @@ printf '%s\n' '{"comments":[],"files":["a.rs"]}' > "$OUT"
             &home,
             &HomeConfig {
                 review: ReviewConfig {
+                    assurance: None,
                     engine: Some("quality".into()),
                     bin: Some(backend.display().to_string()),
                     wrapper: Some(wrapper_path(&home).display().to_string()),
@@ -864,6 +882,7 @@ printf '%s\n' '{"comments":[],"files":["a.rs"]}' > "$OUT"
             &home,
             &HomeConfig {
                 review: ReviewConfig {
+                    assurance: None,
                     engine: Some("quality".into()),
                     bin: Some(backend2.display().to_string()),
                     wrapper: Some(wrapper_path(&home).display().to_string()),
@@ -925,6 +944,7 @@ printf '%s\n' '{"comments":[],"files":["a.rs"]}' > "$OUT"
             &home,
             &HomeConfig {
                 review: ReviewConfig {
+                    assurance: None,
                     engine: Some("generic".into()),
                     bin: Some(missing_backend.display().to_string()),
                     wrapper: Some(wrap.display().to_string()),
@@ -1019,6 +1039,7 @@ printf '%s\n' '{"comments":[],"files":["a.rs"]}' > "$OUT"
             &home,
             &HomeConfig {
                 review: ReviewConfig {
+                    assurance: None,
                     engine: Some("generic".into()),
                     bin: Some(backend.display().to_string()),
                     wrapper: Some(wrapper_path(&home).display().to_string()),
