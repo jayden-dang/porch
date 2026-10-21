@@ -43,7 +43,7 @@ enum Command {
         #[arg(long)]
         intent: Option<String>,
     },
-    /// Detect review engine, write `$PORCH_HOME/config.yaml` + wrapper.
+    /// Write rules and reader wiring to `$PORCH_HOME/config.yaml` (+ wrapper when needed).
     Setup {
         /// Detect, write, verify; print JSON (non-interactive).
         #[arg(long)]
@@ -51,7 +51,7 @@ enum Command {
         /// Re-check wrapper/config without rewriting.
         #[arg(long)]
         verify: bool,
-        /// Force engine (`agent`, `ocr`, or `generic`).
+        /// Force the wire selection (`agent`, `ocr`, or `generic`; rules-only also accepted).
         #[arg(long)]
         engine: Option<String>,
         /// Rewrite wrapper from current config.yaml.

@@ -523,3 +523,43 @@ fn nontty_setup_prints_json_no_hang() {
     let v: Value = serde_json::from_str(&stdout).expect("non-TTY setup must print JSON");
     assert_eq!(v["ok"], true, "{stdout}");
 }
+
+#[test]
+fn setup_help_does_not_label_quality() {
+    let assert = Command::cargo_bin("porch")
+        .unwrap()
+        .args(["setup", "--help"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        !stdout.to_ascii_lowercase().contains("quality"),
+        "help must not use quality as a label\n{stdout}"
+    );
+    assert!(
+        stdout.contains("rules") || stdout.contains("reader"),
+        "help should name rules or reader\n{stdout}"
+    );
+}
+
+#[test]
+fn setup_engine_quality_still_parses() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let assert = Command::cargo_bin("porch")
+        .unwrap()
+        .env("PORCH_HOME", &home)
+        .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
+        .args(["setup", "--yes", "--engine", "quality"])
+        .assert();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    let v: Value = serde_json::from_str(&stdout).expect("JSON result");
+    let err = v["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("unknown engine"),
+        "quality must still parse as a wire value\n{stdout}"
+    );
+}

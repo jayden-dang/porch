@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use porch_gate::install_service;
 use porch_review::{
     DetectedEngine, EngineKind, SetupResult, default_engine, detect_engines, detect_optional_tools,
-    review_setup_ok, setup_apply, setup_verify, setup_yes,
+    review_setup_ok, setup_apply, setup_verify, setup_yes, voice_phrase,
 };
 use ratatui::Frame;
 use ratatui::Terminal;
@@ -163,6 +163,8 @@ pub struct SetupWizard {
     pub screen: WizardScreen,
     pub engines: Vec<DetectedEngine>,
     pub focus: usize,
+    /// Floor-resolver sibling path (or unresolved detail) for the fixed rules block.
+    pub rules_line: String,
     pub gh: Option<PathBuf>,
     pub fixer: Option<PathBuf>,
     pub tools_line: String,
@@ -183,7 +185,8 @@ impl SetupWizard {
     /// Build wizard from PATH detection.
     #[must_use]
     pub fn detect() -> Self {
-        let engines = detect_engines();
+        let (rules_line, rules_bin) = rules_from_floor();
+        let engines = reader_engines(detect_engines(), rules_bin);
         let (fixer, gh, tools) = detect_optional_tools();
         let focus = default_focus(&engines);
         let tools_line = format_tools_line(&tools);
@@ -191,6 +194,7 @@ impl SetupWizard {
             screen: WizardScreen::Select,
             engines,
             focus,
+            rules_line,
             gh,
             fixer,
             tools_line,
@@ -364,10 +368,7 @@ impl SetupWizard {
 
         let text = match self.screen {
             WizardScreen::Select => self.select_lines(),
-            WizardScreen::Verifying => vec![
-                Line::from("verifying…"),
-                Line::from("writing wrapper + config, then checking --help / preview"),
-            ],
+            WizardScreen::Verifying => self.verifying_lines(),
             WizardScreen::Success => self.success_lines(),
         };
         let para = Paragraph::new(text);
@@ -376,16 +377,17 @@ impl SetupWizard {
 
     fn select_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        lines.push(Line::from(
-            "Judgment layer (floor always runs via porch-quality sibling)",
-        ));
+        lines.push(Line::from("rules"));
+        lines.push(Line::from(format!("  {}", self.rules_line)));
+        lines.push(Line::from(""));
+        lines.push(Line::from("reader"));
         if self.engines.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (none detected)",
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(
-                "  install claude/codex for agent; quality is floor-only and still needs the sibling",
+                "  install claude/codex for a reader; no reader is rules only and needs the sibling",
             ));
         } else {
             for (i, eng) in self.engines.iter().enumerate() {
@@ -400,19 +402,16 @@ impl SetupWizard {
                 };
                 let label = match eng.kind {
                     EngineKind::Quality => {
-                        format!(
-                            "  {marker} quality — floor-only ({}){rec}",
-                            eng.bin.display()
-                        )
+                        format!("  {marker} no reader — rules only{rec}")
                     }
                     EngineKind::Agent => {
-                        format!("  {marker} agent ({}){rec}", eng.bin.display())
+                        format!("  {marker} {}{rec}", eng.bin.display())
                     }
                     EngineKind::Ocr => {
-                        format!("  {marker} ocr   ({}) (legacy)", eng.bin.display())
+                        format!("  {marker} ocr ({}) (legacy){rec}", eng.bin.display())
                     }
                     EngineKind::Generic => {
-                        format!("  {marker} generic (binary already named review)")
+                        format!("  {marker} {} (generic){rec}", eng.bin.display())
                     }
                 };
                 let style = if i == self.focus {
@@ -452,11 +451,22 @@ impl SetupWizard {
         } else {
             lines.push(Line::from("Enter  write wrapper + config and verify"));
         }
-        lines.push(Line::from("↑↓     change engine"));
+        lines.push(Line::from("↑↓     change reader"));
         lines.push(Line::from("d/spc  toggle login-service install"));
         lines.push(Line::from("s      skip (leave nothing written)"));
         lines.push(Line::from("q      quit"));
         lines
+    }
+
+    fn verifying_lines(&self) -> Vec<Line<'static>> {
+        let floor_only = self
+            .focused_engine()
+            .is_none_or(|k| k == EngineKind::Quality);
+        vec![
+            Line::from("verifying…"),
+            Line::from(voice_phrase(floor_only)),
+            Line::from("writing wrapper + config, then checking --help / preview"),
+        ]
     }
 
     fn success_lines(&self) -> Vec<Line<'static>> {
@@ -498,6 +508,41 @@ fn default_focus(engines: &[DetectedEngine]) -> usize {
         }
     }
     0
+}
+
+fn rules_from_floor() -> (String, Option<PathBuf>) {
+    match porch_review::floor::state() {
+        porch_review::floor::FloorState::Ready { sibling, .. } => {
+            (sibling.display().to_string(), Some(sibling))
+        }
+        porch_review::floor::FloorState::LaunchReplaced { launch } => (
+            format!("porch was replaced while running: {}", launch.display()),
+            None,
+        ),
+        porch_review::floor::FloorState::Unresolved { reason } => (reason, None),
+    }
+}
+
+fn reader_engines(
+    detected: Vec<DetectedEngine>,
+    rules_bin: Option<PathBuf>,
+) -> Vec<DetectedEngine> {
+    let mut out = vec![DetectedEngine {
+        kind: EngineKind::Quality,
+        bin: rules_bin.unwrap_or_else(|| PathBuf::from("porch-quality")),
+    }];
+    for eng in detected {
+        match eng.kind {
+            EngineKind::Quality | EngineKind::Generic => {}
+            EngineKind::Ocr => {
+                if eng.bin.file_name().and_then(|n| n.to_str()) == Some("ocr") {
+                    out.push(eng);
+                }
+            }
+            EngineKind::Agent => out.push(eng),
+        }
+    }
+    out
 }
 
 fn format_tools_line(tools: &porch_review::ToolsConfig) -> String {
@@ -636,63 +681,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ocr_is_focused_by_default_when_only_engine() {
-        let mut w = SetupWizard {
-            screen: WizardScreen::Select,
-            engines: vec![fake_ocr_engine()],
-            focus: default_focus(&[fake_ocr_engine()]),
-            gh: None,
-            fixer: None,
-            tools_line: String::new(),
-            error: None,
-            success_wrapper: None,
-            success_engine: None,
-            install_daemon: false,
-            success_daemon_service: None,
-            apply_hook: None,
-            daemon_hook: None,
-        };
-        assert_eq!(w.focused_engine(), Some(EngineKind::Ocr));
-        let s = render_to_string(&w, 80, 24);
-        assert!(s.contains("ocr"), "buffer={s}");
-        let _ = &mut w;
+    fn fake_no_reader() -> DetectedEngine {
+        DetectedEngine {
+            kind: EngineKind::Quality,
+            bin: PathBuf::from("/install/bin/porch-quality"),
+        }
     }
 
-    #[test]
-    fn agent_is_recommended_when_present() {
-        let engines = vec![fake_ocr_engine(), fake_agent_engine()];
-        let focus = default_focus(&engines);
-        let w = SetupWizard {
+    fn wizard_with(engines: Vec<DetectedEngine>, focus: usize) -> SetupWizard {
+        SetupWizard {
             screen: WizardScreen::Select,
             engines,
             focus,
+            rules_line: "/install/bin/porch-quality".into(),
             gh: None,
             fixer: None,
             tools_line: String::new(),
-            error: None,
-            success_wrapper: None,
-            success_engine: None,
-            install_daemon: false,
-            success_daemon_service: None,
-            apply_hook: None,
-            daemon_hook: None,
-        };
-        assert_eq!(w.focused_engine(), Some(EngineKind::Agent));
-        let s = render_to_string(&w, 80, 24);
-        assert!(s.contains("agent"), "buffer={s}");
-        assert!(s.contains("recommended"), "buffer={s}");
-    }
-
-    #[test]
-    fn enter_triggers_apply_hook_and_success_shows_wrapper() {
-        let mut w = SetupWizard {
-            screen: WizardScreen::Select,
-            engines: vec![fake_ocr_engine()],
-            focus: 0,
-            gh: Some(PathBuf::from("/opt/homebrew/bin/gh")),
-            fixer: None,
-            tools_line: "tools".into(),
             error: None,
             success_wrapper: None,
             success_engine: None,
@@ -701,7 +705,90 @@ mod tests {
             apply_hook: None,
             daemon_hook: None,
         }
-        .with_apply_hook(|_| {
+    }
+
+    #[test]
+    fn ocr_is_focused_by_default_when_only_engine() {
+        let engines = vec![fake_ocr_engine()];
+        let mut w = wizard_with(engines.clone(), default_focus(&engines));
+        assert_eq!(w.focused_engine(), Some(EngineKind::Ocr));
+        let s = render_to_string(&w, 80, 24);
+        assert!(s.contains("ocr"), "buffer={s}");
+        let _ = &mut w;
+    }
+
+    #[test]
+    fn no_reader_is_recommended_when_present_with_agent() {
+        let engines = vec![fake_no_reader(), fake_agent_engine(), fake_ocr_engine()];
+        let focus = default_focus(&engines);
+        let w = wizard_with(engines, focus);
+        assert_eq!(w.focused_engine(), Some(EngineKind::Quality));
+        let s = render_to_string(&w, 100, 28);
+        assert!(s.contains("no reader"), "buffer={s}");
+        assert!(s.contains("recommended"), "buffer={s}");
+        assert!(!s.contains("quality — floor-only"), "buffer={s}");
+    }
+
+    #[test]
+    fn select_shows_rules_and_reader_blocks() {
+        let engines = vec![fake_no_reader(), fake_agent_engine()];
+        let w = wizard_with(engines, 0);
+        let s = render_to_string(&w, 100, 28);
+        assert!(s.contains("rules"), "buffer={s}");
+        assert!(s.contains("/install/bin/porch-quality"), "buffer={s}");
+        assert!(s.contains("reader"), "buffer={s}");
+        assert!(s.contains("no reader"), "buffer={s}");
+        assert!(s.contains("/opt/homebrew/bin/claude"), "buffer={s}");
+        assert!(!s.contains("quality — floor-only"), "buffer={s}");
+        assert!(
+            !s.contains("/opt/homebrew/bin/porch-quality"),
+            "rules must not print a PATH which(porch-quality); buffer={s}"
+        );
+    }
+
+    #[test]
+    fn ocr_row_omitted_when_canonical_name_is_not_ocr() {
+        let mise_ocr = DetectedEngine {
+            kind: EngineKind::Ocr,
+            bin: PathBuf::from("/opt/homebrew/Cellar/mise/2024.1.0/bin/mise"),
+        };
+        let engines = reader_engines(vec![mise_ocr, fake_agent_engine()], None);
+        assert!(
+            !engines.iter().any(|e| e.kind == EngineKind::Ocr),
+            "mise-shim ocr must be omitted: {engines:?}"
+        );
+        let w = wizard_with(engines, 0);
+        let s = render_to_string(&w, 100, 28);
+        assert!(!s.contains("mise"), "buffer={s}");
+        assert!(s.contains("no reader"), "buffer={s}");
+    }
+
+    #[test]
+    fn pending_verifying_line_uses_voice_phrases() {
+        let engines = vec![fake_no_reader(), fake_agent_engine()];
+        let mut w = wizard_with(engines, 0);
+        assert_eq!(w.handle_key(KeyCode::Enter), WizardAction::Apply);
+        assert_eq!(w.screen, WizardScreen::Verifying);
+        let s = render_to_string(&w, 100, 24);
+        assert!(
+            s.contains(voice_phrase(true)),
+            "quality pending must be rules only; buffer={s}"
+        );
+
+        let engines = vec![fake_no_reader(), fake_agent_engine()];
+        let mut w = wizard_with(engines, 1);
+        assert_eq!(w.focused_engine(), Some(EngineKind::Agent));
+        assert_eq!(w.handle_key(KeyCode::Enter), WizardAction::Apply);
+        let s = render_to_string(&w, 100, 24);
+        assert!(
+            s.contains(voice_phrase(false)),
+            "agent pending must be rules + reader; buffer={s}"
+        );
+    }
+
+    #[test]
+    fn enter_triggers_apply_hook_and_success_shows_wrapper() {
+        let mut w = wizard_with(vec![fake_ocr_engine()], 0).with_apply_hook(|_| {
             Ok(SetupResult {
                 ok: true,
                 engine: Some("ocr".into()),
@@ -713,6 +800,8 @@ mod tests {
                 daemon_service: None,
             })
         });
+        w.gh = Some(PathBuf::from("/opt/homebrew/bin/gh"));
+        w.tools_line = "tools".into();
         assert_eq!(w.handle_key(KeyCode::Enter), WizardAction::Apply);
         assert_eq!(w.screen, WizardScreen::Verifying);
         let _ = w.apply(Path::new("/tmp"));
@@ -727,22 +816,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let wrote = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&wrote);
-        let mut w = SetupWizard {
-            screen: WizardScreen::Select,
-            engines: vec![fake_ocr_engine()],
-            focus: 0,
-            gh: None,
-            fixer: None,
-            tools_line: String::new(),
-            error: None,
-            success_wrapper: None,
-            success_engine: None,
-            install_daemon: false,
-            success_daemon_service: None,
-            apply_hook: None,
-            daemon_hook: None,
-        }
-        .with_apply_hook(move |_| {
+        let mut w = wizard_with(vec![fake_ocr_engine()], 0).with_apply_hook(move |_| {
             flag.store(true, Ordering::SeqCst);
             Err("should not run".into())
         });
@@ -752,22 +826,8 @@ mod tests {
 
     #[test]
     fn apply_error_stays_on_select_inline() {
-        let mut w = SetupWizard {
-            screen: WizardScreen::Select,
-            engines: vec![fake_ocr_engine()],
-            focus: 0,
-            gh: None,
-            fixer: None,
-            tools_line: String::new(),
-            error: None,
-            success_wrapper: None,
-            success_engine: None,
-            install_daemon: false,
-            success_daemon_service: None,
-            apply_hook: None,
-            daemon_hook: None,
-        }
-        .with_apply_hook(|_| Err("tampered wrapper".into()));
+        let mut w = wizard_with(vec![fake_ocr_engine()], 0)
+            .with_apply_hook(|_| Err("tampered wrapper".into()));
         assert_eq!(w.handle_key(KeyCode::Enter), WizardAction::Apply);
         let _ = w.apply(Path::new("/tmp"));
         assert_eq!(w.screen, WizardScreen::Select);
@@ -778,21 +838,7 @@ mod tests {
 
     #[test]
     fn daemon_checkbox_defaults_off_and_toggles() {
-        let mut w = SetupWizard {
-            screen: WizardScreen::Select,
-            engines: vec![fake_ocr_engine()],
-            focus: 0,
-            gh: None,
-            fixer: None,
-            tools_line: String::new(),
-            error: None,
-            success_wrapper: None,
-            success_engine: None,
-            install_daemon: false,
-            success_daemon_service: None,
-            apply_hook: None,
-            daemon_hook: None,
-        };
+        let mut w = wizard_with(vec![fake_ocr_engine()], 0);
         let s = render_to_string(&w, 100, 28);
         assert!(s.contains("[ ]"), "buffer={s}");
         assert!(s.contains("login service"), "buffer={s}");
@@ -806,38 +852,25 @@ mod tests {
 
     #[test]
     fn daemon_opt_in_calls_hook_on_apply() {
-        let mut w = SetupWizard {
-            screen: WizardScreen::Select,
-            engines: vec![fake_ocr_engine()],
-            focus: 0,
-            gh: None,
-            fixer: None,
-            tools_line: String::new(),
-            error: None,
-            success_wrapper: None,
-            success_engine: None,
-            install_daemon: true,
-            success_daemon_service: None,
-            apply_hook: None,
-            daemon_hook: None,
-        }
-        .with_apply_hook(|_| {
-            Ok(SetupResult {
-                ok: true,
-                engine: Some("ocr".into()),
-                wrapper: Some("/tmp/home/bin/review".into()),
-                agent_bin: None,
-                verified: true,
-                warnings: Vec::new(),
-                error: None,
-                daemon_service: None,
+        let mut w = wizard_with(vec![fake_ocr_engine()], 0)
+            .with_apply_hook(|_| {
+                Ok(SetupResult {
+                    ok: true,
+                    engine: Some("ocr".into()),
+                    wrapper: Some("/tmp/home/bin/review".into()),
+                    agent_bin: None,
+                    verified: true,
+                    warnings: Vec::new(),
+                    error: None,
+                    daemon_service: None,
+                })
             })
-        })
-        .with_daemon_hook(|| {
-            Ok(PathBuf::from(
-                "/tmp/user/Library/LaunchAgents/ai.porch.daemon.plist",
-            ))
-        });
+            .with_daemon_hook(|| {
+                Ok(PathBuf::from(
+                    "/tmp/user/Library/LaunchAgents/ai.porch.daemon.plist",
+                ))
+            });
+        w.install_daemon = true;
         assert_eq!(w.handle_key(KeyCode::Enter), WizardAction::Apply);
         let _ = w.apply(Path::new("/tmp"));
         assert_eq!(w.screen, WizardScreen::Success);
@@ -850,38 +883,13 @@ mod tests {
         assert!(s.contains("LaunchAgents"), "buffer={s}");
     }
 
-    fn empty_wizard() -> SetupWizard {
-        SetupWizard {
-            screen: WizardScreen::Select,
-            engines: vec![],
-            focus: 0,
-            gh: None,
-            fixer: None,
-            tools_line: String::new(),
-            error: None,
-            success_wrapper: None,
-            success_engine: None,
-            install_daemon: false,
-            success_daemon_service: None,
-            apply_hook: None,
-            daemon_hook: None,
-        }
-    }
-
     #[test]
-    fn empty_engines_name_the_floor_sibling_not_a_path_quality_engine() {
-        let mut w = empty_wizard();
+    fn rules_block_names_sibling_path_not_path_quality() {
+        let w = wizard_with(vec![fake_no_reader()], 0);
         let s = render_to_string(&w, 100, 24);
-        assert!(s.contains("sibling"), "buffer={s}");
-        assert!(
-            s.contains("floor-only") || s.contains("floor"),
-            "buffer={s}"
-        );
+        assert!(s.contains("rules"), "buffer={s}");
+        assert!(s.contains("/install/bin/porch-quality"), "buffer={s}");
         assert!(!s.contains("install porch-quality (M16)"), "buffer={s}");
-        assert_eq!(w.handle_key(KeyCode::Enter), WizardAction::None);
-        let err = w.error.as_deref().expect("inline error");
-        assert!(err.contains("sibling"), "{err}");
-        assert!(err.contains("floor-only"), "{err}");
-        assert!(!err.contains("install porch-quality (M16)"), "{err}");
+        assert!(!s.contains("quality — floor-only"), "buffer={s}");
     }
 }
