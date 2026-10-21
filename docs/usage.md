@@ -505,3 +505,5 @@ the same reason as above: the fence refuses writes from a writer that does not u
 Reverting the upgrade means restoring a backup of `$PORCH_HOME`. The `forward_records` rows
 themselves are append-only and are never rewritten, so a restored backup simply lacks them.
 
+
+<!-- porch gate smoke test -->
