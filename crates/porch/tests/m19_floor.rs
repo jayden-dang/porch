@@ -485,6 +485,11 @@ fn set_home_engine(home: &Path, engine: &str) {
     let mut out = String::new();
     let mut replaced = false;
     for line in body.lines() {
+        // setup writes review.assurance too, and it wins over engine; drop it so the
+        // engine edit alone decides the shape.
+        if line.trim_start().starts_with("assurance:") {
+            continue;
+        }
         if !replaced && line.trim_start().starts_with("engine:") {
             let indent_len = line.len() - line.trim_start().len();
             out.push_str(&line[..indent_len]);
