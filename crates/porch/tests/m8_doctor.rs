@@ -89,7 +89,106 @@ fn doctor_ok_floor_sibling_is_distinct_from_judgment_review() {
         .stdout(predicates::str::contains("porch-quality"))
         .stdout(predicates::str::contains("deterministic floor"))
         .stdout(predicates::str::contains("[warn] review:"))
-        .stdout(predicates::str::contains("judgment engine"));
+        .stdout(predicates::str::contains("rules"));
+}
+
+fn review_line(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find(|l| l.contains("] review:"))
+        .unwrap_or("")
+        .to_string()
+}
+
+#[test]
+fn doctor_review_line_names_voice_phrase_and_winning_key() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    install_fake_git(&bin);
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.yaml"),
+        "review:\n  assurance: rules-only\n  engine: quality\n",
+    )
+    .unwrap();
+
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .env("PATH", &bin)
+        .env("PORCH_HOME", &home)
+        .env("HOME", tmp.path())
+        .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
+        .env_remove("PORCH_GH_BIN")
+        .env_remove("PORCH_FIXER_BIN")
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let review = review_line(&stdout);
+    assert!(
+        review.contains(porch_review::voice_phrase(true)),
+        "expected rules-only phrase: {review} full={stdout}"
+    );
+    assert!(
+        review.contains("assurance"),
+        "expected winning key assurance: {review}"
+    );
+    assert!(stdout.contains("[ok  ] floor:"), "{stdout}");
+    assert!(stdout.contains("identity="), "{stdout}");
+    assert!(stdout.contains("porch-quality"), "{stdout}");
+    assert!(
+        !home.join("daemon.pid").exists(),
+        "doctor must not spawn a daemon"
+    );
+}
+
+#[test]
+fn doctor_review_line_names_engine_when_assurance_absent() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    install_fake_git(&bin);
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("config.yaml"), "review:\n  engine: quality\n").unwrap();
+
+    let out = Command::cargo_bin("porch")
+        .unwrap()
+        .env("PATH", &bin)
+        .env("PORCH_HOME", &home)
+        .env("HOME", tmp.path())
+        .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
+        .env_remove("PORCH_GH_BIN")
+        .env_remove("PORCH_FIXER_BIN")
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let review = review_line(&stdout);
+    assert!(
+        review.contains(porch_review::voice_phrase(true)),
+        "expected rules-only phrase: {review} full={stdout}"
+    );
+    assert!(
+        review.contains("engine"),
+        "expected winning key engine: {review}"
+    );
+    assert!(
+        !home.join("daemon.pid").exists(),
+        "doctor must not spawn a daemon"
+    );
 }
 
 #[test]
@@ -165,20 +264,38 @@ fn init_prints_remote_and_next_steps() {
         .status();
 
     // No review/gh on a stripped PATH suffix → tip line may appear; remote line must.
-    Command::cargo_bin("porch")
+    let out = Command::cargo_bin("porch")
         .unwrap()
         .current_dir(&work)
         .env("PORCH_HOME", &home)
+        .env_remove("PORCH_REVIEW_BIN")
+        .env_remove("PORCH_REVIEW_AGENT_BIN")
         .arg("init")
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("porch remote ->"))
-        .stdout(predicates::str::contains("repo id:"))
-        .stdout(predicates::str::contains("default branch:"))
-        .stdout(predicates::str::contains("PORCH_HOME:"))
-        .stdout(predicates::str::contains(
-            "next: git push porch HEAD:refs/heads/",
-        ));
+        .arg("--skip-setup")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("porch remote ->"), "{stdout}");
+    assert!(stdout.contains("repo id:"), "{stdout}");
+    assert!(stdout.contains("default branch:"), "{stdout}");
+    assert!(stdout.contains("PORCH_HOME:"), "{stdout}");
+    assert!(
+        stdout.contains("next: git push porch HEAD:refs/heads/"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("rules") || stdout.contains("reader"),
+        "init tip must name rules/reader: {stdout}"
+    );
+    assert!(
+        !stdout.to_lowercase().contains("judgment engine"),
+        "init tip must not label wiring as engine/quality: {stdout}"
+    );
 
     if let Ok(pid) = fs::read_to_string(home.join("daemon.pid")) {
         if let Ok(pid) = pid.trim().parse::<u32>() {

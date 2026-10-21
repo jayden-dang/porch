@@ -8,7 +8,8 @@ use std::process::{Command, ExitCode};
 use porch_gate::{DaemonCondition, daemon_condition, look, porch_home, socket_path};
 use porch_review::floor::FloorState;
 use porch_review::{
-    REVIEW_BIN_ENV, floor, is_executable, load_home_config, resolve_bin, review_bin, which,
+    REVIEW_BIN_ENV, VoiceKey, floor, is_executable, load_home_config, resolve_bin, review_bin,
+    voice_phrase, which,
 };
 
 const GH_BIN_ENV: &str = "PORCH_GH_BIN";
@@ -315,64 +316,64 @@ fn check_review() -> Check {
             ),
         };
     }
-    if porch_review::review_uses_agent(Some(&home)) {
-        match porch_review::agent_review_bin(&home) {
-            Ok(agent) => {
-                if let Some(p) = resolve_bin(&agent) {
-                    let engine = load_home_config(&home)
-                        .ok()
-                        .flatten()
-                        .and_then(|c| c.review.engine)
-                        .unwrap_or_else(|| "agent".into());
-                    return Check::new(
-                        Level::Ok,
-                        "review",
-                        format!("{} (engine={engine}, agent)", p.display()),
-                    );
-                }
-                return Check::new(
+    match load_home_config(&home) {
+        Ok(Some(cfg)) => match cfg.review.selected() {
+            Ok(sel) => check_review_selection(&home, &sel),
+            Err(e) => Check::new(Level::Warn, "review", e.to_string()),
+        },
+        Ok(None) | Err(_) => Check::new(
+            Level::Warn,
+            "review",
+            format!(
+                "rules/reader not configured — run `porch setup` (`rules only` still needs the porch-quality sibling) or set {REVIEW_BIN_ENV}"
+            ),
+        ),
+    }
+}
+
+fn check_review_selection(home: &Path, sel: &porch_review::VoiceSelection) -> Check {
+    let phrase = voice_phrase(sel.floor_only);
+    let key = match sel.source {
+        VoiceKey::Assurance => "assurance",
+        VoiceKey::Engine => "engine",
+    };
+    if sel.floor_only {
+        return Check::new(Level::Ok, "review", format!("{phrase} ({key})"));
+    }
+    if sel.reader == Some(porch_review::EngineKind::Agent) {
+        return match porch_review::agent_review_bin(home) {
+            Ok(agent) => match resolve_bin(&agent) {
+                Some(p) => Check::new(
+                    Level::Ok,
+                    "review",
+                    format!("{phrase} ({key}) {}", p.display()),
+                ),
+                None => Check::new(
                     Level::Warn,
                     "review",
                     format!(
-                        "`{agent}` not found — run `porch setup --engine agent` or set PORCH_REVIEW_AGENT_BIN"
+                        "{phrase} ({key}) — `{agent}` not found; run `porch setup` or set PORCH_REVIEW_AGENT_BIN"
                     ),
-                );
-            }
-            Err(e) => {
-                return Check::new(Level::Warn, "review", e.to_string());
-            }
-        }
+                ),
+            },
+            Err(e) => Check::new(Level::Warn, "review", format!("{phrase} ({key}) — {e}")),
+        };
     }
     let bin = review_bin();
-    let resolved = resolve_bin(&bin);
-    if let Some(p) = resolved {
-        if let Ok(Some(cfg)) = load_home_config(&home) {
-            if let Some(engine) = cfg.review.engine.as_deref() {
-                let wrap = cfg
-                    .review
-                    .wrapper
-                    .as_deref()
-                    .unwrap_or_else(|| p.to_str().unwrap_or(""));
-                return Check::new(
-                    Level::Ok,
-                    "review",
-                    format!("{} (engine={engine}, wrapper={wrap})", p.display()),
-                );
-            }
-        }
-        return Check::new(
+    match resolve_bin(&bin) {
+        Some(p) => Check::new(
             Level::Ok,
             "review",
-            format!("{} (PATH default `review`)", p.display()),
-        );
-    }
-    Check::new(
-        Level::Warn,
-        "review",
-        format!(
-            "judgment engine not configured — run `porch setup` (`quality` is floor-only; `agent` still needs the porch-quality sibling) or set {REVIEW_BIN_ENV}"
+            format!("{phrase} ({key}) {}", p.display()),
         ),
-    )
+        None => Check::new(
+            Level::Warn,
+            "review",
+            format!(
+                "{phrase} ({key}) — reader `{bin}` not found; run `porch setup` or set {REVIEW_BIN_ENV}"
+            ),
+        ),
+    }
 }
 
 fn check_gh() -> Check {

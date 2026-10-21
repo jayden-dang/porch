@@ -705,11 +705,11 @@ fn run_init(yes: bool, skip_setup: bool, intent: Option<&str>) -> Result<ExitCod
                 }
             } else if io::stdin().is_terminal() {
                 eprintln!(
-                    "porch: review setup incomplete — run `porch setup` (or `porch init --yes`)"
+                    "porch: rules/reader setup incomplete — run `porch setup` (or `porch init --yes`)"
                 );
             } else {
                 eprintln!(
-                    "porch: review setup incomplete — run `porch setup --yes` or `porch init --skip-setup`"
+                    "porch: rules/reader setup incomplete — run `porch setup --yes` or `porch init --skip-setup`"
                 );
             }
         }
@@ -767,7 +767,7 @@ fn run_bare() -> Result<ExitCode> {
 
     print_runs_summary(&report.runs);
     if setup::setup_incomplete(&home) {
-        println!("hint: review setup incomplete — run `porch setup --yes`");
+        println!("hint: rules/reader setup incomplete — run `porch setup --yes`");
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -882,13 +882,13 @@ fn print_init_next_steps(
         println!("       or: PORCH_INTENT={text:?} git push porch");
     }
 
-    // Agent engine has no `review` wrapper — use setup-aware check (same as doctor).
+    // Agent reader has no `review` wrapper — use setup-aware check (same as doctor).
     let missing_review = !porch_review::review_setup_ok(home);
     let gh_bin = env::var("PORCH_GH_BIN").unwrap_or_else(|_| "gh".into());
     let missing_gh = !doctor::bin_on_path(&gh_bin);
     if missing_review || missing_gh {
         println!(
-            "tip: run `porch setup` / `porch doctor` — review and/or gh look missing for a complete run"
+            "tip: run `porch setup` / `porch doctor` — rules/reader and/or gh look missing for a complete run"
         );
     }
 }

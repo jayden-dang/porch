@@ -14,7 +14,7 @@ Install: [install.md](install.md). This page is the operator loop after the bina
 | `porch-quality` next to `porch` | Mandatory **deterministic floor**. Not PATH-selected, not optional. `porch doctor` checks the sibling of `current_exe` |
 | `git` | Gate operations shell out to git |
 | `gh` logged in | Deliver (PR). `porch doctor` checks it |
-| A judgment engine (optional) | `claude` / `codex` for `engine: agent`. `engine: quality` is floor-only (no judgment) and still requires the sibling |
+| A reader (optional) | `claude` / `codex` for `rules + reader` (`engine: agent`). `rules only` (`engine: quality`) is floor-only and still requires the sibling |
 | Optional fixer | `PORCH_FIXER_BIN` (for `respond fix`) |
 | Repo tools on `PATH` | Certify runs in a **cold** worktree (no `node_modules`). `biome`, `just`, `moon`, etc. must be on `PATH` |
 
@@ -33,25 +33,25 @@ Full install options: [install.md](install.md).
 ## C. First-run setup
 
 ```sh
-porch setup                 # TTY: one screen, Enter applies the recommended engine
+porch setup                 # TTY: rules block + reader choices; Enter applies the recommended row
 porch setup --yes           # headless JSON
 porch doctor
 ```
 
-`porch setup` writes `$PORCH_HOME/config.yaml` and, for `quality` / `ocr` / `generic`, a porch-owned `$PORCH_HOME/bin/review` wrapper. That wrapper is the **judgment** selection. The floor is always the `porch-quality` sibling of the running `porch` binary — setup cannot turn it off.
+`porch setup` writes `$PORCH_HOME/config.yaml` (`review.assurance` plus `review.engine`) and, for wire values `quality` / `ocr` / `generic`, a porch-owned `$PORCH_HOME/bin/review` wrapper. That wrapper is the **reader** selection. The floor (**rules**) is always the `porch-quality` sibling of the running `porch` binary — setup cannot turn it off. Human shape labels are `rules only (floor-only)` and `rules + reader (floor+judgment)`.
 
-| Engine | When |
+| Wire (`review.engine`) | When |
 |---|---|
-| `quality` | Floor-only (no judgment). Selected by default when `porch`'s own bindir is on `PATH`, which `cargo install porch` makes true — so on a machine that also has a coding agent, the default is floor-only and the agent is passed over. Requesting it explicitly resolves the sibling, not a `PATH` lookup |
-| `agent` | Coding agent (`claude` / `codex`) for the judgment layer — session-free review turn. Still requires the floor sibling |
-| `generic` | a binary already named `review` that speaks `--from --to --format json --output` (judgment). Floor sibling still required |
-| `ocr` | legacy only: `porch setup --engine ocr` (judgment). Floor sibling still required |
+| `quality` | `rules only (floor-only)`. Selected by default when `porch`'s own bindir is on `PATH`, which `cargo install porch` makes true — so on a machine that also has a coding agent, the default is rules-only and the agent is passed over. Requesting it explicitly resolves the sibling, not a `PATH` lookup |
+| `agent` | Coding agent (`claude` / `codex`) as the reader — session-free review turn (`rules + reader`). Still requires the floor sibling |
+| `generic` | a binary already named `review` that speaks `--from --to --format json --output` (reader). Floor sibling still required |
+| `ocr` | legacy only: `porch setup --engine ocr` (reader). Floor sibling still required |
 
 Do **not** set `PORCH_REVIEW_BIN=ocr` (missing the `review` subcommand). Env still overrides config: `PORCH_REVIEW_BIN`, `PORCH_REVIEW_AGENT_BIN`, `PORCH_FIXER_BIN`, `PORCH_GH_BIN`, `PORCH_HOME`. None of those env vars relocates the floor.
 
 Re-apply after editing `config.yaml`: `porch setup --apply`. Re-check: `porch setup --verify`. Optional login service: `porch setup --yes --install-daemon`.
 
-`porch doctor` must show **floor** ok (`porch-quality` next to `porch`), judgment **review** ok when you selected `agent` / `generic` / `ocr`, and `git` **ok**. Exit 1 only if a hard check fails (`git` missing).
+`porch doctor` must show **floor** ok (`porch-quality` next to `porch`), **review** ok naming `rules only (floor-only)` or `rules + reader (floor+judgment)` and which key won (`assurance` or `engine`), and `git` **ok**. Exit 1 only if a hard check fails (`git` missing).
 
 The floor line also carries `identity=<sha256>` — the artifact identity porch observed
 for that sibling, and the one the assurance record stores. Two installations reporting
@@ -151,9 +151,11 @@ When `phase=compose`, `porch agent status` also shows `pr_url`, `compose_packet_
 (`floor-only` or `floor+judgment`) on `assurance_record` when a round backs the
 run. Legacy and unreviewed records omit the shape. A delivered PR's hidden
 `porch-attestation` comment includes the same shape next to `head_sha`.
-`porch status` is inspect, not the compact live snapshot: it reports
-**Daemon condition**, recover refs, leftover worktree HEADs, and **Forward
-verdict**s without calling the daemon.
+`porch status` / `porch runs` use the human phrases `rules only (floor-only)`
+or `rules + reader (floor+judgment)` when that record exists. `porch status` is
+inspect, not the compact live snapshot: it reports **Daemon condition**, recover
+refs, leftover worktree HEADs, and **Forward verdict**s without calling the
+daemon.
 
 ## I. Parked review (TUI)
 
@@ -356,7 +358,7 @@ porch agent sync                    # if local branch lags pipeline
 | doctor warns floor | Install so `porch-quality` sits next to `porch` (`cargo install porch --locked --force`); restart the daemon |
 | doctor: `porch was replaced while running` | An install landed under a live daemon, so the sibling beside it is the new floor. `porch daemon restart`. Stop the daemon before upgrading to avoid it |
 | `cargo install porch` says `binary porch-quality already exists` | You installed the floor separately on v0.2.1 or earlier. Nothing was installed — add `--force`, or `cargo uninstall porch-quality` first |
-| doctor warns review | `porch setup --yes` (judgment: `agent` / `claude`/`codex`; `quality` is floor-only and still needs the sibling) |
+| doctor warns review | `porch setup --yes` (reader: `agent` / `claude`/`codex`; `rules only` still needs the sibling) |
 | certify `biome: not found` | Put biome on `PATH`; `porch daemon stop --force && porch daemon start` so the daemon inherits it |
 | lefthook/e2e on every push | `git push --no-verify porch …` |
 | rebase conflict | TUI/`respond` **fix** or **abort** |

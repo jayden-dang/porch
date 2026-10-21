@@ -543,7 +543,12 @@ impl App {
             .join("  ");
         let mut pipeline_text = format!("branch {branch}  status {status}\n{phase_line}");
         if let Some(shape) = self.snapshot.assurance_record.assurance_shape() {
-            let _ = write!(pipeline_text, "\nassurance shape {shape}");
+            let phrase = match shape {
+                "floor-only" => porch_review::voice_phrase(true),
+                "floor+judgment" => porch_review::voice_phrase(false),
+                other => other,
+            };
+            let _ = write!(pipeline_text, "\nassurance shape {phrase}");
         }
         if self.snapshot.status == "failed" {
             if let Some(err) = &self.snapshot.error {
@@ -1025,11 +1030,17 @@ mod tests {
             porch_gate::AssuranceRecord::round_with_shape("01ROUND", Some("floor+judgment".into()));
         let mut app = App::from_snapshot(snap, &home, &home);
         let s = render_to_string(&mut app, 100, 24);
-        assert!(s.contains("assurance shape floor+judgment"), "buffer={s}");
+        assert!(s.contains(porch_review::voice_phrase(false)), "buffer={s}");
+        assert!(s.contains("assurance shape"), "buffer={s}");
+        assert!(
+            !s.contains("assurance shape floor+judgment"),
+            "must not show raw shape alone: {s}"
+        );
         assert!(
             s.contains("a approve"),
             "shape display must not hide park actions: {s}"
         );
+        assert!(s.contains("review"), "phase name review must stay: {s}");
     }
 
     #[test]

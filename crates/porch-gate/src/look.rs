@@ -15,7 +15,7 @@ use crate::eject::resolve_repo_id;
 use crate::home::{db_path, repos_dir, worktrees_dir};
 use crate::rounds::forward::{self, ForwardRecordRow};
 use crate::rounds::reconcile::{self, Verdict};
-use crate::rpc::compact_run_row;
+use crate::rpc::{compact_run_row, resolve_run_assurance};
 
 /// What inspect could conclude about the state database.
 #[derive(Debug, Clone, Serialize)]
@@ -142,6 +142,11 @@ pub fn look(home: &Path, work: Option<&Path>, run_limit: usize) -> LookReport {
             let take = if run_limit == 0 { 0 } else { run_limit };
             for run in rows.iter().take(take) {
                 let mut row = compact_run_row(run);
+                if let Ok((rec, _)) = resolve_run_assurance(&db, run) {
+                    if let Some(phrase) = voice_phrase_for_shape(rec.assurance_shape()) {
+                        row["assurance"] = serde_json::Value::String(phrase.to_string());
+                    }
+                }
                 match project_run_forwards(&db, &bare_path, &run.id) {
                     Ok(fwds) => {
                         if let Some(first) = fwds.first() {
@@ -421,6 +426,14 @@ fn forward_view(
     }
 }
 
+fn voice_phrase_for_shape(shape: Option<&str>) -> Option<&'static str> {
+    match shape {
+        Some("floor-only") => Some("rules only (floor-only)"),
+        Some("floor+judgment") => Some("rules + reader (floor+judgment)"),
+        _ => None,
+    }
+}
+
 /// Human lines for `porch status` (no JSON).
 #[must_use]
 pub fn format_status_human(report: &LookReport) -> String {
@@ -472,11 +485,16 @@ pub fn format_status_human(report: &LookReport) -> String {
     match report.runs.first() {
         Some(r) => {
             let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-            lines.push(format!(
+            let mut latest = format!(
                 "latest: {id} {} {}",
                 r.get("branch").and_then(|v| v.as_str()).unwrap_or("?"),
                 r.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
-            ));
+            );
+            if let Some(phrase) = r.get("assurance").and_then(|v| v.as_str()) {
+                latest.push(' ');
+                latest.push_str(phrase);
+            }
+            lines.push(latest);
         }
         None => lines.push("latest: (none)".into()),
     }

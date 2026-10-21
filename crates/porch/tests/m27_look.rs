@@ -195,6 +195,162 @@ fn status_lists_every_recover_ref_not_only_the_latest_run() {
     assert!(names.iter().any(|n| n.ends_with("/run-new")), "{names:?}");
 }
 
+fn floor_only_plan(run_id: &str) -> porch_gate::rounds::OpenRoundPlan {
+    use porch_gate::rounds::{
+        OpenRoundPlan, ProducerInvocation, RequirementSpec, Resolution, Role,
+    };
+    OpenRoundPlan {
+        run_id: run_id.to_string(),
+        producers: vec![ProducerInvocation {
+            descriptor_json: r#"{"slot":0}"#.into(),
+            descriptor_equivalence_digest: "equiv-floor".into(),
+        }],
+        requirements: vec![RequirementSpec {
+            slot: 0,
+            role: Role::Floor,
+            resolution: Resolution::Resolved,
+            expected_equivalence_digest: Some("equiv-floor".into()),
+            reason: None,
+        }],
+    }
+}
+
+fn floor_only_bindings(inventory: &[u8]) -> porch_gate::rounds::RoundBindings {
+    use porch_gate::rounds::{
+        self, ContextApplication, ContextApplicationState, ContextSource, RoundBindings,
+        capture_context_element, context_applicability_digest, sha256_hex,
+    };
+    let intent = capture_context_element(
+        "intent",
+        ContextSource::Present {
+            bytes: inventory.to_vec(),
+        },
+    );
+    let intent_digest = context_applicability_digest("intent", "present", inventory);
+    RoundBindings {
+        from_sha: "from".into(),
+        to_sha: "to".into(),
+        inventory_digest: sha256_hex(inventory),
+        inventory_bytes: inventory.to_vec(),
+        trusted_config_sha: "config".into(),
+        protocol_schema_version: rounds::PROTOCOL_SCHEMA_VERSION,
+        fingerprint_version: 1,
+        intent_source: Some("flag".into()),
+        context_elements: vec![intent],
+        context_applications: vec![ContextApplication {
+            element_name: "intent".into(),
+            producer_slot: 0,
+            application: ContextApplicationState::Applied,
+            effective_digest: Some(intent_digest),
+        }],
+    }
+}
+
+fn finish_floor_only_round(
+    db: &porch_gate::Db,
+    round_id: &porch_gate::rounds::RoundId,
+    run_id: &str,
+) {
+    use porch_gate::rounds::{
+        self, AssuranceCompletion, CoverageState, ExecutionState, FinalizeOutcome,
+        FinalizeProposal, FindingInstanceProposal, RoundCoverageProposal,
+    };
+    let producer = rounds::producers_for_round(db, round_id).unwrap()[0]
+        .id
+        .clone();
+    let (rev, _) = rounds::read_history(db, run_id).unwrap();
+    assert_eq!(
+        rounds::finalize_round(
+            db,
+            round_id,
+            &FinalizeProposal {
+                execution: ExecutionState::Finished,
+                assurance_completion: AssuranceCompletion::Complete,
+                completion_reason: None,
+                coverage: vec![RoundCoverageProposal {
+                    producer_invocation_id: producer.clone(),
+                    path: "a.rs".into(),
+                    state: CoverageState::Completed,
+                    reason: None,
+                    authority: None,
+                    completion_evidence: Some("reviewed".into()),
+                }],
+                producer_durations: Vec::new(),
+                review_duration_ms: None,
+                instances: vec![FindingInstanceProposal {
+                    producer_invocation_id: producer,
+                    fingerprint: "fp".into(),
+                    fingerprint_version: 1,
+                    candidate_key: "ck".into(),
+                    criterion_id: "rust/unwrap-in-lib".into(),
+                    evidence: "e".into(),
+                    consequence: "c".into(),
+                    action: "must-fix".into(),
+                    severity: "error".into(),
+                    provenance_json: "{}".into(),
+                    confidence_value: None,
+                    confidence_kind: None,
+                    path: "a.rs".into(),
+                    anchor_kind: "symbol".into(),
+                    anchor_value: "foo".into(),
+                }],
+            },
+            rev,
+        )
+        .unwrap(),
+        FinalizeOutcome::Finalized
+    );
+}
+
+fn seed_floor_only_round(s: &Setup) -> String {
+    use porch_gate::rounds;
+    use porch_gate::{Db, db_path};
+
+    let db = Db::open(&db_path(&s.home)).unwrap();
+    let run = db
+        .insert_run(&repo_id(s), "feat-voice", "aaa", Some("inv"), Some("flag"))
+        .unwrap();
+    let round_id =
+        rounds::open_round(&db, &floor_only_plan(&run.id), &floor_only_bindings(b"inv")).unwrap();
+    finish_floor_only_round(&db, &round_id, &run.id);
+    let (rec, _) = porch_gate::resolve_run_assurance(&db, &run).unwrap();
+    assert_eq!(rec.assurance_shape(), Some("floor-only"));
+    run.id
+}
+
+#[test]
+fn status_names_voice_phrase_when_assurance_record_exists() {
+    let s = setup();
+    assert!(daemon_pid(&s.home).is_none());
+    let _run_id = seed_floor_only_round(&s);
+    assert!(daemon_pid(&s.home).is_none());
+
+    let phrase = porch_review::voice_phrase(true);
+    let out = porch(&s).arg("status").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(phrase),
+        "status must name voice phrase: {stdout}"
+    );
+    assert!(
+        daemon_pid(&s.home).is_none(),
+        "status must not start a daemon"
+    );
+
+    let runs = porch(&s).arg("runs").output().unwrap();
+    assert!(runs.status.success(), "{runs:?}");
+    let runs_out = String::from_utf8_lossy(&runs.stdout);
+    assert!(
+        runs_out.contains(phrase),
+        "runs must name voice phrase: {runs_out}"
+    );
+    assert!(
+        daemon_pid(&s.home).is_none(),
+        "runs must not start a daemon"
+    );
+}
+
 #[test]
 fn inspect_uses_porch_repo_id_not_the_path_hash() {
     let s = setup();

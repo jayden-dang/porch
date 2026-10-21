@@ -69,6 +69,11 @@ fn assurance_for(kind: EngineKind) -> &'static str {
     }
 }
 
+const NO_READER_ON_PATH: &str = "no reader on PATH — install a coding agent (`claude` or `codex`) \
+(`rules + reader` still requires the porch-quality sibling of porch); \
+`rules only` is floor-only. Legacy `ocr` / a binary named `review` also ok. \
+Then re-run `porch setup`";
+
 /// Detect known engines currently on PATH.
 #[must_use]
 pub fn detect_engines() -> Vec<DetectedEngine> {
@@ -200,13 +205,7 @@ pub fn setup_yes(porch_home: &Path, engine: Option<EngineKind>) -> Result<SetupR
     let mut warnings = Vec::new();
     let detected = detect_engines();
     let Some(kind) = engine.or_else(|| default_engine(&detected)) else {
-        return Ok(SetupResult::fail(
-            "no judgment engine on PATH — install a coding agent (`claude` or `codex`) \
-             (`engine: agent` still requires the porch-quality sibling of porch); \
-             `engine: quality` is floor-only. Legacy `ocr` / a binary named `review` also ok. \
-             Then re-run `porch setup`",
-            warnings,
-        ));
+        return Ok(SetupResult::fail(NO_READER_ON_PATH, warnings));
     };
     let on_path = detected
         .iter()
@@ -873,5 +872,17 @@ mod tests {
     #[test]
     fn default_none_when_empty() {
         assert_eq!(default_engine(&[]), None);
+    }
+
+    #[test]
+    fn missing_engines_error_uses_rules_and_reader_labels() {
+        assert!(
+            NO_READER_ON_PATH.contains("reader") && NO_READER_ON_PATH.contains("rules"),
+            "{NO_READER_ON_PATH}"
+        );
+        assert!(
+            !NO_READER_ON_PATH.contains("judgment engine"),
+            "{NO_READER_ON_PATH}"
+        );
     }
 }
