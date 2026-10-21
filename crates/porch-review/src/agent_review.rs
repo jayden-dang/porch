@@ -504,6 +504,12 @@ pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, 
             let _ = s.read_to_string(&mut stdout);
         }
 
+        // Keep what the reviewer said: a coverage or JSON failure is otherwise undiagnosable.
+        if let Some(dir) = out_file.parent() {
+            let _ = fs::write(dir.join("agent-stdout.txt"), &stdout);
+            let _ = fs::write(dir.join("agent-stderr.txt"), &stderr);
+        }
+
         if !status.success() {
             return Err(Error::Exit {
                 status: status.code().unwrap_or(-1),
@@ -936,6 +942,41 @@ printf '%s\n' '{"findings":[],"files":["a.rs"]}' > "$OUT"
         })
         .unwrap_err();
         assert!(matches!(err, Error::Coverage(ref p) if p == "b.rs"));
+    }
+
+    #[test]
+    fn run_agent_review_keeps_agent_output_when_review_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let wt = tmp.path().join("wt");
+        let review_dir = home.join("runs/r1/review");
+        git_init_wt(&wt);
+        let prompt =
+            write_reviewer_prompt(&review_dir, None, None, &["a.rs".into(), "b.rs".into()])
+                .unwrap();
+        let bin = install_fake(
+            &tmp.path().join("bin"),
+            "fake-agent",
+            "#!/bin/sh\nprintf '%s\\n' '{\"findings\":[],\"files\":[\"a.rs\"]}'\necho oops >&2\n",
+        );
+        let err = run_agent_review(&RunAgentReviewOpts {
+            work_tree: &wt,
+            prompt_file: &prompt,
+            porch_home: &home,
+            from_sha: "aaa",
+            to_sha: "bbb",
+            changed_files: &["a.rs".into(), "b.rs".into()],
+            bin: bin.to_str().unwrap(),
+            timeout: Duration::from_secs(5),
+            plan: None,
+            artifact_dir: None,
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Coverage(_)));
+        let stdout = fs::read_to_string(review_dir.join("agent-stdout.txt")).unwrap();
+        assert!(stdout.contains(r#""files":["a.rs"]"#), "{stdout}");
+        let stderr = fs::read_to_string(review_dir.join("agent-stderr.txt")).unwrap();
+        assert!(stderr.contains("oops"), "{stderr}");
     }
 
     #[test]
