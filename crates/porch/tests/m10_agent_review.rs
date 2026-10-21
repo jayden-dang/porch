@@ -272,8 +272,19 @@ printf '%s\n' '{"comments":[],"files":["README"]}' > "$OUT"
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn agent_review_push_writes_prompt_and_completes() {
+    agent_review_push_completes(false);
+}
+
+/// A `claude` symlink into a versioned install dir canonicalizes to `2.1.306`;
+/// the CLI family must still follow the configured name, not the resolved file.
+#[test]
+fn agent_review_push_completes_when_claude_is_a_symlink_to_a_versioned_file() {
+    agent_review_push_completes(true);
+}
+
+#[allow(clippy::too_many_lines)]
+fn agent_review_push_completes(symlinked: bool) {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let origin = root.join("origin.git");
@@ -283,6 +294,13 @@ fn agent_review_push_writes_prompt_and_completes() {
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&bin).unwrap();
     let fake_agent = install_fake_claude(&bin);
+    if symlinked {
+        let versions = bin.join("versions");
+        fs::create_dir_all(&versions).unwrap();
+        let real = versions.join("2.1.306");
+        fs::rename(&fake_agent, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &fake_agent).unwrap();
+    }
     let fake_gh = install_noop_gh(&bin);
 
     init_bare(&origin).unwrap();

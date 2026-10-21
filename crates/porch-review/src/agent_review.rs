@@ -434,7 +434,7 @@ pub fn run_agent_review(opts: &RunAgentReviewOpts<'_>) -> Result<ReviewOutcome, 
 
     let bin_path = spawn_bin_path(opts);
     let bin_label = bin_path.display().to_string();
-    let family = agent_cli_family(&bin_label);
+    let family = agent_cli_family(&family_label(opts));
     // Neutralize before the dirty snapshot so rename/restore is not mistaken for
     // a reviewer write. Claude/Codex skip AGENTS.md neutralize because readonly /
     // plan flags are used; dirty worktree (file-write) detection still fail-closes.
@@ -553,6 +553,15 @@ fn spawn_bin_path<'a>(opts: &'a RunAgentReviewOpts<'a>) -> &'a Path {
     opts.plan.map_or_else(
         || Path::new(opts.bin),
         |p| p.spawned_target_absolute.as_path(),
+    )
+}
+
+/// Name the operator configured, not the canonicalized spawn target: a `claude`
+/// symlink into a versioned install dir resolves to a file like `2.1.306`.
+fn family_label(opts: &RunAgentReviewOpts<'_>) -> String {
+    opts.plan.map_or_else(
+        || opts.bin.to_string(),
+        |p| p.descriptor.invocation.requested_target.clone(),
     )
 }
 
