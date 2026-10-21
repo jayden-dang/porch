@@ -512,7 +512,10 @@ fn agent_run_attach_run_id() {
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     let v: Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(v.is_object(), "agent stdout must be one JSON object; stdout={stdout}");
+    assert!(
+        v.is_object(),
+        "agent stdout must be one JSON object; stdout={stdout}"
+    );
     assert_eq!(v["run_id"], run.id);
     assert_eq!(v["status"], "parked");
     // AgentStatus serde field names (not AgentCliResult wrapper keys).
@@ -543,7 +546,7 @@ fn agent_run_attach_run_id() {
         .pointer("/assurance_record/assurance_shape")
         .and_then(|x| x.as_str());
     assert!(
-        matches!(shape, Some("floor-only") | Some("floor+judgment")),
+        matches!(shape, Some("floor-only" | "floor+judgment")),
         "assurance_shape must stay floor-only or floor+judgment, not a human phrase; got {shape:?}; stdout={stdout}"
     );
     assert_ne!(
