@@ -525,7 +525,7 @@ fn nontty_setup_prints_json_no_hang() {
 }
 
 #[test]
-fn setup_help_does_not_label_quality() {
+fn setup_help_names_engine_wire_values_not_rules_only_alias() {
     let assert = Command::cargo_bin("porch")
         .unwrap()
         .args(["setup", "--help"])
@@ -533,13 +533,19 @@ fn setup_help_does_not_label_quality() {
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     assert!(
-        !stdout.to_ascii_lowercase().contains("quality"),
-        "help must not use quality as a label\n{stdout}"
+        stdout.contains("rules") || stdout.contains("reader"),
+        "command about should name rules or reader\n{stdout}"
     );
     assert!(
-        stdout.contains("rules") || stdout.contains("reader"),
-        "help should name rules or reader\n{stdout}"
+        !stdout.contains("rules-only"),
+        "--engine help must not claim rules-only is a flag value\n{stdout}"
     );
+    for wire in ["agent", "ocr", "generic", "quality"] {
+        assert!(
+            stdout.contains(wire),
+            "--engine help must name wire value `{wire}`\n{stdout}"
+        );
+    }
 }
 
 #[test]

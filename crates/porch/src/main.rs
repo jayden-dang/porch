@@ -51,7 +51,7 @@ enum Command {
         /// Re-check wrapper/config without rewriting.
         #[arg(long)]
         verify: bool,
-        /// Force the wire selection (`agent`, `ocr`, or `generic`; rules-only also accepted).
+        /// Force `review.engine` wire (`agent`, `ocr`, `generic`, or `quality`).
         #[arg(long)]
         engine: Option<String>,
         /// Rewrite wrapper from current config.yaml.

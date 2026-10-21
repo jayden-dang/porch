@@ -892,4 +892,62 @@ mod tests {
         assert!(!s.contains("install porch-quality (M16)"), "buffer={s}");
         assert!(!s.contains("quality — floor-only"), "buffer={s}");
     }
+
+    #[test]
+    fn detect_rules_line_comes_from_floor_state_not_path_which() {
+        use porch_review::floor::{FloorState, sibling_of};
+        use porch_review::which;
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let sibling = sibling_of(&exe).expect("test exe has a parent");
+        let (line, bin) = rules_from_floor();
+        let state = porch_review::floor::state();
+        let drawn_marker = match &state {
+            FloorState::Ready { sibling, .. } => {
+                assert_eq!(line, sibling.display().to_string());
+                assert_eq!(bin.as_ref(), Some(sibling));
+                sibling.display().to_string()
+            }
+            FloorState::LaunchReplaced { launch } => {
+                assert!(line.contains(&launch.display().to_string()), "{line}");
+                assert!(bin.is_none());
+                launch.display().to_string()
+            }
+            FloorState::Unresolved { reason } => {
+                assert_eq!(line, *reason);
+                assert!(bin.is_none());
+                assert!(
+                    reason.contains(&sibling.display().to_string()),
+                    "unresolved reason must name the floor sibling, not PATH: {reason}"
+                );
+                sibling.display().to_string()
+            }
+        };
+
+        let w = SetupWizard::detect();
+        assert_eq!(w.rules_line, line);
+        let s = render_to_string(&w, 120, 32);
+        assert!(s.contains("rules"), "buffer={s}");
+        assert!(
+            s.contains(&drawn_marker),
+            "drawn rules must show floor-resolver sibling; buffer={s}"
+        );
+
+        if let Some(path_hit) = which("porch-quality") {
+            let which_s = path_hit.display().to_string();
+            let same_as_sibling = std::fs::canonicalize(&sibling).ok()
+                == std::fs::canonicalize(&path_hit).ok()
+                || sibling == path_hit;
+            if !same_as_sibling {
+                assert_ne!(
+                    line, which_s,
+                    "rules_from_floor must not return PATH which(porch-quality)"
+                );
+                assert!(
+                    !s.contains(&which_s),
+                    "drawn rules must not show PATH which; buffer={s}"
+                );
+            }
+        }
+    }
 }
