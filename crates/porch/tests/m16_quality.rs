@@ -134,7 +134,8 @@ fn doctor_reports_quality_engine() {
         .args(["doctor"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("engine=quality"));
+        .stdout(predicates::str::contains(porch_review::voice_phrase(true)))
+        .stdout(predicates::str::contains("(assurance)"));
 }
 
 #[test]

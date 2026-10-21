@@ -284,7 +284,8 @@ fn doctor_warns_before_setup_ok_after() {
         .assert()
         .success()
         .stdout(predicates::str::contains("[ok  ] review:"))
-        .stdout(predicates::str::contains("engine=ocr"));
+        .stdout(predicates::str::contains(porch_review::voice_phrase(false)))
+        .stdout(predicates::str::contains("(assurance)"));
 }
 
 #[test]

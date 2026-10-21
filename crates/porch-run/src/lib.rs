@@ -685,13 +685,15 @@ impl SpawnedReview {
     }
 }
 
-fn engine_is_quality(home: &Path) -> bool {
+/// Floor-only when selection says so. Err is a failed selection (not floor-only).
+fn engine_is_quality(home: &Path) -> std::result::Result<bool, String> {
     match load_home_config(home).ok().flatten() {
-        Some(cfg) => match cfg.review.selected() {
-            Ok(sel) => sel.floor_only,
-            Err(_) => false,
-        },
-        None => false,
+        Some(cfg) => cfg
+            .review
+            .selected()
+            .map(|sel| sel.floor_only)
+            .map_err(|e| e.to_string()),
+        None => Ok(false),
     }
 }
 
@@ -719,11 +721,20 @@ fn compose_prepared_invocations(
 ) -> ComposedRound {
     match porch_review::floor::resolve() {
         Ok(floor) => {
-            if engine_is_quality(home) {
-                return ComposedRound::Prepared(vec![ComposedProducer {
-                    role: Role::Floor,
-                    invocation: floor,
-                }]);
+            match engine_is_quality(home) {
+                Ok(true) => {
+                    return ComposedRound::Prepared(vec![ComposedProducer {
+                        role: Role::Floor,
+                        invocation: floor,
+                    }]);
+                }
+                Ok(false) => {}
+                Err(reason) => {
+                    return ComposedRound::JudgmentUnresolved {
+                        floor: Box::new(floor),
+                        reason,
+                    };
+                }
             }
             match prepare(&PrepareOpts {
                 porch_home: Some(home),

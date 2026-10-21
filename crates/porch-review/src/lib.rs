@@ -557,7 +557,7 @@ pub fn run_review(opts: &RunReviewOpts<'_>) -> Result<ReviewOutcome, Error> {
     let use_agent = match opts.plan.map(|p| p.descriptor.adapter_kind) {
         Some(plan::AdapterKind::NativeAgent) => true,
         Some(plan::AdapterKind::PorchJsonCli) => false,
-        None => review_uses_agent(opts.porch_home),
+        None => review_uses_agent(opts.porch_home)?,
     };
     let outcome = if use_agent {
         let home = opts.porch_home.ok_or_else(|| {

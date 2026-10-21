@@ -187,7 +187,8 @@ fn setup_yes_engine_agent_with_fake_claude() {
         .assert()
         .success()
         .stdout(predicates::str::contains("[ok  ] review:"))
-        .stdout(predicates::str::contains("engine=agent"));
+        .stdout(predicates::str::contains(porch_review::voice_phrase(false)))
+        .stdout(predicates::str::contains("(assurance)"));
 }
 
 #[test]

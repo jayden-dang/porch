@@ -394,26 +394,30 @@ pub fn agent_review_bin(porch_home: &Path) -> Result<String, Error> {
 /// True when review should use the session-free agent path.
 ///
 /// `PORCH_REVIEW_BIN` wins (keeps generic/OCR PATH fakes green).
-#[must_use]
-pub fn review_uses_agent(porch_home: Option<&Path>) -> bool {
+/// A failed `selected()` is an error — not "not agent".
+///
+/// # Errors
+///
+/// Returns when home config loads but assurance selection fails closed.
+pub fn review_uses_agent(porch_home: Option<&Path>) -> Result<bool, Error> {
     if crate::env_override(crate::REVIEW_BIN_ENV).is_some() {
-        return false;
+        return Ok(false);
     }
     if crate::env_override(REVIEW_AGENT_BIN_ENV).is_some() {
-        return true;
+        return Ok(true);
     }
     let home = porch_home
         .map(Path::to_path_buf)
         .or_else(crate::porch_home_dir);
     let Some(home) = home else {
-        return false;
+        return Ok(false);
     };
     match crate::load_home_config(&home).ok().flatten() {
-        Some(cfg) => match cfg.review.selected() {
-            Ok(sel) => !sel.floor_only && sel.reader == Some(crate::EngineKind::Agent),
-            Err(_) => false,
-        },
-        None => false,
+        Some(cfg) => {
+            let sel = cfg.review.selected()?;
+            Ok(!sel.floor_only && sel.reader == Some(crate::EngineKind::Agent))
+        }
+        None => Ok(false),
     }
 }
 

@@ -474,13 +474,14 @@ impl SetupWizard {
             .success_wrapper
             .as_ref()
             .map_or_else(|| "(none — agent path)".into(), |p| p.display().to_string());
-        let eng = self
+        let floor_only = self
             .success_engine
-            .clone()
-            .unwrap_or_else(|| "review".into());
+            .as_deref()
+            .and_then(EngineKind::parse)
+            .is_none_or(|k| k == EngineKind::Quality);
         let mut lines = vec![
             Line::from("setup ok"),
-            Line::from(format!("engine    {eng}")),
+            Line::from(voice_phrase(floor_only)),
             Line::from(format!("wrapper   {wrap}")),
             Line::from("doctor    review=ok"),
         ];
@@ -575,9 +576,9 @@ fn format_tools_line(tools: &porch_review::ToolsConfig) -> String {
     format!("biome bun cargo just moon   {det} / {miss}")
 }
 
-const NO_JUDGMENT_ENGINE: &str = "no judgment engine on PATH — install claude/codex \
-(`engine: agent` still requires the porch-quality sibling of porch); \
-`engine: quality` is floor-only. Legacy ocr / `review` also ok";
+const NO_JUDGMENT_ENGINE: &str = "no reader on PATH — install claude/codex \
+(`rules + reader` still requires the porch-quality sibling of porch); \
+`rules only` is floor-only. Legacy ocr / `review` also ok";
 
 fn run_wizard(home: &Path) -> Result<ExitCode> {
     let mut wizard = SetupWizard::detect();

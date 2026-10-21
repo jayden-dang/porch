@@ -201,7 +201,7 @@ pub fn prepare(opts: &PrepareOpts<'_>) -> Result<PreparedInvocation, Error> {
                         }
                     }
                 }
-                review_uses_agent(opts.porch_home)
+                review_uses_agent(opts.porch_home)?
             }
         }
     };
