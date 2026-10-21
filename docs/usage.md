@@ -505,3 +505,9 @@ the same reason as above: the fence refuses writes from a writer that does not u
 Reverting the upgrade means restoring a backup of `$PORCH_HOME`. The `forward_records` rows
 themselves are append-only and are never rewritten, so a restored backup simply lacks them.
 
+## Z. Troubleshooting a failed review
+
+If a run ends `failed` at review, the agent reviewer's raw output is kept beside the
+prompt as `agent-stdout.txt` and `agent-stderr.txt` under
+`$PORCH_HOME/runs/<run_id>/rounds/<round_id>/producers/<producer_id>/`. Read those
+before re-pushing; a push of the same SHA does not start a new run.
